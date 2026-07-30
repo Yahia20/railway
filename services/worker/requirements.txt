@@ -1,0 +1,14 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+httpx==0.28.1
+psycopg[binary,pool]==3.2.3
+numpy==2.2.1
+
+# ASR — Space backend (default). Swap for the local backend by installing the
+# extras in requirements-local-asr.txt instead.
+gradio-client==2.0.2
+
+# Google Drive call source
+google-api-python-client==2.156.0
+google-auth==2.37.0

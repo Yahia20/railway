@@ -1,0 +1,91 @@
+{
+  "name": "03 · Nightly — resolve identity & rebuild metrics",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "cronExpression", "expression": "0 2 * * *" }] }
+      },
+      "id": "sched",
+      "name": "02:00 daily",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-600, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- STEP 1 — resolve identity on phone (certain match).\n-- Creates a customer for any phone we have never seen, then attaches every\n-- unlinked interaction carrying that phone.\nWITH new_people AS (\n  INSERT INTO customers (primary_phone_e164, first_seen_at, last_seen_at)\n  SELECT DISTINCT i.customer_phone_e164, min(i.started_at), max(i.started_at)\n  FROM interactions i\n  WHERE i.customer_id IS NULL\n    AND i.customer_phone_e164 IS NOT NULL\n    AND NOT EXISTS (\n      SELECT 1 FROM customers c WHERE c.primary_phone_e164 = i.customer_phone_e164\n    )\n  GROUP BY i.customer_phone_e164\n  ON CONFLICT (primary_phone_e164) DO NOTHING\n  RETURNING customer_id, primary_phone_e164\n),\nident AS (\n  INSERT INTO customer_identities (customer_id, kind, value, method, confidence)\n  SELECT customer_id, 'phone'::identity_kind, primary_phone_e164,\n         'exact_phone'::match_method, 1.00\n  FROM new_people\n  ON CONFLICT (kind, value) DO NOTHING\n  RETURNING customer_id\n)\nUPDATE interactions i\nSET customer_id = c.customer_id\nFROM customers c\nWHERE i.customer_id IS NULL\n  AND i.customer_phone_e164 = c.primary_phone_e164;",
+        "options": {}
+      },
+      "id": "resolve",
+      "name": "Resolve identity (phone)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-380, 300],
+      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } },
+      "notes": "Phone match only — it is the one match that is certain. CRM-id and fuzzy-name matching are deliberately NOT automated: a wrong merge is expensive to undo and every match is written to customer_identities with its method and confidence."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- STEP 2 — turn agent promises extracted by pass 1 into follow_up rows,\n-- then close any that a later interaction fulfilled.\nINSERT INTO follow_ups (customer_id, agent_id, promised_in, promise_text, promised_at, due_at, channel)\nSELECT i.customer_id, i.agent_id, i.interaction_id,\n       p->>'promise',\n       i.started_at,\n       CASE WHEN p->>'due_hint' IS NOT NULL THEN i.started_at + interval '24 hours' END,\n       i.channel\nFROM interaction_analysis ia\nJOIN interactions i ON i.interaction_id = ia.interaction_id\nCROSS JOIN LATERAL jsonb_array_elements(\n  coalesce(ia.raw_response->'promises_made_by_agent', '[]'::jsonb)) AS p\nWHERE i.agent_id IS NOT NULL\n  AND NOT EXISTS (\n    SELECT 1 FROM follow_ups f\n    WHERE f.promised_in = i.interaction_id AND f.promise_text = p->>'promise'\n  );",
+        "options": {}
+      },
+      "id": "promises",
+      "name": "Materialise promises",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-160, 300],
+      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- STEP 3 — close promises that a later outbound contact fulfilled.\nUPDATE follow_ups f\nSET fulfilled_in = nxt.interaction_id,\n    fulfilled_at = nxt.started_at,\n    hours_to_fulfil = round(extract(epoch from (nxt.started_at - f.promised_at))/3600.0, 2),\n    status = CASE\n      WHEN nxt.started_at <= coalesce(f.due_at, f.promised_at + interval '24 hours')\n        THEN 'fulfilled' ELSE 'late' END,\n    updated_at = now()\nFROM LATERAL (\n  SELECT i.interaction_id, i.started_at\n  FROM interactions i\n  WHERE i.customer_id = f.customer_id\n    AND i.started_at > f.promised_at\n    AND i.agent_id = f.agent_id\n  ORDER BY i.started_at\n  LIMIT 1\n) nxt\nWHERE f.status = 'open';\n\n-- Anything still open past its deadline is a missed promise, not a pending one.\nUPDATE follow_ups\nSET status = 'missed', updated_at = now()\nWHERE status = 'open'\n  AND coalesce(due_at, promised_at + interval '48 hours') < now();",
+        "options": {}
+      },
+      "id": "close-promises",
+      "name": "Close / expire promises",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [60, 300],
+      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT rebuild_customer_metrics() AS rows_rebuilt;",
+        "options": {}
+      },
+      "id": "aggregate",
+      "name": "Rebuild customer_metrics",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [280, 300],
+      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } },
+      "notes": "Truncate and rebuild. customer_metrics is fully derived, so it can always be dropped and recomputed — which is what stops a wrong dashboard number from becoming permanent."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO job_runs (job_name, status, finished_at, items_ok, detail)\nVALUES ('nightly_aggregate', 'succeeded', now(), $1::int,\n        jsonb_build_object('rows_rebuilt', $1::int));",
+        "options": { "queryReplacement": "={{ $json.rows_rebuilt }}" }
+      },
+      "id": "log",
+      "name": "Log run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [500, 300],
+      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } }
+    }
+  ],
+  "connections": {
+    "02:00 daily": { "main": [[{ "node": "Resolve identity (phone)", "type": "main", "index": 0 }]] },
+    "Resolve identity (phone)": { "main": [[{ "node": "Materialise promises", "type": "main", "index": 0 }]] },
+    "Materialise promises": { "main": [[{ "node": "Close / expire promises", "type": "main", "index": 0 }]] },
+    "Close / expire promises": { "main": [[{ "node": "Rebuild customer_metrics", "type": "main", "index": 0 }]] },
+    "Rebuild customer_metrics": { "main": [[{ "node": "Log run", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": [{ "name": "customer360" }]
+}

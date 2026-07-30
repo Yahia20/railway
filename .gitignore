@@ -1,0 +1,53 @@
+# ── Secrets ─────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+service-account*.json
+gcp-*.json
+
+# ── Real customer data — NEVER commit ───────────────────────────────────────
+# This repository is public. Everything below contains either live credentials
+# or personal data belonging to real customers, which makes committing it a
+# breach under both Egyptian and Saudi PDPL, not merely untidy.
+#
+#   api_response.txt              live Bitrix REST token in deal_info_endpoint,
+#                                 plus a customer's name and CRM contact id
+#   fixtures/chats/*.json         same payload
+#   fixtures/calls/*.wav          recordings of real customers' voices
+#   docs/samples/*.json           verbatim transcripts and phone numbers
+#   docs/call-evaluation.html     rendered transcript
+#
+# Keep them on local disk. See fixtures/README.md for how to populate them.
+api_response.txt
+fixtures/chats/
+fixtures/calls/
+docs/samples/
+docs/call-evaluation.html
+*.wav
+*.mp3
+*.ogg
+
+# Internal design docs that quote the live payload
+build-spec.html
+customer-360-explained.html
+schema-map.html
+schema.html
+final-erd.html
+*.pdf
+*.docx
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# ── Local scratch ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+/tmp/
+chunks/

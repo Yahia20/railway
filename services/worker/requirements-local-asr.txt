@@ -1,0 +1,7 @@
+# Only needed when ASR_BACKEND=local, i.e. running the 2B Cohere weights
+# in-process. Adds ~2.5 GB to the image, so it is deliberately NOT in the
+# default requirements: the Space and Cohere-API backends need none of it.
+-r requirements.txt
+torch==2.5.1
+transformers==4.48.0
+accelerate==1.2.1

@@ -1,0 +1,61 @@
+# Local mirror of the Railway project. Same three services, same private
+# networking, same shared volume for call audio — so a workflow that runs here
+# runs there.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: localdev
+      POSTGRES_DB: customer360
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Postgres runs everything in this directory, in name order, on first
+      # boot of an empty volume. Same files, same order as Railway.
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d customer360"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build: ./services/worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:localdev@postgres:5432/customer360
+      WORKER_API_KEY: ${WORKER_API_KEY:-localdev-key}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ASR_BACKEND: ${ASR_BACKEND:-space}
+      DEFAULT_PHONE_REGION: ${DEFAULT_PHONE_REGION:-SA}
+      PBX_TZ_OFFSET_HOURS: ${PBX_TZ_OFFSET_HOURS:-3}
+      WORK_DIR: /tmp/customer360
+    ports:
+      - "8000:8000"
+    volumes:
+      - audio:/tmp/customer360
+
+  n8n:
+    image: n8nio/n8n:latest
+    depends_on:
+      - worker
+    environment:
+      N8N_PORT: 5678
+      WORKER_URL: http://worker:8000
+      WORKER_API_KEY: ${WORKER_API_KEY:-localdev-key}
+      DRIVE_CALLS_FOLDER_ID: ${DRIVE_CALLS_FOLDER_ID:-}
+      GENERIC_TIMEZONE: Asia/Riyadh
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8ndata:/home/node/.n8n
+      # Same mount path as the worker: audio moves by path, never base64 over HTTP.
+      - audio:/tmp/customer360
+
+volumes:
+  pgdata:
+  n8ndata:
+  audio:
