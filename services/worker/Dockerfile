@@ -26,10 +26,10 @@ EXPOSE 8000
 # a second probe with a hardcoded port would report the container unhealthy the
 # moment Railway assigns a different $PORT.
 
-# Bind :: — Railway's private network is IPv6-only, so a service listening on
-# 0.0.0.0 is unreachable at <service>.railway.internal no matter what the
-# healthcheck says. `::` is dual-stack on Linux and serves IPv4 as well.
+# Exec form, no shell, no variable expansion anywhere in the command.
 #
-# ${PORT:-8000} keeps this runnable with plain `docker run`, and exec makes
-# uvicorn PID 1 so it receives SIGTERM and shuts down cleanly on redeploy.
-CMD ["sh", "-c", "exec uvicorn app.main:app --host :: --port ${PORT:-8000}"]
+# Railway tokenizes a service's start command and runs it WITHOUT a shell, so
+# `--port $PORT` and `--port ${PORT:-8000}` both arrive at uvicorn as literal
+# text and it exits immediately. app/serve.py reads PORT and HOST from the
+# environment itself, which behaves the same however it is invoked.
+CMD ["python", "-m", "app.serve"]
