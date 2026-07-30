@@ -12,24 +12,33 @@
       "name": "Bitrix webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [-720, 300],
+      "position": [-880, 300],
       "webhookId": "travelgate-chat"
+    },
+    {
+      "parameters": { "respondWith": "text", "responseBody": "ok", "options": {} },
+      "id": "respond",
+      "name": "200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [-660, 480],
+      "notes": "Answer Bitrix immediately. A webhook sender must never wait on a model call."
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO raw_events (source, external_ref, payload, payload_hash)\nVALUES ('bitrix_webhook', $1, $2::jsonb, encode(digest($2::text,'sha256'),'hex'))\nON CONFLICT (source, payload_hash) DO NOTHING\nRETURNING raw_id;",
+        "query": "INSERT INTO raw_events (source, external_ref, payload, payload_hash)\nVALUES ('bitrix_webhook', $1, $2::jsonb, encode(digest($2::text, 'sha256'), 'hex'))\nON CONFLICT (source, payload_hash) DO NOTHING\nRETURNING raw_id;",
         "options": {
-          "queryReplacement": "={{ $json.body.dialog_id || $json.body.Dialog }},{{ JSON.stringify($json.body) }}"
+          "queryReplacement": "={{ [ ($json.body.dialog_id || $json.body.Dialog || $json.body.Dialoug || 'unknown'), JSON.stringify($json.body) ] }}"
         }
       },
       "id": "land-raw",
       "name": "Land raw (idempotent)",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [-500, 300],
-      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } },
-      "notes": "ON CONFLICT DO NOTHING means a redelivered webhook returns zero rows and the branch below stops. Replay always starts from here, never from Bitrix."
+      "position": [-660, 300],
+      "credentials": { "postgres": { "id": "railway-pg", "name": "railway-pg" } },
+      "notes": "Query params are an ARRAY expression, not a comma-separated string. The payload is JSON and full of commas — a comma-separated list would be split into dozens of bogus parameters.\n\nON CONFLICT DO NOTHING means a redelivered webhook returns zero rows and the branch below stops. Replay always starts from here, never from Bitrix."
     },
     {
       "parameters": {
@@ -37,9 +46,10 @@
           "options": { "caseSensitive": true, "version": 2 },
           "conditions": [
             {
+              "id": "has-raw-id",
               "leftValue": "={{ $json.raw_id }}",
               "rightValue": "",
-              "operator": { "type": "number", "operation": "exists" }
+              "operator": { "type": "number", "operation": "exists", "singleValue": true }
             }
           ],
           "combinator": "and"
@@ -50,58 +60,58 @@
       "name": "New payload?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
-      "position": [-280, 300]
+      "position": [-440, 300]
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ $env.WORKER_URL }}/chats/parse",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [{ "name": "X-API-Key", "value": "={{ $env.WORKER_API_KEY }}" }]
-        },
+        "url": "http://railway-15c718f0.railway.internal:8000/chats/parse",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify({ payload: $('Bitrix webhook').item.json }) }}",
-        "options": { "timeout": 30000 }
+        "options": { "timeout": 60000 }
       },
       "id": "parse",
       "name": "Parse & compute metrics",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [-60, 200],
-      "notes": "Normalisation, phone E.164 and every computed metric happen in Python. n8n never does arithmetic that ends up in a score."
+      "position": [-220, 300],
+      "credentials": { "httpHeaderAuth": { "id": "worker-api", "name": "worker-api" } },
+      "notes": "Private-network URL: no public internet, no egress billing.\n\nAuth is an n8n Header Auth credential (X-API-Key) rather than $env, so the secret never sits in this JSON and n8n's env-access setting is irrelevant.\n\nNormalisation, phone E.164 and every computed metric happen in Python. n8n never does arithmetic that ends up in a score."
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH up AS (\n  INSERT INTO interactions (\n    external_source, external_id, channel, started_at, ended_at,\n    customer_phone_raw, customer_phone_e164, is_bot_handled,\n    handled_by, message_count, customer_message_count, agent_message_count,\n    first_response_seconds, is_after_hours\n  ) VALUES (\n    $1, $2, $3::channel, $4::timestamptz, $5::timestamptz,\n    $6, $7, $8::boolean,\n    CASE WHEN $8::boolean THEN 'bot' ELSE 'agent' END::speaker_role,\n    $9::int, $10::int, $11::int, $12::int, $13::boolean\n  )\n  ON CONFLICT (external_source, external_id) DO UPDATE SET\n    ended_at = EXCLUDED.ended_at,\n    message_count = EXCLUDED.message_count,\n    customer_message_count = EXCLUDED.customer_message_count,\n    agent_message_count = EXCLUDED.agent_message_count,\n    first_response_seconds = EXCLUDED.first_response_seconds,\n    updated_at = now()\n  RETURNING interaction_id\n)\nSELECT interaction_id FROM up;",
+        "query": "INSERT INTO interactions (\n  external_source, external_id, channel, started_at, ended_at,\n  customer_phone_raw, customer_phone_e164, is_bot_handled, handled_by,\n  message_count, customer_message_count, agent_message_count,\n  first_response_seconds, is_after_hours\n) VALUES (\n  'bitrix', $1, $2::channel, $3::timestamptz, $4::timestamptz,\n  $5, $6, $7::boolean,\n  CASE WHEN $7::boolean THEN 'bot'::speaker_role ELSE 'agent'::speaker_role END,\n  $8::int, $9::int, $10::int, $11::int, $12::boolean\n)\nON CONFLICT (external_source, external_id) DO UPDATE SET\n  ended_at               = EXCLUDED.ended_at,\n  message_count          = EXCLUDED.message_count,\n  customer_message_count = EXCLUDED.customer_message_count,\n  agent_message_count    = EXCLUDED.agent_message_count,\n  first_response_seconds = EXCLUDED.first_response_seconds,\n  is_bot_handled         = EXCLUDED.is_bot_handled,\n  updated_at             = now()\nRETURNING interaction_id;",
         "options": {
-          "queryReplacement": "=bitrix,{{ $json.external_id }},{{ $json.channel }},{{ $json.started_at }},{{ $json.ended_at }},{{ $json.customer_phone_e164 }},{{ $json.customer_phone_e164 }},{{ $json.is_bot_only }},{{ $json.messages.length }},{{ $json.metrics.customer_message_count }},{{ $json.metrics.agent_message_count }},{{ $json.metrics.first_response_seconds }},{{ $json.metrics.after_hours }}"
+          "queryReplacement": "={{ [ $json.external_id, $json.channel, $json.started_at, $json.ended_at, $json.customer_phone_e164, $json.customer_phone_e164, $json.is_bot_only, $json.messages.length, $json.metrics.customer_message_count, $json.metrics.agent_message_count, $json.metrics.first_response_seconds, $json.metrics.after_hours ] }}"
         }
       },
       "id": "upsert-interaction",
       "name": "Upsert interaction",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [160, 200],
-      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } }
+      "position": [0, 300],
+      "credentials": { "postgres": { "id": "railway-pg", "name": "railway-pg" } }
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "INSERT INTO chat_messages (interaction_id, seq, sender, body, sent_at)\nSELECT $1::uuid,\n       (m->>'seq')::int,\n       (m->>'sender')::speaker_role,\n       m->>'body',\n       (m->>'sent_at')::timestamptz\nFROM jsonb_array_elements($2::jsonb) AS m\nON CONFLICT (interaction_id, sender, sent_at, body_hash) DO NOTHING;",
         "options": {
-          "queryReplacement": "={{ $json.interaction_id }},{{ JSON.stringify($('Parse & compute metrics').item.json.messages) }}"
+          "queryReplacement": "={{ [ $json.interaction_id, JSON.stringify($('Parse & compute metrics').item.json.messages) ] }}"
         }
       },
       "id": "insert-messages",
       "name": "Insert messages (dedup)",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [380, 200],
-      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } },
-      "notes": "The webhook resends the WHOLE thread every time. The unique key on (interaction_id, sender, sent_at, body_hash) is what stops five webhooks becoming five copies of every message."
+      "position": [220, 300],
+      "alwaysOutputData": true,
+      "notes": "The webhook resends the WHOLE thread every time. The unique key on (interaction_id, sender, sent_at, body_hash) is what stops five webhooks becoming five copies of every message.\n\nThe message array is passed as ONE jsonb parameter and expanded in SQL, so Arabic text containing commas cannot corrupt the parameter list.",
+      "credentials": { "postgres": { "id": "railway-pg", "name": "railway-pg" } }
     },
     {
       "parameters": {
@@ -109,8 +119,9 @@
           "options": { "caseSensitive": true, "version": 2 },
           "conditions": [
             {
+              "id": "should-eval",
               "leftValue": "={{ $('Parse & compute metrics').item.json.should_evaluate }}",
-              "rightValue": true,
+              "rightValue": "",
               "operator": { "type": "boolean", "operation": "true", "singleValue": true }
             }
           ],
@@ -122,36 +133,33 @@
       "name": "Human agent involved?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
-      "position": [600, 200],
+      "position": [440, 300],
       "notes": "Bot-only threads stop here. Grading a human on the qualification bot's messages makes every QA number wrong."
     },
     {
-      "parameters": {
-        "amount": 30,
-        "unit": "minutes"
-      },
+      "parameters": { "amount": 30, "unit": "minutes" },
       "id": "settle",
       "name": "Wait for thread to settle",
       "type": "n8n-nodes-base.wait",
       "typeVersion": 1.1,
-      "position": [820, 100],
+      "position": [660, 200],
       "webhookId": "chat-settle",
-      "notes": "A conversation grows over days. Re-running the judge on every webhook is expensive and produces churn; this waits until the thread has been idle before spending a model call."
+      "notes": "A conversation grows over days. Re-running the judge on every webhook is expensive and produces churn; this waits until the thread has been idle before spending a model call.\n\nTESTING: set this to 1 minute for the first end-to-end run, then put it back to 30. A Wait longer than ~65s only resumes reliably when the workflow is PUBLISHED, not in a manual execution."
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "SELECT count(*) AS newer\nFROM chat_messages\nWHERE interaction_id = $1::uuid\n  AND sent_at > $2::timestamptz;",
+        "query": "SELECT count(*)::int AS newer\nFROM chat_messages\nWHERE interaction_id = $1::uuid\n  AND sent_at > $2::timestamptz;",
         "options": {
-          "queryReplacement": "={{ $('Upsert interaction').item.json.interaction_id }},{{ $('Parse & compute metrics').item.json.ended_at }}"
+          "queryReplacement": "={{ [ $('Upsert interaction').item.json.interaction_id, $('Parse & compute metrics').item.json.ended_at ] }}"
         }
       },
       "id": "check-stale",
       "name": "Newer messages arrived?",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [1040, 100],
-      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } },
+      "position": [880, 200],
+      "credentials": { "postgres": { "id": "railway-pg", "name": "railway-pg" } },
       "notes": "If the thread grew while we waited, a later run will evaluate the fuller version. Abandoning this run avoids paying twice and avoids a stale score overwriting a fresh one."
     },
     {
@@ -160,6 +168,7 @@
           "options": { "caseSensitive": true, "version": 2 },
           "conditions": [
             {
+              "id": "settled",
               "leftValue": "={{ $json.newer }}",
               "rightValue": 0,
               "operator": { "type": "number", "operation": "equals" }
@@ -173,16 +182,14 @@
       "name": "Still the latest?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
-      "position": [1260, 100]
+      "position": [1100, 200]
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ $env.WORKER_URL }}/evaluate",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [{ "name": "X-API-Key", "value": "={{ $env.WORKER_API_KEY }}" }]
-        },
+        "url": "http://railway-15c718f0.railway.internal:8000/evaluate",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify({ conversation: $('Parse & compute metrics').item.json.transcript_text, input_type: 'chat', metadata: $('Parse & compute metrics').item.json.metrics, run_pass1: true, run_pass2: true }) }}",
@@ -192,36 +199,49 @@
       "name": "Two AI passes",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1480, 100],
-      "notes": "One HTTP call, two separate DeepSeek requests inside. Pass 1 (customer) and pass 2 (agent) never see each other's output."
+      "position": [1320, 200],
+      "credentials": { "httpHeaderAuth": { "id": "worker-api", "name": "worker-api" } },
+      "notes": "One HTTP call, two separate DeepSeek requests inside. Pass 1 (customer) and pass 2 (agent) never see each other's output, so an angry customer cannot drag down the agent's score."
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO agent_evaluations (\n  interaction_id, schema_version, prompt_version, rubric_version, model,\n  input_type, final_score, performance_level, weight_applied,\n  m1_reception, m2_offer, m3_objections, m4_followup, m5_closing,\n  breakdown, evidence, stage_reached, objections_found, behavior_flags,\n  top_strength, top_weakness, top_recommendation, notes, raw_response\n) VALUES (\n  $1::uuid, '1.0', $2, $3, $4, 'chat'::input_type,\n  $5::numeric, $6, $7::numeric,\n  $8::numeric, $9::numeric, $10::numeric, $11::numeric, $12::numeric,\n  $13::jsonb, $14::jsonb, $15::conversation_stage, $16::jsonb, $17::jsonb,\n  $18, $19, $20, $21, $22::jsonb\n)\nON CONFLICT (interaction_id) DO UPDATE SET\n  final_score = EXCLUDED.final_score,\n  performance_level = EXCLUDED.performance_level,\n  weight_applied = EXCLUDED.weight_applied,\n  m1_reception = EXCLUDED.m1_reception, m2_offer = EXCLUDED.m2_offer,\n  m3_objections = EXCLUDED.m3_objections, m4_followup = EXCLUDED.m4_followup,\n  m5_closing = EXCLUDED.m5_closing,\n  breakdown = EXCLUDED.breakdown, evidence = EXCLUDED.evidence,\n  raw_response = EXCLUDED.raw_response, updated_at = now();",
+        "query": "INSERT INTO interaction_analysis (\n  interaction_id, schema_version, prompt_version, model, input_type,\n  language, intent, summary_ar, confidence, uncertain_fields, raw_response\n) VALUES (\n  $1::uuid, '1.0', $2, $3, 'chat'::input_type,\n  $4, $5, $6, $7::numeric, $8::jsonb, $9::jsonb\n)\nON CONFLICT (interaction_id) DO UPDATE SET\n  summary_ar   = EXCLUDED.summary_ar,\n  confidence   = EXCLUDED.confidence,\n  raw_response = EXCLUDED.raw_response,\n  updated_at   = now();",
         "options": {
-          "queryReplacement": "={{ $('Upsert interaction').item.json.interaction_id }},{{ $json.pass2.prompt_version }},{{ $json.rubric_version }},{{ $json.pass2.model }},{{ $json.pass2.final_score }},{{ $json.pass2.performance_level }},{{ $json.pass2.weight_applied }},{{ $json.pass2.modules.module1_reception }},{{ $json.pass2.modules.module2_offer }},{{ $json.pass2.modules.module3_objections }},{{ $json.pass2.modules.module4_followup }},{{ $json.pass2.modules.module5_closing }},{{ JSON.stringify($json.pass2.payload.modules) }},{{ JSON.stringify($json.pass2.payload.evidence) }},{{ $json.pass2.payload.stage_reached }},{{ JSON.stringify($json.pass2.payload.modules.module3_objections.objections_found) }},{{ JSON.stringify($json.pass2.payload.behavior_flags) }},{{ $json.pass2.payload.summary.top_strength }},{{ $json.pass2.payload.summary.top_weakness }},{{ $json.pass2.payload.summary.top_recommendation }},{{ $json.pass2.payload.notes }},{{ JSON.stringify($json.pass2.payload) }}"
+          "queryReplacement": "={{ [ $('Upsert interaction').item.json.interaction_id, $json.pass1.prompt_version, $json.pass1.model, ($json.pass1.payload.language || null), ($json.pass1.payload.intent || null), ($json.pass1.payload.summary_ar || null), ($json.pass1.payload.confidence ?? null), JSON.stringify($json.pass1.payload.uncertain_fields || []), JSON.stringify($json.pass1.payload) ] }}"
+        }
+      },
+      "id": "store-analysis",
+      "name": "Store customer analysis",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1540, 200],
+      "credentials": { "postgres": { "id": "railway-pg", "name": "railway-pg" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO agent_evaluations (\n  interaction_id, schema_version, prompt_version, rubric_version, model,\n  input_type, final_score, performance_level, weight_applied,\n  m1_reception, m2_offer, m3_objections, m4_followup, m5_closing,\n  breakdown, evidence, stage_reached, behavior_flags,\n  top_strength, top_weakness, top_recommendation, notes, raw_response\n) VALUES (\n  $1::uuid, '1.0', $2, $3, $4, 'chat'::input_type,\n  $5::numeric, $6, $7::numeric,\n  $8::numeric, $9::numeric, $10::numeric, $11::numeric, $12::numeric,\n  $13::jsonb, $14::jsonb, $15::conversation_stage, $16::jsonb,\n  $17, $18, $19, $20, $21::jsonb\n)\nON CONFLICT (interaction_id) DO UPDATE SET\n  final_score       = EXCLUDED.final_score,\n  performance_level = EXCLUDED.performance_level,\n  weight_applied    = EXCLUDED.weight_applied,\n  m1_reception      = EXCLUDED.m1_reception,\n  m2_offer          = EXCLUDED.m2_offer,\n  m3_objections     = EXCLUDED.m3_objections,\n  m4_followup       = EXCLUDED.m4_followup,\n  m5_closing        = EXCLUDED.m5_closing,\n  breakdown         = EXCLUDED.breakdown,\n  evidence          = EXCLUDED.evidence,\n  raw_response      = EXCLUDED.raw_response,\n  updated_at        = now();",
+        "options": {
+          "queryReplacement": "={{ [ $('Upsert interaction').item.json.interaction_id, $json.pass2.prompt_version, $json.rubric_version, $json.pass2.model, $json.pass2.final_score, $json.pass2.performance_level, $json.pass2.weight_applied, $json.pass2.modules.module1_reception, $json.pass2.modules.module2_offer, $json.pass2.modules.module3_objections, $json.pass2.modules.module4_followup, $json.pass2.modules.module5_closing, JSON.stringify($json.pass2.payload.modules), JSON.stringify($json.pass2.payload.evidence || []), ($json.pass2.payload.stage_reached || null), JSON.stringify($json.pass2.payload.behavior_flags || []), ($json.pass2.payload.summary?.top_strength || null), ($json.pass2.payload.summary?.top_weakness || null), ($json.pass2.payload.summary?.top_recommendation || null), ($json.pass2.payload.notes || null), JSON.stringify($json.pass2.payload) ] }}"
         }
       },
       "id": "store-eval",
       "name": "Store evaluation",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [1700, 100],
-      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } }
-    },
-    {
-      "parameters": { "respondWith": "text", "responseBody": "ok", "options": {} },
-      "id": "respond",
-      "name": "200 OK",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
-      "position": [-60, 420],
-      "notes": "Answer Bitrix immediately. A webhook sender must never wait on ASR or a model call."
+      "position": [1760, 200],
+      "credentials": { "postgres": { "id": "railway-pg", "name": "railway-pg" } },
+      "notes": "Module scores may be null — that means the situation never arose, which is different from zero. The column is nullable on purpose and weight_applied records the denominator actually used."
     }
   ],
   "connections": {
-    "Bitrix webhook": { "main": [[{ "node": "Land raw (idempotent)", "type": "main", "index": 0 }, { "node": "200 OK", "type": "main", "index": 0 }]] },
+    "Bitrix webhook": {
+      "main": [[
+        { "node": "200 OK", "type": "main", "index": 0 },
+        { "node": "Land raw (idempotent)", "type": "main", "index": 0 }
+      ]]
+    },
     "Land raw (idempotent)": { "main": [[{ "node": "New payload?", "type": "main", "index": 0 }]] },
     "New payload?": { "main": [[{ "node": "Parse & compute metrics", "type": "main", "index": 0 }], []] },
     "Parse & compute metrics": { "main": [[{ "node": "Upsert interaction", "type": "main", "index": 0 }]] },
@@ -231,7 +251,8 @@
     "Wait for thread to settle": { "main": [[{ "node": "Newer messages arrived?", "type": "main", "index": 0 }]] },
     "Newer messages arrived?": { "main": [[{ "node": "Still the latest?", "type": "main", "index": 0 }]] },
     "Still the latest?": { "main": [[{ "node": "Two AI passes", "type": "main", "index": 0 }], []] },
-    "Two AI passes": { "main": [[{ "node": "Store evaluation", "type": "main", "index": 0 }]] }
+    "Two AI passes": { "main": [[{ "node": "Store customer analysis", "type": "main", "index": 0 }]] },
+    "Store customer analysis": { "main": [[{ "node": "Store evaluation", "type": "main", "index": 0 }]] }
   },
   "settings": { "executionOrder": "v1", "saveManualExecutions": true },
   "tags": [{ "name": "customer360" }]
