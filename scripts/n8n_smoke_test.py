@@ -1,19 +1,20 @@
-"""Push a synthetic conversation through the live chats pipeline and check every stage.
+"""Push a synthetic conversation through the live chats pipeline and verify it.
 
-    export DATABASE_URL=postgresql://postgres:PASSWORD@HOST:PORT/customer360
+    export N8N_API_KEY=...
     python scripts/n8n_smoke_test.py
 
-Posts a two-sided Arabic conversation to the n8n webhook, then verifies each
-table in turn: raw_events -> interactions -> chat_messages -> interaction_analysis
--> agent_evaluations.
+Verification goes through n8n's own execution record rather than a direct database
+connection, because Postgres is on Railway's private network with public
+networking OFF — which is how it should stay. n8n runs inside that network and
+reports every node's input and output, so the execution log is both sufficient
+and more honest: it shows what the pipeline actually did, not what the database
+happens to contain.
 
-The fixture is deliberately a *complete* sale — greeting by name, a priced offer,
-a price objection, a close, and a stated follow-up time — so all five rubric
-modules are exercised. That is the opposite of the real discovery call we tested,
-which could only exercise 40% of the rubric, and it is the only way to prove the
-modules that call left null actually work.
-
-Run it twice: the second run must not duplicate anything.
+The fixture is deliberately a COMPLETE sale — greeting by name, a priced offer
+with hotel, dates and cancellation terms, a price objection with a competitor
+comparison, a payment request, and a stated follow-up time. The real call we
+tested was a discovery call that could only exercise 40% of the rubric, so it
+proved nothing about modules 3, 4 and 5. This one exercises all five.
 """
 from __future__ import annotations
 
@@ -22,14 +23,15 @@ import json
 import os
 import sys
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
 
 N8N_BASE = os.getenv("N8N_BASE_URL", "https://n8n-production-a685c.up.railway.app")
 WEBHOOK = f"{N8N_BASE}/webhook/travelgate/chat"
+WORKFLOW_ID = os.getenv("N8N_WORKFLOW_ID", "i6VM7qxmbYEDebDx")
 
-DIALOG_ID = os.getenv("SMOKE_DIALOG_ID", "smoke-test-001")
 START = datetime(2026, 7, 30, 10, 0, tzinfo=timezone(timedelta(hours=3)))
 
 # (sender, text, minutes_after_start)
@@ -46,10 +48,18 @@ SCRIPT = [
     ("Agent",    "وصلني التحويل، شكراً جزيلاً أستاذ أحمد وأهلاً وسهلاً بك في ترافل جيت! الحجز مؤكد الآن. سأرسل لك التأكيد والتذاكر خلال ساعتين كما وعدتك. وأتمنى بعد رحلتكم تقيّم خدمتنا وتشاركنا رأيك، يهمنا جداً.", 33),
 ]
 
+EXPECTED_NODES = [
+    "Bitrix webhook", "Land raw (idempotent)", "New payload?",
+    "Parse & compute metrics", "Upsert interaction", "Insert messages (dedup)",
+    "Human agent involved?", "Wait for thread to settle",
+    "Newer messages arrived?", "Still the latest?", "Two AI passes",
+    "Store customer analysis", "Store evaluation",
+]
 
-def payload() -> dict:
+
+def payload(dialog_id: str) -> dict:
     return {
-        "dialog_id": DIALOG_ID,
+        "dialog_id": dialog_id,
         "crm_entity_type": "DEAL",
         "crm_entity_id": "99001",
         "contact_id": "99002",
@@ -75,124 +85,140 @@ def payload() -> dict:
     }
 
 
-def connect():
-    import psycopg
+class N8N:
+    def __init__(self):
+        key = os.getenv("N8N_API_KEY")
+        if not key:
+            raise SystemExit("N8N_API_KEY is not set")
+        self.c = httpx.Client(base_url=N8N_BASE.rstrip("/") + "/api/v1",
+                              headers={"X-N8N-API-KEY": key}, timeout=90.0)
 
-    url = os.getenv("DATABASE_URL")
-    if not url:
-        raise SystemExit("DATABASE_URL is not set")
-    if "/customer360" not in url:
-        raise SystemExit("DATABASE_URL does not point at the customer360 database")
-    return psycopg.connect(url, autocommit=True)
+    def latest_execution(self) -> dict | None:
+        r = self.c.get("/executions",
+                       params={"workflowId": WORKFLOW_ID, "limit": 1, "includeData": "true"})
+        r.raise_for_status()
+        data = r.json().get("data") or []
+        return data[0] if data else None
+
+    def execution(self, eid) -> dict:
+        r = self.c.get(f"/executions/{eid}", params={"includeData": "true"})
+        r.raise_for_status()
+        return r.json()
 
 
-def check(conn, label: str, sql: str, params=()) -> tuple[bool, str]:
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
-        row = cur.fetchone()
-    ok = bool(row and row[0])
-    detail = " · ".join(str(x) for x in row) if row else "no row"
-    print(f"  {'PASS' if ok else 'FAIL'}  {label:34s} {detail}")
-    return ok, detail
+def node_states(execution: dict) -> tuple[dict[str, str], dict]:
+    result = (execution.get("data") or {}).get("resultData") or {}
+    run = result.get("runData") or {}
+    states, outputs = {}, {}
+    for name, runs in run.items():
+        first = runs[0] if runs else {}
+        if first.get("error"):
+            states[name] = "ERROR: " + str(first["error"].get("message"))[:160]
+        else:
+            states[name] = "ok"
+            try:
+                outputs[name] = first["data"]["main"][0][0]["json"]
+            except (KeyError, IndexError, TypeError):
+                pass
+    if result.get("error"):
+        err = result["error"]
+        states.setdefault(err.get("node", {}).get("name", "?"),
+                          "ERROR: " + str(err.get("message"))[:160])
+    return states, outputs
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wait", type=int, default=180,
-                    help="seconds to wait for the settle Wait node + both AI passes")
+    ap.add_argument("--wait", type=int, default=420, help="seconds to wait for completion")
+    ap.add_argument("--dialog-id", default=None)
     args = ap.parse_args()
 
-    body = payload()
+    dialog_id = args.dialog_id or f"smoke-{uuid.uuid4().hex[:8]}"
+    body = payload(dialog_id)
     agents = sum(1 for m in body["conversation_history"] if m["sender"] == "Agent")
-    print(f"posting {len(body['conversation_history'])} messages "
-          f"({agents} from the agent) to\n  {WEBHOOK}\n")
 
-    r = httpx.post(WEBHOOK, json=body, timeout=60.0)
-    print(f"webhook -> HTTP {r.status_code} {r.text[:80]!r}")
+    print(f"dialog_id : {dialog_id}")
+    print(f"messages  : {len(body['conversation_history'])} ({agents} from the agent)")
+    print(f"posting to: {WEBHOOK}\n")
+
+    n8n = N8N()
+    before = n8n.latest_execution()
+    before_id = before["id"] if before else None
+
+    r = httpx.post(WEBHOOK, json=body, timeout=90.0)
+    print(f"webhook -> HTTP {r.status_code} {r.text[:60]!r}")
     if r.status_code == 404:
-        raise SystemExit("404 — the workflow is not published. Run n8n_setup.py --apply first.")
-    if r.status_code >= 400:
-        raise SystemExit(f"webhook rejected the payload: {r.text[:300]}")
+        raise SystemExit("404 — workflow not published. Run n8n_setup.py --apply first.")
+    r.raise_for_status()
 
-    conn = connect()
+    print(f"\nwaiting up to {args.wait}s for the execution to finish "
+          "(1-minute settle window + two DeepSeek calls)")
 
-    print("\nstage 1 — ingest (immediate)")
-    time.sleep(8)
-    results = [
-        check(conn, "raw_events landed",
-              "SELECT count(*) FROM raw_events WHERE external_ref = %s", (DIALOG_ID,)),
-        check(conn, "interaction created",
-              "SELECT count(*), max(channel::text) FROM interactions "
-              "WHERE external_id = %s AND external_source = 'bitrix'", (DIALOG_ID,)),
-        check(conn, "messages stored",
-              "SELECT count(*) FROM chat_messages m JOIN interactions i "
-              "USING (interaction_id) WHERE i.external_id = %s", (DIALOG_ID,)),
-        check(conn, "phone normalised to E.164",
-              "SELECT count(*) FROM interactions WHERE external_id = %s "
-              "AND customer_phone_e164 = '+966500000001'", (DIALOG_ID,)),
-        check(conn, "agent messages recognised",
-              "SELECT agent_message_count FROM interactions WHERE external_id = %s", (DIALOG_ID,)),
-        check(conn, "not flagged bot-only",
-              "SELECT NOT is_bot_handled FROM interactions WHERE external_id = %s", (DIALOG_ID,)),
-    ]
-
-    print(f"\nstage 2 — waiting up to {args.wait}s for the settle window and both AI passes")
-    deadline = time.time() + args.wait
-    scored = False
+    eid, deadline = None, time.time() + args.wait
+    seen_states: dict[str, str] = {}
     while time.time() < deadline:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT count(*) FROM agent_evaluations e JOIN interactions i "
-                "USING (interaction_id) WHERE i.external_id = %s", (DIALOG_ID,))
-            if cur.fetchone()[0]:
-                scored = True
-                break
+        latest = n8n.latest_execution()
+        if latest and latest["id"] != before_id:
+            eid = latest["id"]
+            ex = n8n.execution(eid)
+            states, outputs = node_states(ex)
+            for name, st in states.items():
+                if seen_states.get(name) != st:
+                    mark = "  ok  " if st == "ok" else "  FAIL"
+                    print(f"{mark} {name}" + ("" if st == "ok" else f"  :: {st[7:]}"))
+                    seen_states[name] = st
+            status = ex.get("status")
+            if status in ("success", "error", "crashed", "canceled"):
+                return report(ex, status, dialog_id)
         time.sleep(10)
-        print("   ...", end="", flush=True)
-    print()
 
-    if not scored:
-        print("  FAIL  no evaluation row yet.")
-        print("        Check n8n > Executions for workflow 01. If it is paused on the")
-        print("        Wait node, that is expected — re-run with --wait 2000, or set the")
-        print("        Wait node to 1 minute (n8n_setup.py --test-wait).")
-        return 1
+    print("\ntimed out. Current execution status:", (n8n.execution(eid).get("status") if eid else "none"))
+    print("If it is 'waiting', the Wait node has not resumed yet — re-run with --wait 2000.")
+    return 1
 
-    print("stage 3 — AI output")
-    results += [
-        check(conn, "customer analysis stored",
-              "SELECT count(*), max(summary_ar) FROM interaction_analysis a "
-              "JOIN interactions i USING (interaction_id) WHERE i.external_id = %s", (DIALOG_ID,)),
-        check(conn, "evaluation stored",
-              "SELECT final_score, performance_level, weight_applied FROM agent_evaluations e "
-              "JOIN interactions i USING (interaction_id) WHERE i.external_id = %s", (DIALOG_ID,)),
-        check(conn, "all 5 modules scored",
-              "SELECT (m1_reception IS NOT NULL AND m2_offer IS NOT NULL "
-              "AND m3_objections IS NOT NULL AND m5_closing IS NOT NULL) "
-              "FROM agent_evaluations e JOIN interactions i USING (interaction_id) "
-              "WHERE i.external_id = %s", (DIALOG_ID,)),
-        check(conn, "evidence cited",
-              "SELECT jsonb_array_length(evidence) FROM agent_evaluations e "
-              "JOIN interactions i USING (interaction_id) WHERE i.external_id = %s", (DIALOG_ID,)),
-    ]
 
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT final_score, performance_level, weight_applied, m1_reception, m2_offer, "
-            "m3_objections, m4_followup, m5_closing, stage_reached, top_weakness "
-            "FROM agent_evaluations e JOIN interactions i USING (interaction_id) "
-            "WHERE i.external_id = %s", (DIALOG_ID,))
-        row = cur.fetchone()
-    if row:
-        keys = ["final_score", "level", "weight_applied", "m1", "m2", "m3", "m4", "m5",
-                "stage", "top_weakness"]
-        print("\nscored row:")
-        print(json.dumps(dict(zip(keys, [str(x) for x in row])), ensure_ascii=False, indent=2))
+def report(ex: dict, status: str, dialog_id: str) -> int:
+    states, outputs = node_states(ex)
+    print(f"\nexecution {ex.get('id')} finished: {status}\n")
 
-    failed = [d for ok, d in results if not ok]
-    print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
-    print("\nRun this script again — nothing should duplicate (idempotency check).")
-    return 0 if not failed else 1
+    reached = [n for n in EXPECTED_NODES if n in states]
+    missing = [n for n in EXPECTED_NODES if n not in states]
+    failed = {n: s for n, s in states.items() if s != "ok"}
+
+    print(f"nodes run   : {len(reached)}/{len(EXPECTED_NODES)}")
+    if missing:
+        print(f"not reached : {', '.join(missing)}")
+    if failed:
+        print("\nfailures:")
+        for n, s in failed.items():
+            print(f"  {n}: {s}")
+
+    evaluate = outputs.get("Two AI passes")
+    if evaluate and isinstance(evaluate.get("pass2"), dict):
+        p2 = evaluate["pass2"]
+        print("\n=== SCORED ===")
+        print(f"  final_score      : {p2.get('final_score')}")
+        print(f"  performance_level: {p2.get('performance_level')}")
+        print(f"  weight_applied   : {p2.get('weight_applied')}")
+        for k, v in (p2.get("modules") or {}).items():
+            print(f"    {k:24s} {v}")
+        summary = (p2.get("payload") or {}).get("summary") or {}
+        if summary:
+            print("\n  coaching:")
+            for k, v in summary.items():
+                print(f"    {k}: {v}")
+        for w in p2.get("warnings") or []:
+            print(f"  ! {w}")
+        p1 = (evaluate.get("pass1") or {}).get("payload") or {}
+        if p1:
+            print(f"\n  customer: {(p1.get('customer') or {}).get('name')} · "
+                  f"{p1.get('service')} · stage={(p1.get('commercial') or {}).get('buying_stage')}")
+
+    ok = status == "success" and not failed
+    print(f"\n{'PASS' if ok else 'FAIL'} — dialog_id {dialog_id}")
+    if ok:
+        print("Re-run to confirm idempotency: the second run must not duplicate rows.")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

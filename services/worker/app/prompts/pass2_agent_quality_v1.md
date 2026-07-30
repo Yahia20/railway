@@ -82,6 +82,16 @@ Any criterion you score below full marks MUST have a corresponding entry in the
 `evidence` array containing the exact quote it rests on. A deduction with no
 quote is not a finding — award the points instead.
 
+⛔ **Quotes must be VERBATIM and CONTIGUOUS.** Every `evidence.quote` is checked
+character-for-character against the conversation, and a quote that is not found
+is discarded along with the finding it supports.
+
+- Never add `...` or `…`. Never truncate mid-quote.
+- Never join two separate parts of a message into one quote.
+- Never tidy up spelling, spacing or punctuation.
+- If the passage you want is long, quote a SHORT contiguous span of it — ten
+  words that actually appear beat fifty that have been abridged.
+
 Do not infer intent. Evaluate only what the agent explicitly said.
 
 =============================================================

@@ -43,21 +43,22 @@
     {
       "parameters": {
         "conditions": {
-          "options": { "caseSensitive": true, "version": 2 },
+          "options": { "caseSensitive": true, "version": 2, "typeValidation": "loose" },
           "conditions": [
             {
               "id": "has-raw-id",
-              "leftValue": "={{ $json.raw_id }}",
+              "leftValue": "={{ !!$json.raw_id }}",
               "rightValue": "",
-              "operator": { "type": "number", "operation": "exists", "singleValue": true }
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
             }
           ],
           "combinator": "and"
         },
-        "options": {}
+        "options": { "looseTypeValidation": true }
       },
       "id": "is-new",
       "name": "New payload?",
+      "notes": "The condition is coerced to a boolean on purpose. Postgres returns bigserial as a STRING, so a number-typed comparison fails with \"'6' is a string but was expecting a number\" — and when ON CONFLICT DO NOTHING suppresses the row, raw_id is absent entirely. !! handles both.",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [-440, 300]
@@ -165,21 +166,22 @@
     {
       "parameters": {
         "conditions": {
-          "options": { "caseSensitive": true, "version": 2 },
+          "options": { "caseSensitive": true, "version": 2, "typeValidation": "loose" },
           "conditions": [
             {
               "id": "settled",
-              "leftValue": "={{ $json.newer }}",
-              "rightValue": 0,
-              "operator": { "type": "number", "operation": "equals" }
+              "leftValue": "={{ Number($json.newer || 0) === 0 }}",
+              "rightValue": "",
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
             }
           ],
           "combinator": "and"
         },
-        "options": {}
+        "options": { "looseTypeValidation": true }
       },
       "id": "is-settled",
       "name": "Still the latest?",
+      "notes": "Same string-vs-number trap as 'New payload?': count(*) comes back as a string. Number() coercion rather than a typed comparison.",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [1100, 200]
@@ -223,7 +225,7 @@
         "operation": "executeQuery",
         "query": "INSERT INTO agent_evaluations (\n  interaction_id, schema_version, prompt_version, rubric_version, model,\n  input_type, final_score, performance_level, weight_applied,\n  m1_reception, m2_offer, m3_objections, m4_followup, m5_closing,\n  breakdown, evidence, stage_reached, behavior_flags,\n  top_strength, top_weakness, top_recommendation, notes, raw_response\n) VALUES (\n  $1::uuid, '1.0', $2, $3, $4, 'chat'::input_type,\n  $5::numeric, $6, $7::numeric,\n  $8::numeric, $9::numeric, $10::numeric, $11::numeric, $12::numeric,\n  $13::jsonb, $14::jsonb, $15::conversation_stage, $16::jsonb,\n  $17, $18, $19, $20, $21::jsonb\n)\nON CONFLICT (interaction_id) DO UPDATE SET\n  final_score       = EXCLUDED.final_score,\n  performance_level = EXCLUDED.performance_level,\n  weight_applied    = EXCLUDED.weight_applied,\n  m1_reception      = EXCLUDED.m1_reception,\n  m2_offer          = EXCLUDED.m2_offer,\n  m3_objections     = EXCLUDED.m3_objections,\n  m4_followup       = EXCLUDED.m4_followup,\n  m5_closing        = EXCLUDED.m5_closing,\n  breakdown         = EXCLUDED.breakdown,\n  evidence          = EXCLUDED.evidence,\n  raw_response      = EXCLUDED.raw_response,\n  updated_at        = now();",
         "options": {
-          "queryReplacement": "={{ [ $('Upsert interaction').item.json.interaction_id, $json.pass2.prompt_version, $json.rubric_version, $json.pass2.model, $json.pass2.final_score, $json.pass2.performance_level, $json.pass2.weight_applied, $json.pass2.modules.module1_reception, $json.pass2.modules.module2_offer, $json.pass2.modules.module3_objections, $json.pass2.modules.module4_followup, $json.pass2.modules.module5_closing, JSON.stringify($json.pass2.payload.modules), JSON.stringify($json.pass2.payload.evidence || []), ($json.pass2.payload.stage_reached || null), JSON.stringify($json.pass2.payload.behavior_flags || []), ($json.pass2.payload.summary?.top_strength || null), ($json.pass2.payload.summary?.top_weakness || null), ($json.pass2.payload.summary?.top_recommendation || null), ($json.pass2.payload.notes || null), JSON.stringify($json.pass2.payload) ] }}"
+          "queryReplacement": "={{ [ $('Upsert interaction').item.json.interaction_id, $json.pass2.prompt_version, $json.rubric_version, $json.pass2.model, $json.pass2.final_score, $json.pass2.performance_level, $json.pass2.weight_applied, $json.pass2.modules.module1_reception, $json.pass2.modules.module2_offer, $json.pass2.modules.module3_objections, $json.pass2.modules.module4_followup, $json.pass2.modules.module5_closing, JSON.stringify($json.pass2.payload.modules || {}), JSON.stringify($json.pass2.payload.evidence || []), $json.pass2.payload.stage_reached || null, JSON.stringify($json.pass2.payload.behavior_flags || []), ($json.pass2.payload.summary || {}).top_strength || null, ($json.pass2.payload.summary || {}).top_weakness || null, ($json.pass2.payload.summary || {}).top_recommendation || null, $json.pass2.payload.notes || null, JSON.stringify($json.pass2.payload) ] }}"
         }
       },
       "id": "store-eval",
