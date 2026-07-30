@@ -3,13 +3,23 @@
   "nodes": [
     {
       "parameters": {
-        "rule": { "interval": [{ "field": "cronExpression", "expression": "0 2 * * *" }] }
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * *"
+            }
+          ]
+        }
       },
       "id": "sched",
       "name": "02:00 daily",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
-      "position": [-600, 300]
+      "position": [
+        -600,
+        300
+      ]
     },
     {
       "parameters": {
@@ -21,8 +31,16 @@
       "name": "Resolve identity (phone)",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [-380, 300],
-      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } },
+      "position": [
+        -380,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "Railway Postgres"
+        }
+      },
       "notes": "Phone match only — it is the one match that is certain. CRM-id and fuzzy-name matching are deliberately NOT automated: a wrong merge is expensive to undo and every match is written to customer_identities with its method and confidence."
     },
     {
@@ -35,8 +53,16 @@
       "name": "Materialise promises",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [-160, 300],
-      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } }
+      "position": [
+        -160,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "Railway Postgres"
+        }
+      }
     },
     {
       "parameters": {
@@ -48,8 +74,16 @@
       "name": "Close / expire promises",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [60, 300],
-      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } }
+      "position": [
+        60,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "Railway Postgres"
+        }
+      }
     },
     {
       "parameters": {
@@ -61,31 +95,105 @@
       "name": "Rebuild customer_metrics",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [280, 300],
-      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } },
+      "position": [
+        280,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "Railway Postgres"
+        }
+      },
       "notes": "Truncate and rebuild. customer_metrics is fully derived, so it can always be dropped and recomputed — which is what stops a wrong dashboard number from becoming permanent."
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "INSERT INTO job_runs (job_name, status, finished_at, items_ok, detail)\nVALUES ('nightly_aggregate', 'succeeded', now(), $1::int,\n        jsonb_build_object('rows_rebuilt', $1::int));",
-        "options": { "queryReplacement": "={{ $json.rows_rebuilt }}" }
+        "options": {
+          "queryReplacement": "={{ [ $json.rows_rebuilt ] }}"
+        }
       },
       "id": "log",
       "name": "Log run",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [500, 300],
-      "credentials": { "postgres": { "id": "railway-pg", "name": "Railway Postgres" } }
+      "position": [
+        500,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "Railway Postgres"
+        }
+      }
     }
   ],
   "connections": {
-    "02:00 daily": { "main": [[{ "node": "Resolve identity (phone)", "type": "main", "index": 0 }]] },
-    "Resolve identity (phone)": { "main": [[{ "node": "Materialise promises", "type": "main", "index": 0 }]] },
-    "Materialise promises": { "main": [[{ "node": "Close / expire promises", "type": "main", "index": 0 }]] },
-    "Close / expire promises": { "main": [[{ "node": "Rebuild customer_metrics", "type": "main", "index": 0 }]] },
-    "Rebuild customer_metrics": { "main": [[{ "node": "Log run", "type": "main", "index": 0 }]] }
+    "02:00 daily": {
+      "main": [
+        [
+          {
+            "node": "Resolve identity (phone)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve identity (phone)": {
+      "main": [
+        [
+          {
+            "node": "Materialise promises",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Materialise promises": {
+      "main": [
+        [
+          {
+            "node": "Close / expire promises",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Close / expire promises": {
+      "main": [
+        [
+          {
+            "node": "Rebuild customer_metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rebuild customer_metrics": {
+      "main": [
+        [
+          {
+            "node": "Log run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
   },
-  "settings": { "executionOrder": "v1" },
-  "tags": [{ "name": "customer360" }]
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    {
+      "name": "customer360"
+    }
+  ]
 }

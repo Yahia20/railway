@@ -93,12 +93,31 @@ class N8N:
         self.c = httpx.Client(base_url=N8N_BASE.rstrip("/") + "/api/v1",
                               headers={"X-N8N-API-KEY": key}, timeout=90.0)
 
-    def latest_execution(self) -> dict | None:
-        r = self.c.get("/executions",
-                       params={"workflowId": WORKFLOW_ID, "limit": 1, "includeData": "true"})
+    def recent(self, limit: int = 15) -> list[dict]:
+        r = self.c.get("/executions", params={"workflowId": WORKFLOW_ID, "limit": limit})
         r.raise_for_status()
-        data = r.json().get("data") or []
-        return data[0] if data else None
+        return r.json().get("data") or []
+
+    def find_by_dialog(self, dialog_id: str) -> dict | None:
+        """Match on OUR dialog_id, not on 'most recent'.
+
+        Anyone else testing the same webhook produces executions too, and
+        latching onto the newest one reports someone else's run as ours — which
+        is exactly what happened the first time this script was used.
+        """
+        for row in self.recent():
+            ex = self.execution(row["id"])
+            run = (ex.get("data") or {}).get("resultData", {}).get("runData", {})
+            hook = run.get("Bitrix webhook")
+            if not hook:
+                continue
+            try:
+                body = hook[0]["data"]["main"][0][0]["json"]["body"]
+            except (KeyError, IndexError, TypeError):
+                continue
+            if body.get("dialog_id") == dialog_id:
+                return ex
+        return None
 
     def execution(self, eid) -> dict:
         r = self.c.get(f"/executions/{eid}", params={"includeData": "true"})
@@ -142,8 +161,6 @@ def main() -> int:
     print(f"posting to: {WEBHOOK}\n")
 
     n8n = N8N()
-    before = n8n.latest_execution()
-    before_id = before["id"] if before else None
 
     r = httpx.post(WEBHOOK, json=body, timeout=90.0)
     print(f"webhook -> HTTP {r.status_code} {r.text[:60]!r}")
@@ -151,16 +168,15 @@ def main() -> int:
         raise SystemExit("404 — workflow not published. Run n8n_setup.py --apply first.")
     r.raise_for_status()
 
-    print(f"\nwaiting up to {args.wait}s for the execution to finish "
-          "(1-minute settle window + two DeepSeek calls)")
+    print(f"\nwaiting up to {args.wait}s for OUR execution "
+          "(settle window + two DeepSeek calls)")
 
     eid, deadline = None, time.time() + args.wait
     seen_states: dict[str, str] = {}
     while time.time() < deadline:
-        latest = n8n.latest_execution()
-        if latest and latest["id"] != before_id:
-            eid = latest["id"]
-            ex = n8n.execution(eid)
+        ex = n8n.find_by_dialog(dialog_id)
+        if ex:
+            eid = ex["id"]
             states, outputs = node_states(ex)
             for name, st in states.items():
                 if seen_states.get(name) != st:
