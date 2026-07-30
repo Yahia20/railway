@@ -1,0 +1,8 @@
+tests/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+requirements-local-asr.txt
+railway.json
+README.md

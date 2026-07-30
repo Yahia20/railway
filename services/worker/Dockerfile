@@ -18,12 +18,18 @@ COPY app ./app
 RUN useradd --create-home --uid 10001 worker && chown -R worker:worker /app
 USER worker
 
-ENV WORK_DIR=/tmp/customer360
+ENV WORK_DIR=/tmp/customer360 \
+    PORT=8000
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"
+# No Docker HEALTHCHECK on purpose. Railway probes `healthcheckPath` itself, and
+# a second probe with a hardcoded port would report the container unhealthy the
+# moment Railway assigns a different $PORT.
 
-# Railway supplies $PORT. Single worker: the container is I/O-bound on model
-# calls, and Railway scales by replica rather than by process.
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Bind :: — Railway's private network is IPv6-only, so a service listening on
+# 0.0.0.0 is unreachable at <service>.railway.internal no matter what the
+# healthcheck says. `::` is dual-stack on Linux and serves IPv4 as well.
+#
+# ${PORT:-8000} keeps this runnable with plain `docker run`, and exec makes
+# uvicorn PID 1 so it receives SIGTERM and shuts down cleanly on redeploy.
+CMD ["sh", "-c", "exec uvicorn app.main:app --host :: --port ${PORT:-8000}"]
