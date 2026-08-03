@@ -1,7 +1,11 @@
 # HANDOFF — TravelGate Customer 360 & Sales Quality
 
-Complete context for someone (or some model) picking this up cold. Written
-2026-07-30. No secrets in this file — see [§10](#10-secrets) for where each one lives.
+Complete context for someone (or some model) picking this up cold. Updated
+2026-07-30 after the chats pipeline was verified live. No secrets in this file —
+see [§10](#10-secrets) for where each one lives.
+
+**If you are Claude Code and just opened this folder: `CLAUDE.md` has the rules
+and gotchas in short form. This file has the why.**
 
 ---
 
@@ -363,55 +367,74 @@ skip when absent. **Keep it that way**, or consider making the repo private.
 
 ## 8 · What remains
 
-### Blocking chats going live
+### ✅ Chats — DONE and verified live
 
-1. **Bitrix IT must send us conversations.** Forward
-   `docs/bitrix-integration-spec.md` — it has an Arabic summary, the handler URL
-   and a `curl` to test with.
+Workflow 01 is **active** and ran all 14 nodes to success on a live webhook post
+(n8n execution 25, and again on 22):
 
-   Handler URL: `https://n8n-production-a685c.up.railway.app/webhook/travelgate/chat`
+```
+Bitrix webhook → Land raw → New payload? → Parse & compute metrics
+→ Upsert interaction → Insert messages → Human agent involved?
+→ Wait (30 min) → Newer messages? → Still latest? → Two AI passes
+→ Store customer analysis → Store evaluation → 200 OK
+```
 
-   ⚠️ **The critical ask:** their sample payload contained **only customer
-   messages** (all five entries `"sender": "Customer"`). We score the *agent* —
-   without the agent's replies there is nothing to score. They must send both
-   sides, with `sender` distinguishing `Customer` / `Agent` / `Bot`. Agent and Bot
-   must be separable, or the qualification bot's work gets credited to staff.
+The synthetic fixture (a complete sale: greeting by name, priced offer with
+hotel/dates/terms, price objection with competitor comparison, payment request,
+stated follow-up time) scored **100 / Excellent on weight_applied 0.8**, stage
+`deal_closed`, 15 evidence items, customer extracted as أحمد / package /
+purchased. Four modules scored; follow-up correctly `null`.
 
-   Also: none of the three events currently selected on their outbound webhook
-   (`ONIMCONNECTORMESSAGEADD`, `…UPDATE`, `ONIMBOTMESSAGEADD`) carries human agent
-   replies. They need `OnImOpenLinesMessageAdd`, or to send the full session
-   history when a conversation closes.
+Reproduce any time: `python scripts/n8n_smoke_test.py`
 
-2. **Workflow 01 needs to be finished in n8n.** It is imported but not working:
-   - Postgres credential `railway-pg` must point at database **`customer360`**
-   - A **Header Auth** credential is needed: name `worker-api`, header
-     `X-API-Key`, value = the worker API key (§10)
-   - Both credentials must be **re-selected on every node** (6 Postgres, 2 HTTP)
-   - The Wait node is 30 min; set it to 1 min for the first test
-   - The workflow must be **Published** (webhook 404s until then)
+**Four bugs were found by running it for real** — all fixed, all worth knowing
+because they are n8n behaviours, not typos. They are listed as gotchas 4–7 in
+`CLAUDE.md`.
 
-   **Better path than clicking:** create an n8n API key
-   (Settings → API → Create) and patch the workflow programmatically via
-   `PATCH /api/v1/workflows/{id}` — it can set credential IDs directly. This
-   avoids the whole re-selection problem and is repeatable.
+### ⏳ Chats — waiting on the client
 
-### Blocking calls going live
+**Bitrix must actually send us conversations.** Forward
+`docs/bitrix-integration-spec.md` (Arabic summary, handler URL, `curl` to test).
 
-3. **Google Drive service account** — JSON key + the recordings folder ID, with
-   the folder shared to the service account's email. Set
+Handler: `https://n8n-production-a685c.up.railway.app/webhook/travelgate/chat`
+
+⚠️ **The one thing that decides whether this works:** their sample payload
+contained **only customer messages** — all five entries `"sender": "Customer"`.
+We score the *agent*. Without their replies there is nothing to score, every
+conversation is flagged bot-only and skipped, and the pipeline will look broken
+while behaving exactly as designed.
+
+They also need `OnImOpenLinesMessageAdd` (or to send the full session history on
+close). None of the three events currently on their outbound webhook carries a
+human agent's reply.
+
+### ❌ Calls — built, never run
+
+Workflow 02 is **inactive and untested**. It needs:
+
+1. **A Google Drive service account** — JSON key plus the recordings folder ID,
+   with the folder shared to the service account's email. Then set
    `DRIVE_CALLS_FOLDER_ID` and `GOOGLE_SERVICE_ACCOUNT_JSON` on the worker.
-4. **Fix workflow 02's comma bug** (§7) before it runs. Untestable until 3 is done.
-5. **Ask the PBX team for two-channel recording** (§6).
+2. A first run against a real recording. The ASR itself is already proven (13/13
+   chunks on the sample call), and the same comma/jsonb parameter fixes from
+   workflow 01 have been applied — but **nothing in workflow 02 has ever
+   executed**, so treat it as unverified.
+3. **Two-channel recording from the PBX** — free, one config change, and it turns
+   speaker attribution from inferred into measured. Highest-value ask available.
 
-### Security, do soon
+### ❌ Nightly (workflow 03) — inactive
 
-6. **Disable public networking on the Postgres service.** It was enabled to run
-   migrations and is no longer needed.
-7. **Rotate three secrets** — all appeared in a chat transcript:
-   the **Bitrix REST token** (highest priority — it was in a folder headed for a
-   public repo), the DeepSeek API key, and the Postgres password.
+Fixed and ready, but there is nothing to aggregate until real conversations flow.
+Activate it once they do.
 
----
+### 🔒 Security — do soon
+
+- **Rotate the Bitrix REST token** (`v7yx…`). Highest priority: it was in a
+  folder headed for a public repo.
+- Rotate the DeepSeek API key and the Postgres password — both appeared in a chat
+  transcript.
+- Postgres public networking has already been turned **off**. Keep it off; use
+  `scripts/railway_api.py` or n8n for database access.
 
 ## 9 · Open decisions
 
@@ -458,31 +481,31 @@ python scripts/railway_configure.py --apply
 
 ---
 
-## 11 · Verify the current state in 30 seconds
+## 11 · Verify the current state in 60 seconds
 
 ```bash
-# worker alive
+# 1. worker alive
 curl https://railway-production-d648.up.railway.app/health
 # -> {"status":"ok","version":"1.0.0"}
 
-# what is configured (needs the key)
-curl -H "X-API-Key: $WORKER_API_KEY" \
-  https://railway-production-d648.up.railway.app/ready
-# -> database: ready, judge: ready,
-#    chats_source: missing BITRIX_WEBHOOK_TOKEN   (only needed for backfill pull)
-#    calls_source: missing DRIVE_* vars           (expected)
+# 2. what is configured
+curl -H "X-API-Key: $WORKER_API_KEY"   https://railway-production-d648.up.railway.app/ready
+# -> database: ready, judge: ready
+#    chats_source: missing BITRIX_WEBHOOK_TOKEN  (only needed for backfill pull)
+#    calls_source: missing DRIVE_* vars          (expected — calls not wired)
 
-# schema present
-psql "$DATABASE_URL" -c \
-  "select count(*) from information_schema.tables where table_schema='public'"
-# -> 25
+# 3. tests
+cd services/worker && pytest tests/ -q          # 37 passed
 
-# tests
-cd services/worker && pytest tests/ -q     # 37 passed
+# 4. the whole chats pipeline, live
+export N8N_API_KEY=...
+python scripts/n8n_smoke_test.py                # expect PASS, 13/13 nodes
 ```
 
-**Status summary:** database live and migrated; worker deployed and healthy with
-DeepSeek and Postgres connected; ASR and the full two-pass evaluation proven
-end-to-end on a real call; n8n running with three workflows imported but
-workflow 01 not yet credentialled or published. Chats go live when Bitrix IT
-posts to the webhook **with agent messages included**.
+If step 4 passes, everything on our side works and the only thing missing is
+real data from Bitrix.
+
+**Status:** database live and migrated; worker deployed and healthy with DeepSeek
+and Postgres connected; ASR and the two-pass evaluation proven on a real call;
+**chats workflow verified end to end and active**; calls workflow built but never
+executed; Bitrix not yet sending.
