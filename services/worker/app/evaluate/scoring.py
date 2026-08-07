@@ -238,6 +238,39 @@ def validate_stage_consistency(payload: dict, modules: dict[str, Any]) -> list[s
     return []
 
 
+def validate_ranges(modules: dict[str, Any]) -> list[str]:
+    """Reject criterion values outside their 0..cap range.
+
+    A model that returns 50 for a criterion capped at 25 has misread the rubric,
+    usually by scoring against a 100-point scale it invented. Clamping to the cap
+    would fabricate a score the model never gave, so this is a re-ask, not a
+    repair — the same reasoning as every other check here.
+
+    Without this, `module_score` raises RubricError later and the whole request
+    fails: observed on 4 of 25 real conversations, all with
+    `module3_objections.price_objection = 50`.
+    """
+    problems = []
+    for module_key, caps in CRITERION_MAX.items():
+        breakdown = (modules.get(module_key) or {}).get("breakdown") or {}
+        for name, cap in caps.items():
+            value = breakdown.get(name)
+            if value is None or name not in breakdown:
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                problems.append(
+                    f"{module_key}.{name} is {value!r}, expected a number 0-{cap} or null"
+                )
+            elif not 0 <= value <= cap:
+                problems.append(
+                    f"{module_key}.{name} = {value}, outside its range — "
+                    f"score it 0-{cap}, not on a 0-100 scale"
+                )
+    return problems
+
+
 def contract_violations(payload: dict, modules: dict[str, Any]) -> list[str]:
     """Every check that means the response should be re-asked, not repaired."""
-    return validate_nullability(modules) + validate_stage_consistency(payload, modules)
+    return (validate_nullability(modules)
+            + validate_ranges(modules)
+            + validate_stage_consistency(payload, modules))

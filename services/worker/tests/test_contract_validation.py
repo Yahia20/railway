@@ -96,6 +96,39 @@ def test_contract_violations_aggregates_both_checks():
     assert len(problems) == 2
 
 
+def test_out_of_range_criterion_is_a_contract_violation():
+    """The real failure on the Jul-Aug chat batch: the model scored
+    price_objection 50 against a cap of 25, on 4 of 25 conversations.
+
+    Before this guard the value passed contract_violations untouched, so the
+    re-ask never fired and compute() raised RubricError into a 500."""
+    modules = _modules(module3_objections={
+        "price_objection": 50, "competitor_objection": None,
+        "thinking_time_objection": None, "unavailable_service_objection": None,
+    })
+    problems = scoring.validate_ranges(modules)
+    assert any("price_objection" in p for p in problems)
+    assert problems == scoring.contract_violations({"stage_reached": "negotiation"}, modules)
+
+
+def test_ranges_accept_the_boundaries_and_nulls():
+    modules = _modules(module3_objections={
+        "price_objection": 25, "competitor_objection": 0,
+        "thinking_time_objection": None, "unavailable_service_objection": None,
+    })
+    assert scoring.validate_ranges(modules) == []
+
+
+def test_negative_and_non_numeric_criteria_are_rejected():
+    modules = _modules(module3_objections={
+        "price_objection": -5, "competitor_objection": "25",
+        "thinking_time_objection": None, "unavailable_service_objection": None,
+    })
+    problems = scoring.validate_ranges(modules)
+    assert any("price_objection" in p for p in problems)
+    assert any("competitor_objection" in p for p in problems)
+
+
 def test_unjustified_null_would_have_inflated_module2():
     """Demonstrates why the guard matters, in points.
 

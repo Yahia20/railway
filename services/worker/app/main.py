@@ -210,10 +210,19 @@ def evaluate(req: EvaluateRequest) -> dict:
         }
 
     if req.run_pass2:
-        p2 = judge.run_pass2(
-            req.conversation, req.input_type,
-            metadata=req.metadata, followup_history=req.followup_history, client=client,
-        )
+        # A response that still breaks the rubric after the re-ask is a bad
+        # response, not a server fault. Surface it as such: a 500 with a stack
+        # trace tells the caller nothing about which criterion the model broke.
+        try:
+            p2 = judge.run_pass2(
+                req.conversation, req.input_type,
+                metadata=req.metadata, followup_history=req.followup_history, client=client,
+            )
+        except (scoring.RubricError, judge.JudgeError) as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"judge response violated the rubric contract: {exc}",
+            ) from exc
         out["pass2"] = {
             "payload": p2.payload,
             "final_score": p2.score.final_score,

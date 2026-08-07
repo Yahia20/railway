@@ -37,6 +37,9 @@ schema.html
 final-erd.html
 *.pdf
 *.docx
+# Conversation exports from Bitrix. `Conversation - Travelgate 7 & 8.xlsx` holds
+# 72,869 real customer messages — 1,125 with phone numbers, 22 with emails.
+*.xlsx
 
 # ── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
