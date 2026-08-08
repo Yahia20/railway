@@ -41,6 +41,14 @@ final-erd.html
 # 72,869 real customer messages — 1,125 with phone numbers, 22 with emails.
 *.xlsx
 
+# The rendered customer archive — 375 KB of real customers, names and passport
+# references. Same reason as everything above it.
+TravelGate Customer Archive*.html
+
+# Scored output from local test runs: transcripts, phone numbers, itineraries and
+# agent names, as HTML reports and as the raw JSON behind them.
+local-reports/
+
 # ── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
