@@ -33,6 +33,15 @@ _NAME_RE = re.compile(
 )
 
 
+# Google Drive appends " (1)", " (2)" … when the same filename is uploaded
+# twice, which the 2026-08-08 folder is full of. The suffix is Drive's own
+# bookkeeping, not PBX data, so removing it is not guessing: every field this
+# parser reads still comes verbatim from the PBX's part of the name. Leaving it
+# in means the copy fails to parse, and a call whose ONLY upload carries the
+# suffix is dropped without anyone noticing.
+_DRIVE_COPY_SUFFIX = re.compile(r"\s*\(\d+\)(?=\.[A-Za-z0-9]+$)")
+
+
 class RecordingNameError(ValueError):
     """The filename did not match the PBX convention. Never guess — a wrong
     agent extension attributes a call to the wrong person's scorecard."""
@@ -45,7 +54,8 @@ def parse_recording_name(filename: str, tz_offset_hours: int = 3) -> dict:
     in summer). The filename carries no zone, so this must be configured, not
     assumed — see PBX_TZ_OFFSET_HOURS.
     """
-    m = _NAME_RE.match(os.path.basename(filename))
+    basename = _DRIVE_COPY_SUFFIX.sub("", os.path.basename(filename))
+    m = _NAME_RE.match(basename)
     if not m:
         raise RecordingNameError(f"unrecognised recording filename: {filename!r}")
 

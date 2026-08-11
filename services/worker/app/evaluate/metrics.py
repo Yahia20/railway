@@ -7,8 +7,9 @@ authoritative, and the prompt forbids recalculating them.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from statistics import median
 
 from ..sources.base import Conversation, Message
@@ -16,6 +17,27 @@ from ..sources.base import Conversation, Message
 # Local business hours at the portal's timezone.
 BUSINESS_START = time(9, 0)
 BUSINESS_END = time(21, 0)
+
+# The offset those hours are expressed in. Saudi Arabia, matching
+# DEFAULT_PHONE_REGION and PBX_TZ_OFFSET_HOURS.
+#
+# This has to be applied explicitly. A timestamp carries an offset, and reading
+# the wall clock off it without converting means 19:24+00 is judged as 19:24 —
+# inside business hours — when it is really 22:24 in Riyadh and squarely outside
+# them. The Bitrix webhook sends +03:00, so the two agreed by accident and the
+# error was invisible; the conversation API sends +00 and it is not.
+BUSINESS_TZ = timezone(timedelta(hours=float(os.getenv("PORTAL_TZ_OFFSET_HOURS", "3"))))
+
+
+def _local_time(dt: datetime) -> time:
+    """Wall-clock time at the portal, whatever offset the source used."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(BUSINESS_TZ).time()
+
+
+def is_after_hours(dt: datetime) -> bool:
+    return not (BUSINESS_START <= _local_time(dt) <= BUSINESS_END)
 
 _ARABIC = range(0x0600, 0x0700)
 
@@ -79,7 +101,7 @@ def compute_chat_metrics(conv: Conversation) -> ComputedMetrics:
         agent_message_count=len(agent),
         bot_message_count=sum(1 for m in msgs if m.sender == "bot"),
         conversation_span_seconds=int((msgs[-1].sent_at - msgs[0].sent_at).total_seconds()),
-        after_hours=not (BUSINESS_START <= msgs[0].sent_at.timetz().replace(tzinfo=None) <= BUSINESS_END),
+        after_hours=is_after_hours(msgs[0].sent_at),
         language_matched=matched,
     )
 
@@ -102,10 +124,9 @@ def compute_call_metrics(started_at: datetime, duration_seconds: float,
             if total > 0:
                 talk_ratio = round(agent_time / total, 3)
 
-    local = started_at.timetz().replace(tzinfo=None)
     return ComputedMetrics(
         conversation_span_seconds=int(duration_seconds),
-        after_hours=not (BUSINESS_START <= local <= BUSINESS_END),
+        after_hours=is_after_hours(started_at),
         agent_talk_ratio=talk_ratio,
     )
 

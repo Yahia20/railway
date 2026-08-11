@@ -84,6 +84,13 @@ python scripts/n8n_smoke_test.py
 
 # score a stored transcript directly
 DEEPSEEK_API_KEY=... python scripts/evaluate_call.py docs/samples/<file>.json
+
+# drive the pipeline from the conversation simulator API
+export SIM_BASE_URL=https://<tunnel>.trycloudflare.com SIM_API_KEY=tg_...
+python scripts/simulate_conversation.py --list          # what is in there
+python scripts/simulate_conversation.py <id> --offline  # ingest only, no key
+DEEPSEEK_API_KEY=... python scripts/simulate_conversation.py <id>   # real scores
+python scripts/simulate_conversation.py <id> --webhook  # POST at live n8n
 ```
 
 ---
@@ -160,10 +167,31 @@ honoured as-is. Bare-national Egyptian numbers **fail to normalise rather than
 being assigned to +966** — deliberate: a null phone is recoverable, a
 wrong-country match merges two real people.
 
+**11 · A timestamp's offset is not decoration — convert before comparing.**
+`after_hours` used to read the wall clock straight off `sent_at` and drop the
+offset. The Bitrix webhook sends `+03:00`, which is already Riyadh local, so the
+bug agreed with the truth on every payload we had and stayed invisible. The
+conversation API sends `+00`, and `19:24+00` — 22:24 in Riyadh, plainly after
+hours — came back as *within* business hours. `metrics.is_after_hours` now
+converts to `PORTAL_TZ_OFFSET_HOURS` (default 3) first. Any new source that
+sends UTC would have hit this.
+
 **10 · Call recordings are mono.** Nothing separates agent from customer, so
 speaker attribution is inferred from content and the prompt suppresses the
 absolute rules when `diarization = none`. The fix is free and not ours: ask the
 PBX team to record two channels.
+
+**12 · A `respondToWebhook` node is not a guarantee — a Wait node outranks it.**
+With `executionOrder: v1`, n8n runs sibling branches in canvas order, topmost
+first, and runs each depth-first to its end. Workflow 01 fanned out to `200 OK`
+(y=480) and to the ingest chain (y=300), so the chain went first, parked at the
+30-minute Wait, and the responder was never reached: Bitrix got no answer at all
+and would have timed out and retried. It stayed hidden because the Wait used to
+be short enough that the whole workflow finished inside the sender's timeout.
+Fixed by moving the acknowledgement into the webhook node itself —
+`responseMode: onReceived` — which cannot be reordered by dragging a box.
+**For any fire-and-forget ingest webhook, use `onReceived`, not a responder
+node.** Workflow 01b already did.
 
 ---
 

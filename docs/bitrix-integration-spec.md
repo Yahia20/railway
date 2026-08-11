@@ -177,6 +177,63 @@ history), otherwise we receive only half of every conversation.
 
 ---
 
+## 7b · The conversation API — one field to add
+
+If you expose a pull API instead of (or as well as) the push webhook, we read it
+through the same parser. `/conversations/{id}/messages` currently returns:
+
+```json
+{
+  "conversation_id": "00d1786a-1c19-487c-807a-81d351ca90cf",
+  "message_count": 27,
+  "messages": [
+    {
+      "conversation_id": "00d1786a-…",
+      "sender_id": "0a0bec89-b101-5078-af46-ae738bf4868d",
+      "content": "اسم العرض: البوسنة والهرسك…",
+      "timestamp": "2026-07-19 19:24:59.000+00",
+      "sender_role": "Agent",
+      "content_type": "text"
+    }
+  ]
+}
+```
+
+**Please add `deal_id` to the envelope**, next to `conversation_id`:
+
+```json
+{
+  "conversation_id": "00d1786a-1c19-487c-807a-81d351ca90cf",
+  "deal_id": "13682",
+  "message_count": 27,
+  "messages": [ … ]
+}
+```
+
+Null it when the conversation has no deal — that is a real and expected state,
+and an explicit null is exactly right. Please do not substitute a nearby deal.
+
+**Why we need it.** Every commercial number this system produces — pipeline
+value, win rate, revenue per agent, which offers convert — is a join from a
+conversation to a deal. Without `deal_id` a transcript is still scoreable for
+agent quality, but commercially blind: we can say the agent handled the customer
+well and not that it turned into a sale.
+
+We can currently recover it by calling `/deals` and matching, but that match is
+on the phone number, and a repeat customer with two deals is ambiguous — those
+conversations get no deal at all rather than the wrong one. One field on the
+response removes the guesswork.
+
+Two smaller things on the same response:
+
+- **`message_count` must count what you sent.** If it reports 27 and the array
+  holds 20, we are holding a fragment. We flag and refuse to score those: a
+  thread cut off before the close scores near zero on closing quality, and the
+  agent did nothing wrong. If the endpoint paginates, tell us the parameter.
+- **`sender_role` must distinguish `Bot` from `Agent`** — same reason as §3.
+
+---
+
 ## 8 · How to test it
 
 Send us anything — a real conversation or a made-up one. We can see it arrive

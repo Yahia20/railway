@@ -5,7 +5,7 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "travelgate/chat",
-        "responseMode": "responseNode",
+        "responseMode": "onReceived",
         "options": {}
       },
       "id": "webhook-in",
@@ -17,22 +17,6 @@
         300
       ],
       "webhookId": "travelgate-chat"
-    },
-    {
-      "parameters": {
-        "respondWith": "text",
-        "responseBody": "ok",
-        "options": {}
-      },
-      "id": "respond",
-      "name": "200 OK",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
-      "position": [
-        -660,
-        480
-      ],
-      "notes": "Answer Bitrix immediately. A webhook sender must never wait on a model call."
     },
     {
       "parameters": {
@@ -362,11 +346,6 @@
     "Bitrix webhook": {
       "main": [
         [
-          {
-            "node": "200 OK",
-            "type": "main",
-            "index": 0
-          },
           {
             "node": "Land raw (idempotent)",
             "type": "main",

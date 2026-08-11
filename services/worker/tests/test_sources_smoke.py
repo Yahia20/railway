@@ -125,3 +125,25 @@ def test_clock_drift_is_reported_when_the_two_disagree():
     rather than being silently averaged away."""
     meta = parse_recording_name("q-3009-0500000000-20260701-170522-1782918322.226.wav")
     assert meta["clock_drift_seconds"] == 3600
+
+
+# ── Google Drive duplicate uploads ──────────────────────────────────────────
+# The 2026-08-08 recordings folder contains the same call uploaded several
+# times, which Drive disambiguates as "… (1).wav", "… (2).wav". Those are
+# ordinary recordings and must still parse.
+
+def test_drive_duplicate_suffix_is_ignored():
+    from app.sources.drive_calls import parse_recording_name
+
+    plain = parse_recording_name("q-3009-0565186475-20260808-114155-1786178514.76687.wav")
+    copy = parse_recording_name("q-3009-0565186475-20260808-114155-1786178514.76687 (1).wav")
+    assert copy == plain
+
+
+def test_a_genuinely_malformed_name_still_raises():
+    """The suffix strip must not turn the parser into a guesser."""
+    from app.sources.drive_calls import parse_recording_name, RecordingNameError
+    import pytest
+
+    with pytest.raises(RecordingNameError):
+        parse_recording_name("q-3009-0565186475-notadate-114155-1786178514.76687 (1).wav")

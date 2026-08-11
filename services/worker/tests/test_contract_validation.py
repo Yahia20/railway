@@ -142,3 +142,35 @@ def test_unjustified_null_would_have_inflated_module2():
         "value_selling": 20, "alternative_offer": None})
     assert inflated == 100.0
     assert honest == 90.0
+
+
+# ── evidence quoting ────────────────────────────────────────────────────────
+# Observed on n8n execution 95, 2026-08-09: the model cited an offer by
+# stitching the start and end of one agent message together and dropping the
+# sentence between them, with no ellipsis. The splice reads as a single verbatim
+# quote and every word in it is genuine, so nothing but a substring check
+# catches it.
+
+_AGENT_OFFER = (
+    "فندق Ramada Merter ٤ نجوم في إسطنبول، ٧ ليالٍ من ١٠ إلى ١٧ أغسطس، "
+    "شامل الإفطار والعشاء. "
+    "الفندق قريب من المترو وفيه مسبح للأطفال، مناسب جداً لرحلة عائلية. "
+    "الحجز يحتاج دفعة ٣٠٪ والإلغاء مجاني حتى ٧ أيام قبل السفر."
+)
+
+
+def test_spliced_quote_is_rejected():
+    """Two real spans of one message, joined across an elided sentence."""
+    spliced = (
+        "فندق Ramada Merter ٤ نجوم في إسطنبول، ٧ ليالٍ من ١٠ إلى ١٧ أغسطس، "
+        "شامل الإفطار والعشاء. "
+        "الحجز يحتاج دفعة ٣٠٪ والإلغاء مجاني حتى ٧ أيام قبل السفر."
+    )
+    problems = scoring.validate_evidence({"evidence": [{"quote": spliced}]}, _AGENT_OFFER)
+    assert any("evidence[0]" in p for p in problems)
+
+
+def test_contiguous_quote_survives_whitespace_differences():
+    """The guard must not fire on line wrapping — only on altered content."""
+    quote = "الفندق قريب من  المترو وفيه مسبح للأطفال،\n  مناسب جداً لرحلة عائلية."
+    assert scoring.validate_evidence({"evidence": [{"quote": quote}]}, _AGENT_OFFER) == []
