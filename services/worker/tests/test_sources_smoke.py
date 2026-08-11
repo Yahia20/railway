@@ -187,15 +187,19 @@ def test_local_path_transcribe_still_404s_not_503(monkeypatch):
     assert r.status_code == 404
 
 
-def test_list_query_covers_parent_and_daily_subfolders():
-    """Recordings are filed one folder per day, so the query must span them."""
+def test_list_query_scopes_to_exactly_one_folder():
+    """Drive silently returns nothing for `or`-ed `in parents` clauses.
+
+    Confirmed live 2026-08-11: a folder holding five recordings returned five
+    when queried alone and zero when `or`-ed with its siblings, with no error
+    either way. So the query must name one folder, and list_since loops.
+    """
     from datetime import datetime, timezone
     from app.sources.drive_calls import DriveCallSource
 
-    q = DriveCallSource._list_query(["parent", "day1", "day2"],
-                                    datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc))
-    assert "'parent' in parents or 'day1' in parents or 'day2' in parents" in q
-    assert q.startswith("(")
+    q = DriveCallSource._list_query("day1", datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc))
+    assert q.count("in parents") == 1
+    assert " or " not in q
     assert "trashed = false" in q
     assert "modifiedTime > '2026-08-09T12:00:00Z'" in q
 
@@ -206,5 +210,5 @@ def test_list_query_converts_the_watermark_to_utc():
     from app.sources.drive_calls import DriveCallSource
 
     riyadh = timezone(timedelta(hours=3))
-    q = DriveCallSource._list_query(["f"], datetime(2026, 8, 9, 15, 0, tzinfo=riyadh))
+    q = DriveCallSource._list_query("f", datetime(2026, 8, 9, 15, 0, tzinfo=riyadh))
     assert "modifiedTime > '2026-08-09T12:00:00Z'" in q

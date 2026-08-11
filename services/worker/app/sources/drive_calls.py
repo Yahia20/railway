@@ -133,49 +133,58 @@ class DriveCallSource:
         return ids
 
     @staticmethod
-    def _list_query(folder_ids: list[str], since: datetime) -> str:
-        parents = " or ".join(f"'{fid}' in parents" for fid in folder_ids)
+    def _list_query(folder_id: str, since: datetime) -> str:
+        """One folder per query, deliberately.
+
+        Drive will not `or` several `in parents` clauses together: the combined
+        query is accepted and returns zero rows, which is the worst way for it
+        to fail. Verified 2026-08-11 against a folder holding five recordings —
+        scoped to that folder it returned five, `or`-ed with its siblings it
+        returned nothing, with no error either time.
+        """
         return (
-            f"({parents}) and trashed = false "
+            f"'{folder_id}' in parents and trashed = false "
             f"and mimeType contains 'audio/' "
             f"and modifiedTime > '{since.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%SZ}'"
         )
 
     def list_since(self, since: datetime, limit: int = 500) -> Iterator[CallRecording]:
         files = self._client().files()
-        query = self._list_query(self._search_folder_ids(), since)
-        page_token, seen = None, 0
-        while seen < limit:
-            resp = files.list(
-                q=query,
-                orderBy="modifiedTime",
-                pageSize=min(100, limit - seen),
-                pageToken=page_token,
-                fields="nextPageToken, files(id, name, size, modifiedTime, mimeType)",
-            ).execute()
+        seen = 0
+        for folder_id in self._search_folder_ids():
+            page_token = None
+            while seen < limit:
+                resp = files.list(
+                    q=self._list_query(folder_id, since),
+                    orderBy="modifiedTime",
+                    pageSize=min(100, limit - seen),
+                    pageToken=page_token,
+                    fields="nextPageToken, files(id, name, size, modifiedTime, mimeType)",
+                ).execute()
 
-            for f in resp.get("files", []):
-                seen += 1
-                try:
-                    meta = parse_recording_name(f["name"], self.tz_offset_hours)
-                except RecordingNameError:
-                    # Skipped, not crashed: one oddly named file must not stop
-                    # the batch. The count surfaces in job_runs.items_failed.
-                    yield from ()
-                    continue
-                yield CallRecording(
-                    external_id=meta["uniqueid"],
-                    external_source=self.name,
-                    audio_uri=f"drive://{f['id']}",
-                    started_at=meta["started_at"],
-                    customer_phone_raw=meta["customer_phone_raw"],
-                    agent_extension=meta["agent_extension"],
-                    size_bytes=int(f.get("size", 0)) or None,
-                    raw={"drive_file": f, "parsed_name": meta},
-                )
+                for f in resp.get("files", []):
+                    seen += 1
+                    try:
+                        meta = parse_recording_name(f["name"], self.tz_offset_hours)
+                    except RecordingNameError:
+                        # Skipped, not crashed: one oddly named file must not stop
+                        # the batch. The count surfaces in job_runs.items_failed.
+                        continue
+                    yield CallRecording(
+                        external_id=meta["uniqueid"],
+                        external_source=self.name,
+                        audio_uri=f"drive://{f['id']}",
+                        started_at=meta["started_at"],
+                        customer_phone_raw=meta["customer_phone_raw"],
+                        agent_extension=meta["agent_extension"],
+                        size_bytes=int(f.get("size", 0)) or None,
+                        raw={"drive_file": f, "parsed_name": meta},
+                    )
 
-            page_token = resp.get("nextPageToken")
-            if not page_token:
+                page_token = resp.get("nextPageToken")
+                if not page_token:
+                    break
+            if seen >= limit:
                 return
 
     def download(self, rec: CallRecording, dest_dir: str) -> str:

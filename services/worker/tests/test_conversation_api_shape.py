@@ -202,3 +202,61 @@ def test_normal_thread_is_not_flagged():
 def test_empty_thread_is_not_flagged_as_one_sided():
     """An empty thread is a different problem; do not mislabel it as this one."""
     assert _conv([]).has_no_customer_turn is False
+
+
+# ── stand-in deal ids ───────────────────────────────────────────────────────
+# The conversation API carries no deal_id and no field that joins to /deals, so
+# the commercial half cannot be exercised on real data yet.
+
+def _payload():
+    return {"payload": {"conversation_id": "abc-123", "messages": [
+        {"content": "عندكم عروض؟", "timestamp": "2026-07-30 10:00:00+00",
+         "sender_role": "Customer", "content_type": "text"},
+        {"content": "أهلاً بك", "timestamp": "2026-07-30 10:02:00+00",
+         "sender_role": "Agent", "content_type": "text"}]}}
+
+
+def _parse(monkeypatch, **flags):
+    from fastapi.testclient import TestClient
+    from app import main
+    monkeypatch.setattr(main.settings, "worker_api_key", "k", raising=False)
+    for k, v in flags.items():
+        monkeypatch.setattr(main.settings, k, v, raising=False)
+    r = TestClient(main.app).post("/chats/parse", json=_payload(),
+                                  headers={"X-API-Key": "k"})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_no_synthetic_deal_id_by_default(monkeypatch):
+    body = _parse(monkeypatch, synthetic_deal_ids=False)
+    assert body["bitrix_deal_id"] is None
+    assert body["bitrix_deal_id_is_synthetic"] is False
+
+
+def test_synthetic_deal_id_is_flagged_and_prefixed(monkeypatch):
+    """Never a bare number: it must be impossible to mistake for a real deal."""
+    body = _parse(monkeypatch, synthetic_deal_ids=True)
+    assert body["bitrix_deal_id"] == "synthetic:abc-123"
+    assert body["bitrix_deal_id_is_synthetic"] is True
+    assert not body["bitrix_deal_id"].lstrip("-").isdigit()
+
+
+def test_synthetic_deal_id_is_stable_across_reingest(monkeypatch):
+    assert _parse(monkeypatch, synthetic_deal_ids=True)["bitrix_deal_id"] == \
+           _parse(monkeypatch, synthetic_deal_ids=True)["bitrix_deal_id"]
+
+
+def test_a_real_deal_id_wins_even_with_the_flag_on(monkeypatch):
+    """The day the API adds deal_id, nothing needs turning off."""
+    from fastapi.testclient import TestClient
+    from app import main
+    monkeypatch.setattr(main.settings, "worker_api_key", "k", raising=False)
+    monkeypatch.setattr(main.settings, "synthetic_deal_ids", True, raising=False)
+
+    payload = _payload()
+    payload["payload"]["deal_id"] = "13682"
+    r = TestClient(main.app).post("/chats/parse", json=payload,
+                                  headers={"X-API-Key": "k"})
+    assert r.json()["bitrix_deal_id"] == "13682"
+    assert r.json()["bitrix_deal_id_is_synthetic"] is False

@@ -62,6 +62,12 @@ class Settings:
         default_factory=lambda: int(_env("REANALYSIS_IDLE_MINUTES", "30")))
     score_bot_only_conversations: bool = field(
         default_factory=lambda: _flag("SCORE_BOT_ONLY_CONVERSATIONS", False))
+    # Stand-in deal ids so the commercial half can be exercised before the
+    # conversation API carries a real deal_id. Off unless asked for: the whole
+    # point of the field is to link a transcript to money, and a link nobody
+    # marked as fake is worse than no link.
+    synthetic_deal_ids: bool = field(
+        default_factory=lambda: _flag("SYNTHETIC_DEAL_IDS", False))
     work_dir: str = field(default_factory=lambda: _env("WORK_DIR", "/tmp/customer360"))
 
     def validate_for(self, *capabilities: str) -> None:

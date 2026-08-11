@@ -122,6 +122,20 @@ def parse_chat(req: ParseChatRequest) -> dict:
     phone, phone_error = try_normalize(conv.customer_phone_raw, settings.default_phone_region)
     computed = metrics.compute_chat_metrics(conv)
 
+    # The conversation API exposes no deal_id and no field that joins to /deals,
+    # so nothing real can be filled in here yet. With SYNTHETIC_DEAL_IDS on we
+    # mint a stand-in instead, deterministic per conversation so re-ingesting the
+    # same thread lands on the same row.
+    #
+    # It is prefixed rather than numeric on purpose. bitrix_deal_id is text, so
+    # 'synthetic:<id>' stores cleanly and can never be mistaken for, or collide
+    # with, a Bitrix deal id — every synthetic row is one LIKE away from being
+    # excluded from a revenue figure. The flag also carries into the response so
+    # a caller never has to infer it from the prefix.
+    deal_id, deal_id_is_synthetic = conv.bitrix_deal_id, False
+    if not deal_id and settings.synthetic_deal_ids:
+        deal_id, deal_id_is_synthetic = f"synthetic:{conv.external_id}", True
+
     return {
         "external_id": conv.external_id,
         "external_source": conv.external_source,
@@ -130,7 +144,8 @@ def parse_chat(req: ParseChatRequest) -> dict:
         "ended_at": conv.ended_at.isoformat() if conv.ended_at else None,
         "customer_phone_e164": phone,
         "phone_error": phone_error,
-        "bitrix_deal_id": conv.bitrix_deal_id,
+        "bitrix_deal_id": deal_id,
+        "bitrix_deal_id_is_synthetic": deal_id_is_synthetic,
         "bitrix_contact_id": conv.bitrix_contact_id,
         "agent_external_id": conv.agent_external_id,
         "is_bot_only": conv.is_bot_only,

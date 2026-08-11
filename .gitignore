@@ -6,6 +6,18 @@
 *.key
 service-account*.json
 gcp-*.json
+# Whatever Google hands you keeps its download name, and neither form
+# matches the two patterns above. A client_secret_*.json landed in this
+# working tree on 2026-08-11 and was one `git add -A` from being public.
+client_secret*.json
+*apps.googleusercontent.com*.json
+*-service-account*.json
+# A service account key downloads as <project>-<hash>.json, which matches
+# none of the patterns above. Ignore the whole shape, and any .json sitting
+# loose in the repo root — nothing the project needs lives there.
+/*.json
+!package.json
+!package-lock.json
 
 # ── Real customer data — NEVER commit ───────────────────────────────────────
 # This repository is public. Everything below contains either live credentials
