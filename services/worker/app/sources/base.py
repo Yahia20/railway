@@ -52,6 +52,25 @@ class Conversation:
         """No human agent ever joined. These must never reach agent scoring."""
         return not any(m.sender == "agent" for m in self.messages)
 
+    @property
+    def has_no_customer_turn(self) -> bool:
+        """Nobody is labelled as the customer, on a thread that has messages.
+
+        Observed on 63% of a 60-conversation sample from the chat API: every
+        inbound turn arrives labelled `Agent`, including plain customer replies
+        like "واحد 25/7" answering the bot's "how many travellers and when?".
+
+        A conversation cannot be a conversation with one side missing, so this
+        is a labelling fault at the source, not a real transcript. Scoring it
+        anyway is the worst option available: pass 1 would read the customer's
+        own words as the agent's, pass 2 would grade the agent on sentences the
+        customer wrote, and both would come back confident. A missing score is
+        recoverable once the source is fixed; a plausible wrong one is not.
+        """
+        return bool(self.messages) and not any(
+            m.sender == "customer" for m in self.messages
+        )
+
     def transcript_text(self) -> str:
         """Render for the model. Speaker + timestamp on every line, because
         every timing and attribution rule in the rubric depends on both."""

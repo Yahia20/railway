@@ -124,10 +124,21 @@ def parse_chat(req: ParseChatRequest) -> dict:
         "bitrix_contact_id": conv.bitrix_contact_id,
         "agent_external_id": conv.agent_external_id,
         "is_bot_only": conv.is_bot_only,
-        # Bot-only threads must never reach agent scoring: the bot qualifies the
-        # customer before a human joins, and grading humans on bot messages makes
-        # every QA number wrong.
-        "should_evaluate": not conv.is_bot_only or settings.score_bot_only_conversations,
+        "has_no_customer_turn": conv.has_no_customer_turn,
+        # Two ways a thread is unscoreable, both refusals rather than low scores.
+        #
+        # Bot-only: the bot qualifies the customer before a human joins, and
+        # grading humans on bot messages makes every QA number wrong. Overridable
+        # by SCORE_BOT_ONLY_CONVERSATIONS because it is a policy choice.
+        #
+        # No customer turn: the source labelled every message as the agent, so
+        # the transcript is not a conversation. Not overridable — there is no
+        # setting under which grading an agent on the customer's own sentences
+        # produces a meaningful number.
+        "should_evaluate": (
+            (not conv.is_bot_only or settings.score_bot_only_conversations)
+            and not conv.has_no_customer_turn
+        ),
         "messages": [
             {"seq": m.seq, "sender": m.sender, "body": m.body, "sent_at": m.sent_at.isoformat()}
             for m in conv.messages

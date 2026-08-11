@@ -171,3 +171,34 @@ def test_same_instant_in_a_different_offset_gives_the_same_answer():
         ]))).after_hours
 
     assert at("2026-07-19 12:00:00+00") == at("2026-07-19 15:00:00+03:00") is False
+
+
+# ── one-sided transcripts ───────────────────────────────────────────────────
+# Measured 2026-08-09 on the chat API: 38 of 60 sampled conversations came back
+# with every inbound turn labelled "Agent" and not one "Customer". Scoring those
+# grades the agent on the customer's own sentences.
+
+def _conv(roles):
+    from datetime import datetime, timedelta, timezone
+    from app.sources.base import Conversation, Message
+    t0 = datetime(2026, 7, 30, 10, 0, tzinfo=timezone.utc)
+    return Conversation(
+        external_id="x", external_source="bitrix", channel="whatsapp", started_at=t0,
+        messages=[
+            Message(seq=i + 1, sender=r, body=f"m{i}", sent_at=t0 + timedelta(minutes=i))
+            for i, r in enumerate(roles)
+        ],
+    )
+
+
+def test_thread_with_no_customer_turn_is_flagged():
+    assert _conv(["agent", "agent", "bot"]).has_no_customer_turn is True
+
+
+def test_normal_thread_is_not_flagged():
+    assert _conv(["customer", "agent", "bot"]).has_no_customer_turn is False
+
+
+def test_empty_thread_is_not_flagged_as_one_sided():
+    """An empty thread is a different problem; do not mislabel it as this one."""
+    assert _conv([]).has_no_customer_turn is False
