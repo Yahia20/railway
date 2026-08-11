@@ -114,13 +114,36 @@ class DriveCallSource:
             self._service = build("drive", "v3", credentials=creds, cache_discovery=False)
         return self._service
 
-    def list_since(self, since: datetime, limit: int = 500) -> Iterator[CallRecording]:
-        files = self._client().files()
-        query = (
-            f"'{self.folder_id}' in parents and trashed = false "
+    def _search_folder_ids(self) -> list[str]:
+        """The configured folder and its immediate subfolders.
+
+        The recordings are filed one folder per day ("08-08-2026", "9-8"), so a
+        query scoped to a single folder id is wrong either way: aimed at the
+        parent it matches no audio at all, and aimed at a day it goes stale
+        overnight and would need the environment variable edited daily. One
+        level of nesting covers both that layout and a flat drop folder.
+        """
+        ids = [self.folder_id]
+        resp = self._client().files().list(
+            q=(f"'{self.folder_id}' in parents and trashed = false "
+               f"and mimeType = 'application/vnd.google-apps.folder'"),
+            pageSize=100, fields="files(id)",
+        ).execute()
+        ids += [f["id"] for f in resp.get("files", [])]
+        return ids
+
+    @staticmethod
+    def _list_query(folder_ids: list[str], since: datetime) -> str:
+        parents = " or ".join(f"'{fid}' in parents" for fid in folder_ids)
+        return (
+            f"({parents}) and trashed = false "
             f"and mimeType contains 'audio/' "
             f"and modifiedTime > '{since.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%SZ}'"
         )
+
+    def list_since(self, since: datetime, limit: int = 500) -> Iterator[CallRecording]:
+        files = self._client().files()
+        query = self._list_query(self._search_folder_ids(), since)
         page_token, seen = None, 0
         while seen < limit:
             resp = files.list(

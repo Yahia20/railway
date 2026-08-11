@@ -185,3 +185,26 @@ def test_local_path_transcribe_still_404s_not_503(monkeypatch):
     r = client.post("/calls/transcribe", json={"audio_path": "/nope/missing.wav"},
                     headers={"X-API-Key": "k"})
     assert r.status_code == 404
+
+
+def test_list_query_covers_parent_and_daily_subfolders():
+    """Recordings are filed one folder per day, so the query must span them."""
+    from datetime import datetime, timezone
+    from app.sources.drive_calls import DriveCallSource
+
+    q = DriveCallSource._list_query(["parent", "day1", "day2"],
+                                    datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc))
+    assert "'parent' in parents or 'day1' in parents or 'day2' in parents" in q
+    assert q.startswith("(")
+    assert "trashed = false" in q
+    assert "modifiedTime > '2026-08-09T12:00:00Z'" in q
+
+
+def test_list_query_converts_the_watermark_to_utc():
+    """Drive compares in UTC; a +03:00 watermark sent as-is re-reads 3 hours."""
+    from datetime import datetime, timedelta, timezone
+    from app.sources.drive_calls import DriveCallSource
+
+    riyadh = timezone(timedelta(hours=3))
+    q = DriveCallSource._list_query(["f"], datetime(2026, 8, 9, 15, 0, tzinfo=riyadh))
+    assert "modifiedTime > '2026-08-09T12:00:00Z'" in q
