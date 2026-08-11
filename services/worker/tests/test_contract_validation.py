@@ -275,3 +275,21 @@ def test_a_real_conversation_is_not_swallowed_by_the_floor():
 
     real = "[00:00] ألو السلام عليكم -- عليكم السلام هلا معك خالد من ترافل جيت"
     assert len(spoken_content(real)) >= MIN_SCOREABLE_CHARS
+
+
+def test_a_refusal_still_fills_the_not_null_columns(monkeypatch):
+    """agent_evaluations.model is NOT NULL; a refusal must still be storable."""
+    from fastapi.testclient import TestClient
+    from app import main
+
+    monkeypatch.setattr(main.settings, "worker_api_key", "k", raising=False)
+    monkeypatch.setattr(main.settings, "deepseek_api_key", "sk-test", raising=False)
+    p2 = TestClient(main.app).post(
+        "/evaluate", json={"conversation": "", "input_type": "call_transcript"},
+        headers={"X-API-Key": "k"},
+    ).json()["pass2"]
+
+    for column in ("model", "prompt_version"):
+        assert p2[column], f"{column} would violate NOT NULL"
+    assert p2["final_score"] is None          # nullable, and must stay null
+    assert p2["gradeable"] is False

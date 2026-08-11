@@ -328,7 +328,12 @@ def _unscoreable(reason: str) -> dict:
             "payload": {}, "final_score": None, "performance_level": None,
             "weight_applied": 0.0, "gradeable": False, "modules": {},
             "warnings": [reason], "prompt_version": judge.PASS2_VERSION,
-            "model": None, "usage": None, "input_hash": None,
+            # agent_evaluations.model is NOT NULL, and a refusal still gets a
+            # row — the fact that a call was looked at and found unscoreable is
+            # worth recording. Naming the non-event beats writing the model
+            # that was never asked, which would read as a real evaluation.
+            "model": "none (refused before any model call)",
+            "usage": None, "input_hash": None,
         },
     }
 
