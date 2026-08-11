@@ -301,9 +301,42 @@ def transcribe(req: TranscribeRequest) -> dict:
 # Evaluate
 # ---------------------------------------------------------------------------
 
+# Below this many non-whitespace characters there is no conversation to grade.
+# A real call that is only a greeting still clears it; an ASR miss does not.
+MIN_SCOREABLE_CHARS = 20
+
+
+def _unscoreable(reason: str) -> dict:
+    """A refusal shaped like a result, so callers store it like one."""
+    return {
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "rubric_version": scoring.RUBRIC_VERSION,
+        "pass2": {
+            "payload": {}, "final_score": None, "performance_level": None,
+            "weight_applied": 0.0, "gradeable": False, "modules": {},
+            "warnings": [reason], "prompt_version": judge.PASS2_VERSION,
+            "model": None, "usage": None, "input_hash": None,
+        },
+    }
+
+
 @app.post("/evaluate", dependencies=[Depends(require_api_key)])
 def evaluate(req: EvaluateRequest) -> dict:
     settings.validate_for("judge")
+
+    # An empty transcript is not a bad conversation, it is a missing one, and
+    # the judge cannot tell the difference: asked to grade nothing it returns
+    # zeros with full confidence. Seen live on 2026-08-11 — 17 of 20 calls came
+    # back from the ASR Space with empty text and confidence 0 under burst load,
+    # and every one was stored as final_score 0, "Below Average", gradeable.
+    # That is an agent's scorecard destroyed by someone else's rate limit.
+    body = (req.conversation or "").strip()
+    if len(body) < MIN_SCOREABLE_CHARS:
+        return _unscoreable(
+            f"transcript has {len(body)} characters, below the {MIN_SCOREABLE_CHARS} "
+            f"needed to score: treated as a failed transcription, not a bad call"
+        )
+
     client = judge.DeepSeekClient(settings.deepseek_api_key, settings.deepseek_model)
 
     out: dict[str, Any] = {

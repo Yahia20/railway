@@ -174,3 +174,67 @@ def test_contiguous_quote_survives_whitespace_differences():
     """The guard must not fire on line wrapping — only on altered content."""
     quote = "الفندق قريب من  المترو وفيه مسبح للأطفال،\n  مناسب جداً لرحلة عائلية."
     assert scoring.validate_evidence({"evidence": [{"quote": quote}]}, _AGENT_OFFER) == []
+
+
+# ── unscoreable transcripts ─────────────────────────────────────────────────
+# Live on 2026-08-11: 17 of 20 calls came back from the ASR Space with empty
+# text and confidence 0 under burst load, and every one was stored as
+# final_score 0, "Below Average", gradeable. The judge cannot distinguish a
+# missing transcript from a bad call — asked to grade nothing it returns zeros
+# with full confidence.
+
+import pytest
+
+
+@pytest.mark.parametrize("text", ["", "   ", "\n\n", "ألو", "السلام عليكم"])
+def test_short_or_empty_transcripts_are_refused_not_scored(text, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+
+    monkeypatch.setattr(main.settings, "worker_api_key", "k", raising=False)
+    monkeypatch.setattr(main.settings, "deepseek_api_key", "sk-test", raising=False)
+    r = TestClient(main.app).post(
+        "/evaluate",
+        json={"conversation": text, "input_type": "call_transcript"},
+        headers={"X-API-Key": "k"},
+    )
+    assert r.status_code == 200
+    p2 = r.json()["pass2"]
+    assert p2["gradeable"] is False
+    assert p2["final_score"] is None          # never 0 — 0 means "did it badly"
+    assert "failed transcription" in p2["warnings"][0]
+
+
+def test_a_real_short_call_still_reaches_the_judge(monkeypatch):
+    """The floor must not swallow genuinely brief but real conversations."""
+    from app.main import MIN_SCOREABLE_CHARS
+
+    real = "ألو السلام عليكم -- عليكم السلام هلا معك خالد من ترافل جيت"
+    assert len(real.strip()) >= MIN_SCOREABLE_CHARS
+
+
+def test_failed_chunk_is_distinct_from_a_silent_one():
+    """None means nobody read the chunk; '' means it was read and was silent."""
+    from app.asr.cohere_arabic import _transcribe_with_retry
+
+    class Silent:
+        def transcribe_file(self, p): return ""
+
+    class Broken:
+        def transcribe_file(self, p): raise RuntimeError("429 rate limited")
+
+    assert _transcribe_with_retry(Silent(), "x") == ""
+    assert _transcribe_with_retry(Broken(), "x") is None
+
+
+def test_retry_recovers_a_chunk_that_fails_once():
+    from app.asr.cohere_arabic import _transcribe_with_retry
+
+    class Flaky:
+        def __init__(self): self.n = 0
+        def transcribe_file(self, p):
+            self.n += 1
+            if self.n < 2: raise RuntimeError("429")
+            return "نعم تفضل"
+
+    assert _transcribe_with_retry(Flaky(), "x") == "نعم تفضل"

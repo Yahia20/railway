@@ -224,6 +224,34 @@ def make_backend(kind: str | None = None):
 # Entry point
 # ---------------------------------------------------------------------------
 
+# The free Space is a shared community GPU. Under a burst it rejects requests
+# rather than queueing them, so a batch that would succeed one at a time comes
+# back mostly empty — 17 of 20 calls on 2026-08-11, each of which had
+# transcribed fine on its own moments earlier. Retrying with a widening gap
+# turns most of those into successes and costs nothing when the first try works.
+ASR_RETRIES = 3
+ASR_BACKOFF_SEC = 2.0
+
+
+def _transcribe_with_retry(backend, chunk_path: str) -> str | None:
+    """The chunk's text, or None if every attempt failed.
+
+    None and "" are kept distinct on purpose: "" is a chunk of silence the model
+    read correctly, None is a chunk nobody read. Only the second is a failure,
+    and only failures may move `confidence`.
+    """
+    import time
+
+    for attempt in range(ASR_RETRIES):
+        try:
+            return backend.transcribe_file(chunk_path)
+        except Exception:                       # noqa: BLE001
+            if attempt == ASR_RETRIES - 1:
+                return None
+            time.sleep(ASR_BACKOFF_SEC * (2 ** attempt))
+    return None
+
+
 def transcribe_call(path: str, backend=None, work_dir: str | None = None,
                     target_sec: float = 40.0) -> Transcription:
     """Transcribe one call recording into timestamped segments."""
@@ -241,9 +269,8 @@ def transcribe_call(path: str, backend=None, work_dir: str | None = None,
         start, end = cuts[i], cuts[i + 1]
         chunk_path = _write_chunk(pcm[start:end], rate,
                                   os.path.join(work_dir, f"chunk_{i:04d}.wav"))
-        try:
-            text = backend.transcribe_file(chunk_path)
-        except Exception:                       # noqa: BLE001
+        text = _transcribe_with_retry(backend, chunk_path)
+        if text is None:
             text, failures = "", failures + 1
         segments.append(Segment(seq=i, start_sec=round(start / rate, 2),
                                 end_sec=round(end / rate, 2), text=text))
