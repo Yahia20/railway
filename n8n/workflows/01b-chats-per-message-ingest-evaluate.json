@@ -1,0 +1,518 @@
+{
+  "name": "01b · Chats — per-message ingest & evaluate",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "travelgate/chat-message",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "6141c706-4897-4c6a-8e1e-cb46d7e48fa4",
+      "name": "Bitrix webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -880,
+        300
+      ],
+      "webhookId": "5d6205a6-0fbd-4bd6-9d62-4caf7c9c3b28"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ins AS (\n  INSERT INTO raw_events (source, external_ref, payload, payload_hash)\n  VALUES ('bitrix_webhook', $1, $2::jsonb, encode(digest($2::text, 'sha256'), 'hex'))\n  ON CONFLICT (source, payload_hash) DO NOTHING\n  RETURNING raw_id\n)\nSELECT\n  (SELECT raw_id FROM ins)                AS raw_id,\n  EXISTS (SELECT 1 FROM ins)              AS is_new,\n  encode(digest($2::text, 'sha256'), 'hex') AS payload_hash;",
+        "options": {
+          "queryReplacement": "={{ [ String($json.body.deal_id ?? 'unknown'), JSON.stringify($json.body) ] }}"
+        }
+      },
+      "id": "445b69b8-d188-45b0-9474-5b72a00e90c1",
+      "name": "Land raw (idempotent)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -660,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "notes": "Query params are an ARRAY expression, not a comma-separated string. The payload is JSON and full of commas — a comma-separated list would be split into dozens of bogus parameters.\n\nON CONFLICT DO NOTHING means a redelivered webhook returns zero rows and the branch below stops. Replay always starts from here, never from Bitrix."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "has-raw-id",
+              "leftValue": "={{ $json.is_new === true || $json.is_new === 'true' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "looseTypeValidation": true
+        }
+      },
+      "id": "3f1af2b1-d2cb-4aa7-a6e2-5c3424ad0168",
+      "name": "New payload?",
+      "notes": "The condition is coerced to a boolean on purpose. Postgres returns bigserial as a STRING, so a number-typed comparison fails with \"'6' is a string but was expecting a number\" — and when ON CONFLICT DO NOTHING suppresses the row, raw_id is absent entirely. !! handles both.",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://railway-15c718f0.railway.internal:8000/chats/parse",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ payload: { dialog_id: 'deal-' + String($('Bitrix webhook').item.json.body.deal_id ?? 'unknown'), phone: ($('Bitrix webhook').item.json.body.phone || null), crm_entity_id: String($('Bitrix webhook').item.json.body.deal_id ?? 'unknown'), deal_info: { ID: String($('Bitrix webhook').item.json.body.deal_id ?? 'unknown') }, conversation_history: $json.history } }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "06a8a021-31e0-4171-99de-b11cce119740",
+      "name": "Parse & compute metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -220,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "worker-api",
+          "name": "worker-api"
+        }
+      },
+      "notes": "Private-network URL: no public internet, no egress billing.\n\nAuth is an n8n Header Auth credential (X-API-Key) rather than $env, so the secret never sits in this JSON and n8n's env-access setting is irrelevant.\n\nNormalisation, phone E.164 and every computed metric happen in Python. n8n never does arithmetic that ends up in a score."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO interactions (\n  external_source, external_id, channel, started_at, ended_at,\n  customer_phone_raw, customer_phone_e164, is_bot_handled, handled_by,\n  message_count, customer_message_count, agent_message_count,\n  first_response_seconds, is_after_hours\n) VALUES (\n  'bitrix', $1, $2::channel, $3::timestamptz, $4::timestamptz,\n  $5, $6, $7::boolean,\n  CASE WHEN $7::boolean THEN 'bot'::speaker_role ELSE 'agent'::speaker_role END,\n  $8::int, $9::int, $10::int, $11::int, $12::boolean\n)\nON CONFLICT (external_source, external_id) DO UPDATE SET\n  ended_at               = EXCLUDED.ended_at,\n  message_count          = EXCLUDED.message_count,\n  customer_message_count = EXCLUDED.customer_message_count,\n  agent_message_count    = EXCLUDED.agent_message_count,\n  first_response_seconds = EXCLUDED.first_response_seconds,\n  is_bot_handled         = EXCLUDED.is_bot_handled,\n  updated_at             = now()\nRETURNING interaction_id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.external_id, $json.channel, $json.started_at, $json.ended_at, $json.customer_phone_e164, $json.customer_phone_e164, $json.is_bot_only, $json.messages.length, $json.metrics.customer_message_count, $json.metrics.agent_message_count, $json.metrics.first_response_seconds, $json.metrics.after_hours ] }}"
+        }
+      },
+      "id": "3375affc-8fa6-4c60-99d8-51cb44d4ffac",
+      "name": "Upsert interaction",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        0,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO chat_messages (interaction_id, seq, sender, body, sent_at)\nSELECT $1::uuid,\n       (m->>'seq')::int,\n       (m->>'sender')::speaker_role,\n       m->>'body',\n       (m->>'sent_at')::timestamptz\nFROM jsonb_array_elements($2::jsonb) AS m\nON CONFLICT (interaction_id, sender, sent_at, body_hash) DO NOTHING;",
+        "options": {
+          "queryReplacement": "={{ [ $json.interaction_id, JSON.stringify($('Parse & compute metrics').item.json.messages) ] }}"
+        }
+      },
+      "id": "909c6d97-beda-4f77-8a11-b219df672185",
+      "name": "Insert messages (dedup)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        300
+      ],
+      "alwaysOutputData": true,
+      "notes": "The webhook resends the WHOLE thread every time. The unique key on (interaction_id, sender, sent_at, body_hash) is what stops five webhooks becoming five copies of every message.\n\nThe message array is passed as ONE jsonb parameter and expanded in SQL, so Arabic text containing commas cannot corrupt the parameter list.",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "should-eval",
+              "leftValue": "={{ $('Parse & compute metrics').item.json.should_evaluate }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4c51f947-50da-4b6d-9210-26297fc01260",
+      "name": "Human agent involved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        300
+      ],
+      "notes": "Bot-only threads stop here. Grading a human on the qualification bot's messages makes every QA number wrong."
+    },
+    {
+      "parameters": {
+        "amount": 1,
+        "unit": "minutes",
+        "path": "8c18ac65-1955-4c25-9e45-413ea7353fe2"
+      },
+      "id": "70d31fbd-f61d-4c86-9cce-95715140f8df",
+      "name": "Wait for thread to settle",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        660,
+        200
+      ],
+      "webhookId": "8c18ac65-1955-4c25-9e45-413ea7353fe2",
+      "notes": "A conversation grows over days. Re-running the judge on every webhook is expensive and produces churn; this waits until the thread has been idle before spending a model call.\n\nTESTING: set this to 1 minute for the first end-to-end run, then put it back to 30. A Wait longer than ~65s only resumes reliably when the workflow is PUBLISHED, not in a manual execution."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT count(*)::int AS newer\nFROM raw_events\nWHERE source = 'bitrix_webhook'\n  AND external_ref = $1\n  AND raw_id > $2::bigint;",
+        "options": {
+          "queryReplacement": "={{ [ String($('Bitrix webhook').item.json.body.deal_id ?? 'unknown'), $('Land raw (idempotent)').item.json.raw_id ] }}"
+        }
+      },
+      "id": "55e4d6f4-8708-4a53-96b7-1fa7f3faf37e",
+      "name": "Newer messages arrived?",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        880,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "notes": "If the thread grew while we waited, a later run will evaluate the fuller version. Abandoning this run avoids paying twice and avoids a stale score overwriting a fresh one."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "settled",
+              "leftValue": "={{ Number($json.newer || 0) === 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "looseTypeValidation": true
+        }
+      },
+      "id": "cbcd5aff-c912-4a64-a204-6cc0b7d7cb7d",
+      "name": "Still the latest?",
+      "notes": "Same string-vs-number trap as 'New payload?': count(*) comes back as a string. Number() coercion rather than a typed comparison.",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://railway-15c718f0.railway.internal:8000/evaluate",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ conversation: $('Parse & compute metrics').item.json.transcript_text, input_type: 'chat', metadata: $('Parse & compute metrics').item.json.metrics, run_pass1: true, run_pass2: true }) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "37a61641-d3a0-421e-9b34-f45d7c218cc1",
+      "name": "Two AI passes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1320,
+        200
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "worker-api",
+          "name": "worker-api"
+        }
+      },
+      "notes": "One HTTP call, two separate DeepSeek requests inside. Pass 1 (customer) and pass 2 (agent) never see each other's output, so an angry customer cannot drag down the agent's score."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH r AS (SELECT $2::jsonb AS d)\nINSERT INTO interaction_analysis (\n  interaction_id, schema_version, prompt_version, model, input_type,\n  language, intent, summary_ar, confidence, uncertain_fields, raw_response\n)\nSELECT\n  $1::uuid,\n  '1.0',\n  d->'pass1'->>'prompt_version',\n  d->'pass1'->>'model',\n  'chat'::input_type,\n  left(d->'pass1'->'payload'->>'language', 2),\n  d->'pass1'->'payload'->>'intent',\n  d->'pass1'->'payload'->>'summary_ar',\n  (d->'pass1'->'payload'->>'confidence')::numeric,\n  coalesce(d->'pass1'->'payload'->'uncertain_fields', '[]'::jsonb),\n  d->'pass1'->'payload'\nFROM r\nON CONFLICT (interaction_id) DO UPDATE SET\n  summary_ar   = EXCLUDED.summary_ar,\n  confidence   = EXCLUDED.confidence,\n  raw_response = EXCLUDED.raw_response,\n  updated_at   = now();",
+        "options": {
+          "queryReplacement": "={{ [ $('Upsert interaction').item.json.interaction_id, JSON.stringify($('Two AI passes').item.json) ] }}"
+        }
+      },
+      "id": "bddee985-367d-4e0a-a5d4-b9b2599d5c8f",
+      "name": "Store customer analysis",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1540,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "notes": "Reads $('Two AI passes') by name, never $json. A Postgres node outputs {success:true}, so any node chained after one and using $json silently gets that instead of the data it wanted."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH r AS (SELECT $2::jsonb AS d)\nINSERT INTO agent_evaluations (\n  interaction_id, schema_version, prompt_version, rubric_version, model,\n  input_type, final_score, performance_level, weight_applied,\n  m1_reception, m2_offer, m3_objections, m4_followup, m5_closing,\n  breakdown, evidence, stage_reached, behavior_flags,\n  top_strength, top_weakness, top_recommendation, notes, raw_response\n)\nSELECT\n  $1::uuid,\n  '1.0',\n  d->'pass2'->>'prompt_version',\n  d->>'rubric_version',\n  d->'pass2'->>'model',\n  'chat'::input_type,\n  (d->'pass2'->>'final_score')::numeric,\n  d->'pass2'->>'performance_level',\n  (d->'pass2'->>'weight_applied')::numeric,\n  (d->'pass2'->'modules'->>'module1_reception')::numeric,\n  (d->'pass2'->'modules'->>'module2_offer')::numeric,\n  (d->'pass2'->'modules'->>'module3_objections')::numeric,\n  (d->'pass2'->'modules'->>'module4_followup')::numeric,\n  (d->'pass2'->'modules'->>'module5_closing')::numeric,\n  coalesce(d->'pass2'->'payload'->'modules', '{}'::jsonb),\n  coalesce(d->'pass2'->'payload'->'evidence', '[]'::jsonb),\n  nullif(d->'pass2'->'payload'->>'stage_reached', '')::conversation_stage,\n  coalesce(d->'pass2'->'payload'->'behavior_flags', '[]'::jsonb),\n  d->'pass2'->'payload'->'summary'->>'top_strength',\n  d->'pass2'->'payload'->'summary'->>'top_weakness',\n  d->'pass2'->'payload'->'summary'->>'top_recommendation',\n  d->'pass2'->'payload'->>'notes',\n  d->'pass2'->'payload'\nFROM r\nON CONFLICT (interaction_id) DO UPDATE SET\n  final_score       = EXCLUDED.final_score,\n  performance_level = EXCLUDED.performance_level,\n  weight_applied    = EXCLUDED.weight_applied,\n  m1_reception      = EXCLUDED.m1_reception,\n  m2_offer          = EXCLUDED.m2_offer,\n  m3_objections     = EXCLUDED.m3_objections,\n  m4_followup       = EXCLUDED.m4_followup,\n  m5_closing        = EXCLUDED.m5_closing,\n  breakdown         = EXCLUDED.breakdown,\n  evidence          = EXCLUDED.evidence,\n  raw_response      = EXCLUDED.raw_response,\n  updated_at        = now();",
+        "options": {
+          "queryReplacement": "={{ [ $('Upsert interaction').item.json.interaction_id, JSON.stringify($('Two AI passes').item.json) ] }}"
+        }
+      },
+      "id": "0d8e90ef-8c18-4e5d-a7c4-0e2061f175c2",
+      "name": "Store evaluation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1760,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "notes": "Module scores may be null — that means the situation never arose, which is different from zero. The column is nullable on purpose and weight_applied records the denominator actually used."
+    },
+    {
+      "id": "5293ac5c-3edd-4316-8e6f-04bfe0370176",
+      "name": "Collect thread",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -600,
+        500
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COALESCE(jsonb_agg(jsonb_build_object(\n  'sender', payload->>'sender',\n  'message', payload->>'message',\n  'timestamp', payload->>'timestamp'\n) ORDER BY raw_id), '[]'::jsonb) AS history\nFROM raw_events\nWHERE source = 'bitrix_webhook' AND external_ref = $1;",
+        "options": {
+          "queryReplacement": "={{ [ String($('Bitrix webhook').item.json.body.deal_id ?? 'unknown') ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Bitrix webhook": {
+      "main": [
+        [
+          {
+            "node": "Land raw (idempotent)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Land raw (idempotent)": {
+      "main": [
+        [
+          {
+            "node": "New payload?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & compute metrics": {
+      "main": [
+        [
+          {
+            "node": "Upsert interaction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert interaction": {
+      "main": [
+        [
+          {
+            "node": "Insert messages (dedup)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert messages (dedup)": {
+      "main": [
+        [
+          {
+            "node": "Human agent involved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for thread to settle": {
+      "main": [
+        [
+          {
+            "node": "Newer messages arrived?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Newer messages arrived?": {
+      "main": [
+        [
+          {
+            "node": "Still the latest?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Two AI passes": {
+      "main": [
+        [
+          {
+            "node": "Store customer analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store customer analysis": {
+      "main": [
+        [
+          {
+            "node": "Store evaluation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New payload?": {
+      "main": [
+        [
+          {
+            "node": "Wait for thread to settle",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Human agent involved?": {
+      "main": [
+        [
+          {
+            "node": "Two AI passes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Still the latest?": {
+      "main": [
+        [
+          {
+            "node": "Collect thread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect thread": {
+      "main": [
+        [
+          {
+            "node": "Parse & compute metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  }
+}
