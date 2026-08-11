@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
@@ -301,9 +302,21 @@ def transcribe(req: TranscribeRequest) -> dict:
 # Evaluate
 # ---------------------------------------------------------------------------
 
-# Below this many non-whitespace characters there is no conversation to grade.
-# A real call that is only a greeting still clears it; an ASR miss does not.
+# Below this many characters of actual speech there is no conversation to grade.
 MIN_SCOREABLE_CHARS = 20
+
+# A transcript arrives as "[00:00] text" or "[00:00] AGENT: text", and that
+# scaffolding is not speech. Counting it let "[00:00] ألو السلام عليكم" — a
+# hangup, sixteen characters of Arabic — clear a twenty character floor and be
+# scored 33.1 "Below Average" on 2026-08-11. Measure what was said.
+_TRANSCRIPT_FURNITURE = re.compile(
+    r"^\s*\[\d{1,2}:\d{2}(?::\d{2})?\]\s*(?:[A-Z_]{3,12}:)?\s*", re.MULTILINE
+)
+
+
+def spoken_content(transcript: str) -> str:
+    """The transcript with timestamps and speaker labels removed."""
+    return " ".join(_TRANSCRIPT_FURNITURE.sub("", transcript or "").split())
 
 
 def _unscoreable(reason: str) -> dict:
@@ -330,11 +343,12 @@ def evaluate(req: EvaluateRequest) -> dict:
     # back from the ASR Space with empty text and confidence 0 under burst load,
     # and every one was stored as final_score 0, "Below Average", gradeable.
     # That is an agent's scorecard destroyed by someone else's rate limit.
-    body = (req.conversation or "").strip()
+    body = spoken_content(req.conversation)
     if len(body) < MIN_SCOREABLE_CHARS:
         return _unscoreable(
-            f"transcript has {len(body)} characters, below the {MIN_SCOREABLE_CHARS} "
-            f"needed to score: treated as a failed transcription, not a bad call"
+            f"transcript holds {len(body)} characters of speech, below the "
+            f"{MIN_SCOREABLE_CHARS} needed to score: treated as a failed or "
+            f"abandoned call, not a badly handled one"
         )
 
     client = judge.DeepSeekClient(settings.deepseek_api_key, settings.deepseek_model)

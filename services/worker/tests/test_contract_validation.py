@@ -202,7 +202,7 @@ def test_short_or_empty_transcripts_are_refused_not_scored(text, monkeypatch):
     p2 = r.json()["pass2"]
     assert p2["gradeable"] is False
     assert p2["final_score"] is None          # never 0 — 0 means "did it badly"
-    assert "failed transcription" in p2["warnings"][0]
+    assert "not a badly handled one" in p2["warnings"][0]
 
 
 def test_a_real_short_call_still_reaches_the_judge(monkeypatch):
@@ -238,3 +238,40 @@ def test_retry_recovers_a_chunk_that_fails_once():
             return "نعم تفضل"
 
     assert _transcribe_with_retry(Flaky(), "x") == "نعم تفضل"
+
+
+# ── the floor must measure speech, not scaffolding ──────────────────────────
+# Live 2026-08-11: "[00:00] ألو السلام عليكم" — a hangup, sixteen characters of
+# Arabic — cleared a twenty character floor because the timestamp counted
+# towards it, and was scored 33.1 "Below Average". The caller hung up; the
+# agent did nothing wrong.
+
+def test_timestamps_and_speaker_labels_do_not_count_as_speech():
+    from app.main import spoken_content
+
+    assert spoken_content("[00:00] ألو السلام عليكم") == "ألو السلام عليكم"
+    assert spoken_content("[00:00] AGENT: ألو") == "ألو"
+    assert spoken_content("[01:23:45] CUSTOMER: نعم") == "نعم"
+    assert spoken_content("[00:00] " + chr(10) + "[00:12] ") == ""
+
+
+def test_a_hangup_is_refused_not_scored(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+
+    monkeypatch.setattr(main.settings, "worker_api_key", "k", raising=False)
+    monkeypatch.setattr(main.settings, "deepseek_api_key", "sk-test", raising=False)
+    r = TestClient(main.app).post(
+        "/evaluate",
+        json={"conversation": "[00:00] ألو السلام عليكم", "input_type": "call_transcript"},
+        headers={"X-API-Key": "k"},
+    )
+    p2 = r.json()["pass2"]
+    assert p2["gradeable"] is False and p2["final_score"] is None
+
+
+def test_a_real_conversation_is_not_swallowed_by_the_floor():
+    from app.main import spoken_content, MIN_SCOREABLE_CHARS
+
+    real = "[00:00] ألو السلام عليكم -- عليكم السلام هلا معك خالد من ترافل جيت"
+    assert len(spoken_content(real)) >= MIN_SCOREABLE_CHARS

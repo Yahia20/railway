@@ -183,7 +183,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Everything the judge is allowed to treat as fact about follow-up.\n-- If this returns no rows the worker sends 'unavailable' and Module 4 scores null.\nSELECT coalesce(string_agg(\n  format('  - [%s] %s by %s, %.1fh after this call',\n         i.started_at, i.channel,\n         coalesce(a.full_name, 'unknown'),\n         extract(epoch from (i.started_at - $2::timestamptz))/3600.0),\n  E'\\n' ORDER BY i.started_at), '') AS history\nFROM interactions i\nLEFT JOIN agents a ON a.agent_id = i.agent_id\nWHERE i.customer_phone_e164 = $1\n  AND i.started_at > $2::timestamptz\n  AND i.started_at < $2::timestamptz + interval '14 days';",
+        "query": "-- Everything the judge is allowed to treat as fact about follow-up.\n-- If this returns no rows the worker sends 'unavailable' and Module 4 scores null.\nSELECT coalesce(string_agg(\n  format('  - [%s] %s by %s, %sh after this call',\n         i.started_at, i.channel,\n         coalesce(a.full_name, 'unknown'),\n         round((extract(epoch from (i.started_at - $2::timestamptz))/3600.0)::numeric, 1)),\n  E'\\n' ORDER BY i.started_at), '') AS history\nFROM interactions i\nLEFT JOIN agents a ON a.agent_id = i.agent_id\nWHERE i.customer_phone_e164 = $1\n  AND i.started_at > $2::timestamptz\n  AND i.started_at < $2::timestamptz + interval '14 days';",
         "options": {
           "queryReplacement": "={{ [ $('One item per recording').item.json.customer_phone_e164, $('One item per recording').item.json.started_at ] }}"
         }
@@ -202,7 +202,7 @@
           "name": "Railway Postgres"
         }
       },
-      "notes": "This is the query that makes Module 4 meaningful for a call. Until Bitrix chats are flowing it returns nothing, and Module 4 correctly scores null instead of a free 100."
+      "notes": "Postgres format() only understands %s, %I, %L and %%. A C-style %.1f is rejected at runtime with 'unrecognized format() type specifier' — rounding belongs in SQL, not the format string."
     },
     {
       "parameters": {
