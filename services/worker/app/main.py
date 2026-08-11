@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -19,6 +19,7 @@ from .asr import cohere_arabic
 from .config import settings
 from .evaluate import judge, metrics, scoring
 from .normalize.phone import try_normalize
+from .sources import CallRecording, get_call_source
 from .sources.bitrix_chats import BitrixWebhookSource
 from .sources.drive_calls import RecordingNameError, parse_recording_name
 
@@ -49,6 +50,15 @@ class ParseChatRequest(BaseModel):
 class TranscribeRequest(BaseModel):
     audio_path: str = Field(description="local path, or drive://<fileId>")
     filename: str | None = Field(default=None, description="for PBX metadata parsing")
+
+
+class ListCallsRequest(BaseModel):
+    since: str | None = Field(
+        default=None,
+        description="ISO-8601 instant. Recordings modified after this are returned. "
+                    "Omit for the last 2 days.",
+    )
+    limit: int = Field(default=500, ge=1, le=2000)
 
 
 class EvaluateRequest(BaseModel):
@@ -162,9 +172,82 @@ def parse_call_name(filename: str) -> dict:
     return meta
 
 
+def _call_source_or_503():
+    """The Drive source, or a 503 that names the missing variable.
+
+    Without this the first request after a half-finished setup dies on a raw
+    KeyError and returns a 500 with no clue which of the two variables is
+    absent — the same question /ready already answers precisely.
+    """
+    try:
+        settings.validate_for("calls")
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    # Default to 'drive', not to get_call_source()'s 'mock'. These two endpoints
+    # only mean anything against Drive, and the Drive variables have just been
+    # confirmed present — falling back to the mock here would answer a request
+    # for real recordings with invented ones and look entirely successful.
+    return get_call_source(os.getenv("CALL_SOURCE") or "drive")
+
+
+@app.post("/calls/list", dependencies=[Depends(require_api_key)])
+def list_calls(req: ListCallsRequest) -> dict:
+    """New recordings in the Drive folder, already decoded from their filenames.
+
+    Listing lives here rather than in an n8n Google Drive node so the service
+    account exists in exactly one place. Two copies of a credential is two
+    things to rotate and one to forget, and n8n binds credentials by internal
+    id, so an exported workflow cannot carry it anyway.
+    """
+    since = (
+        datetime.fromisoformat(req.since)
+        if req.since
+        else datetime.now(timezone.utc) - timedelta(days=2)
+    )
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+
+    source = _call_source_or_503()
+    items = []
+    for rec in source.list_since(since, limit=req.limit):
+        phone, phone_error = try_normalize(rec.customer_phone_raw, settings.default_phone_region)
+        # Every field /calls/parse-name returns, plus where the audio lives, so a
+        # caller needs one round trip per batch instead of one per recording.
+        meta = dict(rec.raw.get("parsed_name") or {})
+        meta["started_at"] = rec.started_at.isoformat()
+        meta.update({
+            "external_id": rec.external_id,
+            "audio_uri": rec.audio_uri,
+            "filename": (rec.raw.get("drive_file") or {}).get("name"),
+            "customer_phone_e164": phone,
+            "phone_error": phone_error,
+            "size_bytes": rec.size_bytes,
+        })
+        items.append(meta)
+    return {"since": since.isoformat(), "count": len(items), "recordings": items}
+
+
 @app.post("/calls/transcribe", dependencies=[Depends(require_api_key)])
 def transcribe(req: TranscribeRequest) -> dict:
-    path = req.audio_path
+    """Transcribe a local file, or a Drive object given as drive://<fileId>.
+
+    The Drive form matters: n8n and this worker are separate Railway services
+    with separate filesystems, so a path written by n8n is not a path this
+    process can open. Downloading here keeps the audio on one machine and off
+    the wire between them.
+    """
+    path, downloaded = req.audio_path, False
+    if path.startswith("drive://"):
+        source = _call_source_or_503()
+        rec = CallRecording(
+            external_id=(req.filename or path.removeprefix("drive://")).removesuffix(".wav"),
+            external_source=getattr(source, "name", "asterisk_drive"),
+            audio_uri=path,
+            started_at=datetime.now(timezone.utc),
+        )
+        path = source.download(rec, settings.work_dir)
+        downloaded = True
+
     if not os.path.exists(path):
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"audio not found: {path}")
 

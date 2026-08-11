@@ -147,3 +147,41 @@ def test_a_genuinely_malformed_name_still_raises():
 
     with pytest.raises(RecordingNameError):
         parse_recording_name("q-3009-0565186475-notadate-114155-1786178514.76687 (1).wav")
+
+
+# ── the calls endpoints refuse rather than invent ───────────────────────────
+# get_call_source() defaults to the mock. These two endpoints only mean
+# anything against Drive, so a half-finished setup must fail loudly instead of
+# answering with fabricated recordings that look real.
+
+def test_calls_endpoints_503_without_drive_config(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+
+    monkeypatch.setattr(main.settings, "drive_folder_id", "", raising=False)
+    monkeypatch.setattr(main.settings, "drive_credentials_json", "", raising=False)
+    monkeypatch.setattr(main.settings, "worker_api_key", "k", raising=False)
+    client = TestClient(main.app)
+
+    r = client.post("/calls/list", json={}, headers={"X-API-Key": "k"})
+    assert r.status_code == 503
+    assert "DRIVE_CALLS_FOLDER_ID" in r.json()["detail"]
+    assert "GOOGLE_SERVICE_ACCOUNT_JSON" in r.json()["detail"]
+
+    r = client.post("/calls/transcribe", json={"audio_path": "drive://abc"},
+                    headers={"X-API-Key": "k"})
+    assert r.status_code == 503
+
+
+def test_local_path_transcribe_still_404s_not_503(monkeypatch):
+    """A local path must not be dragged through the Drive config check."""
+    from fastapi.testclient import TestClient
+    from app import main
+
+    monkeypatch.setattr(main.settings, "drive_folder_id", "", raising=False)
+    monkeypatch.setattr(main.settings, "worker_api_key", "k", raising=False)
+    client = TestClient(main.app)
+
+    r = client.post("/calls/transcribe", json={"audio_path": "/nope/missing.wav"},
+                    headers={"X-API-Key": "k"})
+    assert r.status_code == 404

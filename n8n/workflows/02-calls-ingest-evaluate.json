@@ -6,14 +6,14 @@
         "rule": {
           "interval": [
             {
-              "field": "minutes",
-              "minutesInterval": 15
+              "field": "cronExpression",
+              "expression": "0 1 * * *"
             }
           ]
         }
       },
       "id": "sched",
-      "name": "Every 15 min",
+      "name": "Daily 01:00",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [
@@ -45,48 +45,40 @@
     },
     {
       "parameters": {
-        "resource": "fileFolder",
-        "queryString": "=",
-        "filter": {
-          "folderId": {
-            "__rl": true,
-            "value": "={{ $env.DRIVE_CALLS_FOLDER_ID }}",
-            "mode": "id"
-          },
-          "whatToSearch": "files"
-        },
-        "options": {
-          "fields": [
-            "id",
-            "name",
-            "size",
-            "modifiedTime",
-            "mimeType"
+        "method": "POST",
+        "url": "={{ $env.WORKER_URL }}/calls/list",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
           ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ since: $('Read watermark').item.json.since }) }}",
+        "options": {
+          "timeout": 120000
         }
       },
       "id": "list-files",
-      "name": "List Drive recordings",
-      "type": "n8n-nodes-base.googleDrive",
-      "typeVersion": 3,
+      "name": "List new recordings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
       "position": [
         -320,
         300
       ],
-      "credentials": {
-        "googleApi": {
-          "id": "drive-sa",
-          "name": "Drive service account"
-        }
-      },
-      "notes": "Service account, not user OAuth: a scheduled job cannot complete an interactive consent screen."
+      "notes": "Returns every field /calls/parse-name would, plus audio_uri, so no per-file decode call."
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "SELECT NOT EXISTS (\n  SELECT 1 FROM interactions\n  WHERE external_source = 'asterisk_drive' AND external_id = $1\n) AS is_new;",
         "options": {
-          "queryReplacement": "={{ [ $json.name.split('-').pop().replace('.wav','') ] }}"
+          "queryReplacement": "={{ [ $json.uniqueid ] }}"
         }
       },
       "id": "seen",
@@ -94,7 +86,7 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        -100,
+        120,
         300
       ],
       "credentials": {
@@ -131,89 +123,9 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        120,
-        300
-      ]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ $env.WORKER_URL }}/calls/parse-name",
-        "sendQuery": true,
-        "queryParameters": {
-          "parameters": [
-            {
-              "name": "filename",
-              "value": "={{ $('List Drive recordings').item.json.name }}"
-            }
-          ]
-        },
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "X-API-Key",
-              "value": "={{ $env.WORKER_API_KEY }}"
-            }
-          ]
-        },
-        "options": {
-          "timeout": 15000
-        }
-      },
-      "id": "parse-name",
-      "name": "Decode PBX filename",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
         340,
         300
-      ],
-      "notes": "q-3009-0500000000-20260701-170522-<uniqueid>.wav yields agent extension, caller number and start time. Also reports clock drift between the filename and the Asterisk uniqueid."
-    },
-    {
-      "parameters": {
-        "operation": "download",
-        "fileId": {
-          "__rl": true,
-          "value": "={{ $('List Drive recordings').item.json.id }}",
-          "mode": "id"
-        },
-        "options": {
-          "binaryPropertyName": "audio"
-        }
-      },
-      "id": "download",
-      "name": "Download audio",
-      "type": "n8n-nodes-base.googleDrive",
-      "typeVersion": 3,
-      "position": [
-        560,
-        300
-      ],
-      "credentials": {
-        "googleApi": {
-          "id": "drive-sa",
-          "name": "Drive service account"
-        }
-      }
-    },
-    {
-      "parameters": {
-        "operation": "toFile",
-        "fileName": "=/tmp/customer360/{{ $('Decode PBX filename').item.json.uniqueid }}.wav",
-        "dataPropertyName": "audio",
-        "options": {}
-      },
-      "id": "to-disk",
-      "name": "Write to shared volume",
-      "type": "n8n-nodes-base.readWriteFile",
-      "typeVersion": 1,
-      "position": [
-        780,
-        300
-      ],
-      "notes": "n8n and the worker share a Railway volume mounted at /tmp/customer360, so the audio is never base64'd through HTTP."
+      ]
     },
     {
       "parameters": {
@@ -230,7 +142,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ audio_path: '/tmp/customer360/' + $('Decode PBX filename').item.json.uniqueid + '.wav' }) }}",
+        "jsonBody": "={{ JSON.stringify({ audio_path: $('One item per recording').item.json.audio_uri, filename: $('One item per recording').item.json.filename }) }}",
         "options": {
           "timeout": 900000
         }
@@ -240,17 +152,17 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        1000,
+        560,
         300
       ],
-      "notes": "15-minute timeout: an 8-minute call is ~13 chunks and the Space queues. Chunking happens inside the worker at silence boundaries."
+      "notes": "drive://<id> — the worker downloads it. n8n and the worker have separate filesystems."
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "WITH r AS (SELECT $1::jsonb AS meta, $2::jsonb AS tr),\nins AS (\n  INSERT INTO interactions (\n    external_source, external_id, channel, started_at, duration_seconds,\n    customer_phone_raw, customer_phone_e164, agent_id, handled_by\n  )\n  SELECT 'asterisk_drive', meta->>'uniqueid', 'phone_call'::channel,\n         (meta->>'started_at')::timestamptz,\n         round((tr->>'duration_seconds')::numeric)::int,\n         meta->>'customer_phone_raw', meta->>'customer_phone_e164',\n         (SELECT agent_id FROM agents WHERE phone_extension = meta->>'agent_extension'),\n         'agent'::speaker_role\n  FROM r\n  ON CONFLICT (external_source, external_id) DO UPDATE SET updated_at = now()\n  RETURNING interaction_id\n)\nINSERT INTO transcripts (\n  interaction_id, audio_uri, duration_seconds, sample_rate_hz, channels,\n  asr_provider, asr_model_version, asr_confidence, language,\n  full_text, segments, diarization\n)\nSELECT ins.interaction_id, r.meta->>'audio_uri',\n       (r.tr->>'duration_seconds')::numeric,\n       (r.tr->>'sample_rate_hz')::int, (r.tr->>'channels')::int,\n       r.tr->>'provider', r.tr->>'model_version',\n       (r.tr->>'confidence')::numeric, 'ar',\n       r.tr->>'full_text', coalesce(r.tr->'segments', '[]'::jsonb),\n       r.tr->>'diarization'\nFROM ins, r\nON CONFLICT (interaction_id) DO UPDATE SET\n  full_text      = EXCLUDED.full_text,\n  segments       = EXCLUDED.segments,\n  asr_confidence = EXCLUDED.asr_confidence\nRETURNING interaction_id;",
         "options": {
-          "queryReplacement": "={{ [ JSON.stringify(Object.assign({}, $('Decode PBX filename').item.json, { audio_uri: 'drive://' + $('List Drive recordings').item.json.id })), JSON.stringify($('Cohere Arabic ASR').item.json) ] }}"
+          "queryReplacement": "={{ [ JSON.stringify($('One item per recording').item.json), JSON.stringify($('Cohere Arabic ASR').item.json) ] }}"
         }
       },
       "id": "store-transcript",
@@ -258,7 +170,7 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1220,
+        780,
         300
       ],
       "credentials": {
@@ -273,7 +185,7 @@
         "operation": "executeQuery",
         "query": "-- Everything the judge is allowed to treat as fact about follow-up.\n-- If this returns no rows the worker sends 'unavailable' and Module 4 scores null.\nSELECT coalesce(string_agg(\n  format('  - [%s] %s by %s, %.1fh after this call',\n         i.started_at, i.channel,\n         coalesce(a.full_name, 'unknown'),\n         extract(epoch from (i.started_at - $2::timestamptz))/3600.0),\n  E'\\n' ORDER BY i.started_at), '') AS history\nFROM interactions i\nLEFT JOIN agents a ON a.agent_id = i.agent_id\nWHERE i.customer_phone_e164 = $1\n  AND i.started_at > $2::timestamptz\n  AND i.started_at < $2::timestamptz + interval '14 days';",
         "options": {
-          "queryReplacement": "={{ [ $('Decode PBX filename').item.json.customer_phone_e164, $('Decode PBX filename').item.json.started_at ] }}"
+          "queryReplacement": "={{ [ $('One item per recording').item.json.customer_phone_e164, $('One item per recording').item.json.started_at ] }}"
         }
       },
       "id": "followups",
@@ -281,7 +193,7 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1440,
+        1000,
         300
       ],
       "credentials": {
@@ -317,7 +229,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        1660,
+        1220,
         300
       ]
     },
@@ -334,7 +246,7 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1880,
+        1440,
         300
       ],
       "credentials": {
@@ -358,7 +270,7 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        2100,
+        1660,
         300
       ],
       "credentials": {
@@ -367,10 +279,24 @@
           "name": "Railway Postgres"
         }
       }
+    },
+    {
+      "parameters": {
+        "jsCode": "// /calls/list answers once per batch; the rest of the workflow is per call.\nconst { recordings = [] } = $input.first().json;\nreturn recordings.map(r => ({ json: r }));"
+      },
+      "id": "split-recordings",
+      "name": "One item per recording",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -100,
+        300
+      ],
+      "notes": "A Code node rather than Split Out: this is the one list-flattening node in the pipeline, and Code exists on every n8n version."
     }
   ],
   "connections": {
-    "Every 15 min": {
+    "Daily 01:00": {
       "main": [
         [
           {
@@ -385,14 +311,25 @@
       "main": [
         [
           {
-            "node": "List Drive recordings",
+            "node": "List new recordings",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "List Drive recordings": {
+    "List new recordings": {
+      "main": [
+        [
+          {
+            "node": "One item per recording",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One item per recording": {
       "main": [
         [
           {
@@ -415,40 +352,6 @@
       ]
     },
     "New recording?": {
-      "main": [
-        [
-          {
-            "node": "Decode PBX filename",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        []
-      ]
-    },
-    "Decode PBX filename": {
-      "main": [
-        [
-          {
-            "node": "Download audio",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Download audio": {
-      "main": [
-        [
-          {
-            "node": "Write to shared volume",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Write to shared volume": {
       "main": [
         [
           {
