@@ -258,6 +258,7 @@ def transcribe(req: TranscribeRequest) -> dict:
     # one per-request directory and is deleted on the way out. The disk here is
     # ephemeral and small; without this, each call leaks its full audio size and
     # the service eventually dies with opaque 500s on every download.
+    os.makedirs(settings.work_dir, exist_ok=True)
     scratch = tempfile.mkdtemp(prefix="asr_req_", dir=settings.work_dir)
     try:
         path = req.audio_path
