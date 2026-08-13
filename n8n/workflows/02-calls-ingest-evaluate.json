@@ -245,6 +245,60 @@
       }
     },
     {
+      "id": "asr-quality-red",
+      "name": "ASR quality red?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1670,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $('Cohere Arabic ASR').item.json.asr_quality_status === 'red' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "mark-unscoreable",
+      "name": "Mark unscoreable",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1890,
+        420
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- ASR quality gate said red: too much of the audio is unaccounted for\n-- (failed chunks, decoder loops, contamination-dominated text) to score an\n-- agent on what remains. The transcript IS stored for audit; the job goes\n-- straight to dead_letter with the gate detail. No retry: re-transcribing\n-- the same audio reproduces the same acoustics.\nUPDATE call_ingest_jobs\nSET status = 'dead_letter',\n    last_error = left('asr_quality_red: ' || $2, 500),\n    updated_at = now()\nWHERE uniqueid = $1;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, JSON.stringify(($('Cohere Arabic ASR').item.json.asr_metrics || {}).quality || {}) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      }
+    },
+    {
       "id": "build-follow-up-history",
       "name": "Build follow-up history",
       "type": "n8n-nodes-base.postgres",
@@ -519,6 +573,24 @@
     },
     "Link job transcribed": {
       "main": [
+        [
+          {
+            "node": "ASR quality red?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ASR quality red?": {
+      "main": [
+        [
+          {
+            "node": "Mark unscoreable",
+            "type": "main",
+            "index": 0
+          }
+        ],
         [
           {
             "node": "Build follow-up history",
