@@ -291,6 +291,11 @@ def transcribe(req: TranscribeRequest) -> dict:
         "channels": result.channels,
         "confidence": result.confidence,
         "asr_metrics": result.metrics,
+        # Top-level so the n8n IF node can branch on it without digging into
+        # the metrics blob. red = do not evaluate: too much audio is
+        # unaccounted for (failed chunks, decoder loops, contamination-
+        # dominated text) to score an agent on what remains.
+        "asr_quality_status": result.metrics.get("asr_quality_status", "green"),
         "diarization": result.diarization,
         "segments": [
             {"seq": s.seq, "start_sec": s.start_sec, "end_sec": s.end_sec,

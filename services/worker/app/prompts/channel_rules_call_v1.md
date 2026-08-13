@@ -15,6 +15,15 @@ TRANSCRIPT QUALITY
   confirmed by the other speaker. Record any such doubt in notes.
 - The METADATA block gives `asr_confidence`. Below 0.75, lower your certainty
   across every module and say so in notes.
+- The transcript may contain the marker `[[ASR_GAP]]`. It marks a place where
+  unreliable machine output (transcription artifacts, a stuck decoder) was
+  removed before you saw the text. It is NOT speech and nobody said it.
+  * Never quote it as evidence.
+  * Never draw a conclusion that connects the text before a gap to the text
+    after it — the two may be unrelated moments of the call. A question before
+    a gap was not necessarily answered by the sentence after it.
+  * A gap is line/transcription quality, never agent behaviour. Do not score
+    it against the agent; note it if it may have hidden something important.
 
 SPEAKER ATTRIBUTION — READ CAREFULLY
 The METADATA block states `diarization`:

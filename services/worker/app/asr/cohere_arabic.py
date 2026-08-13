@@ -202,7 +202,15 @@ class CohereAPIBackend:
     segment, the exact failure mode that poisoned the first live batch.
     """
 
+    # This backend retries transport errors itself (with rate-limit pacing),
+    # so the generic outer retry in _transcribe_with_retry must not wrap it —
+    # nested loops multiplied to 12 requests per chunk worst case, and burned
+    # free-tier quota exactly when the API was already refusing.
+    handles_transport_retries = True
+
     def __init__(self, api_key: str, base_url: str = "https://api.cohere.com"):
+        import threading
+
         import httpx
 
         self._client = httpx.Client(
@@ -212,17 +220,22 @@ class CohereAPIBackend:
         )
         self._min_interval = float(os.getenv("ASR_MIN_REQUEST_INTERVAL", "12"))
         self._last_request = 0.0
+        # FastAPI runs sync handlers on a thread pool: two concurrent requests
+        # would both read a stale _last_request and burst past the 5/min limit
+        # unless the pacing check-and-set is atomic.
+        self._pace_lock = threading.Lock()
 
     def transcribe_file(self, path: str) -> str:
         import time
 
         import httpx
 
-        for attempt in range(4):
-            wait = self._min_interval - (time.monotonic() - self._last_request)
-            if wait > 0:
-                time.sleep(wait)
-            self._last_request = time.monotonic()
+        for attempt in range(3):
+            with self._pace_lock:
+                wait = self._min_interval - (time.monotonic() - self._last_request)
+                if wait > 0:
+                    time.sleep(wait)
+                self._last_request = time.monotonic()
 
             with open(path, "rb") as fh:
                 # The API rejects the request unless model/language appear
@@ -235,9 +248,14 @@ class CohereAPIBackend:
                     data={"model": MODEL_ID.split("/")[-1], "language": "ar"},
                 )
             if r.status_code == 429 or r.status_code >= 500:
-                if attempt == 3:
+                if attempt == 2:
                     r.raise_for_status()
-                time.sleep(15 * (attempt + 1))
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    pause = max(float(retry_after), 1.0) if retry_after else 15.0 * (attempt + 1)
+                except ValueError:
+                    pause = 15.0 * (attempt + 1)
+                time.sleep(pause)
                 continue
             r.raise_for_status()
             payload = r.json()
@@ -301,6 +319,15 @@ def _transcribe_with_retry(backend, chunk_path: str) -> str | None:
     """
     import time
 
+    if getattr(backend, "handles_transport_retries", False):
+        # The backend already paces and retries transport errors internally;
+        # wrapping it again multiplies the attempts (3×4 = 12 requests per
+        # chunk at worst) and turns one throttled minute into a burned quota.
+        try:
+            return backend.transcribe_file(chunk_path)
+        except Exception:                       # noqa: BLE001
+            return None
+
     for attempt in range(ASR_RETRIES):
         try:
             return backend.transcribe_file(chunk_path)
@@ -338,6 +365,7 @@ def transcribe_call(path: str, backend=None, work_dir: str | None = None,
     cuts = chunk_at_silences(pcm, rate, target_sec=target_sec)
 
     segments, failures, empty_ok = [], 0, 0
+    failed_seqs: set[int] = set()
     for i in range(len(cuts) - 1):
         start, end = cuts[i], cuts[i + 1]
         chunk_path = _write_chunk(pcm[start:end], rate,
@@ -350,15 +378,40 @@ def transcribe_call(path: str, backend=None, work_dir: str | None = None,
                 drop_shared_backend()
                 backend = shared_backend()
             text, failures = "", failures + 1
+            failed_seqs.add(i)
         elif not text:
             empty_ok += 1
         segments.append(Segment(seq=i, start_sec=round(start / rate, 2),
                                 end_sec=round(end / rate, 2), text=text))
 
     total = len(segments) or 1
-    full_text = " ".join(s.text for s in segments if s.text).strip()
+    raw_full_text = " ".join(s.text for s in segments if s.text).strip()
     duration = round(len(pcm) / rate, 2)
-    token_run = _max_token_run(full_text)
+    token_run = _max_token_run(raw_full_text)
+
+    # Contamination removal + loop truncation, per chunk, before anything
+    # downstream sees the text. Segments carry CLEAN text from here on; the
+    # removed literals live in the metrics ledger, reconstructible exactly.
+    from . import text_quality
+
+    chunk_results = []
+    for s in segments:
+        cq = text_quality.clean_chunk(s.text, seq=s.seq)
+        s.text = cq.clean_text
+        chunk_results.append(cq)
+    full_text = " ".join(s.text for s in segments if s.text).strip()
+    clean_chars = len(full_text.replace(text_quality.GAP, ""))
+
+    quality = text_quality.assess_call(
+        chunk_results,
+        chunk_durations=[s.end_sec - s.start_sec for s in segments],
+        failed_seqs=failed_seqs,
+        total_duration=duration,
+        clean_chars=clean_chars,
+        raw_chars=len(raw_full_text),
+        chunks_empty=empty_ok,
+    )
+
     return Transcription(
         full_text=full_text,
         segments=segments,
@@ -376,12 +429,20 @@ def transcribe_call(path: str, backend=None, work_dir: str | None = None,
             # Chunks the backend answered with nothing — silence or music read
             # correctly. Distinct from failed: only failed moves `confidence`.
             "chunks_empty": empty_ok,
-            "chars": len(full_text),
+            "chars": len(raw_full_text),
+            "clean_chars": clean_chars,
             # Arabic phone speech lands very roughly at 2-15 chars/sec of
             # audio; near-zero on a long call means lost speech even when
             # every chunk "succeeded".
-            "chars_per_audio_sec": round(len(full_text) / duration, 2) if duration else 0.0,
+            "chars_per_audio_sec": round(len(raw_full_text) / duration, 2) if duration else 0.0,
             "max_token_run": token_run,
             "repetition_suspect": token_run >= 6,
+            "asr_quality_status": quality["status"],
+            "quality": quality,
+            "cleaning": {
+                "version": text_quality.POLICY_VERSION,
+                "ops": [op for cq in chunk_results for op in cq.ops],
+                "flags": [f for cq in chunk_results for f in cq.flags],
+            },
         },
     )

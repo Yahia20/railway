@@ -193,19 +193,32 @@ def validate_evidence(payload: dict, conversation_text: str) -> list[str]:
     (hamza/alef forms, ya vs alef maqsura, ta marbuta vs ha, diacritics,
     tatweel) — ASR spells these inconsistently, and rejecting a real quote
     over a hamza teaches the judge that citing evidence is pointless.
+
+    Call transcripts may contain [[ASR_GAP]] markers where contaminated or
+    looped ASR output was removed. A quote must match inside ONE uninterrupted
+    span: matching across a gap would accept a "quote" stitched together from
+    two unrelated sentences that merely became adjacent after cleaning, and
+    the marker itself is never quotable.
     """
     problems: list[str] = []
-    haystack = " ".join(conversation_text.split())
-    folded_haystack = _fold_arabic(conversation_text)
+    spans = [s for s in conversation_text.split("[[ASR_GAP]]") if s.strip()]
+    haystacks = [" ".join(s.split()) for s in spans]
+    folded_haystacks = [_fold_arabic(s) for s in spans]
 
     for i, item in enumerate(payload.get("evidence") or []):
         quote = (item.get("quote") or "").strip()
         if not quote:
             problems.append(f"evidence[{i}]: empty quote")
             continue
-        if " ".join(quote.split()) in haystack:
+        if "ASR_GAP" in quote:
+            problems.append(f"evidence[{i}]: quote contains the ASR gap marker, "
+                            "which is not speech and cannot be cited")
             continue
-        if _fold_arabic(quote) in folded_haystack:
+        flat = " ".join(quote.split())
+        if any(flat in h for h in haystacks):
+            continue
+        folded = _fold_arabic(quote)
+        if any(folded in h for h in folded_haystacks):
             continue
         problems.append(f"evidence[{i}]: quote not found in conversation: {quote[:60]!r}")
     return problems
