@@ -56,6 +56,11 @@ class Transcription:
     diarization: Literal["none", "dual_channel", "pyannote", "provider", "manual"] = "none"
     speaker_map: dict = field(default_factory=dict)
 
+    # Honest health measurements (see transcribe_call). `confidence` above is
+    # only chunk return rate; these say what actually came back and whether it
+    # looks like speech or like a decoder stuck in a loop.
+    metrics: dict = field(default_factory=dict)
+
     def as_dialogue(self) -> str:
         """Timestamped rendering for the judge prompt.
 
@@ -306,6 +311,19 @@ def _transcribe_with_retry(backend, chunk_path: str) -> str | None:
     return None
 
 
+def _max_token_run(text: str) -> int:
+    """Longest run of one token repeated consecutively. ASR decoders that get
+    stuck emit the same word dozens of times; real Gulf/Egyptian speech rarely
+    repeats a token more than a handful of times in a row."""
+    best = run = 0
+    prev = None
+    for tok in text.split():
+        run = run + 1 if tok == prev else 1
+        prev = tok
+        best = max(best, run)
+    return best
+
+
 def transcribe_call(path: str, backend=None, work_dir: str | None = None,
                     target_sec: float = 40.0) -> Transcription:
     """Transcribe one call recording into timestamped segments."""
@@ -319,7 +337,7 @@ def transcribe_call(path: str, backend=None, work_dir: str | None = None,
     pcm, rate, channels = read_pcm(path)
     cuts = chunk_at_silences(pcm, rate, target_sec=target_sec)
 
-    segments, failures = [], 0
+    segments, failures, empty_ok = [], 0, 0
     for i in range(len(cuts) - 1):
         start, end = cuts[i], cuts[i + 1]
         chunk_path = _write_chunk(pcm[start:end], rate,
@@ -332,14 +350,19 @@ def transcribe_call(path: str, backend=None, work_dir: str | None = None,
                 drop_shared_backend()
                 backend = shared_backend()
             text, failures = "", failures + 1
+        elif not text:
+            empty_ok += 1
         segments.append(Segment(seq=i, start_sec=round(start / rate, 2),
                                 end_sec=round(end / rate, 2), text=text))
 
     total = len(segments) or 1
+    full_text = " ".join(s.text for s in segments if s.text).strip()
+    duration = round(len(pcm) / rate, 2)
+    token_run = _max_token_run(full_text)
     return Transcription(
-        full_text=" ".join(s.text for s in segments if s.text).strip(),
+        full_text=full_text,
         segments=segments,
-        duration_seconds=round(len(pcm) / rate, 2),
+        duration_seconds=duration,
         sample_rate_hz=rate,
         channels=channels,
         # Not a model confidence — the model does not emit one. This is the
@@ -347,4 +370,18 @@ def transcribe_call(path: str, backend=None, work_dir: str | None = None,
         # measure. Named honestly so nobody reads it as acoustic certainty.
         confidence=round((total - failures) / total, 2),
         diarization="none",
+        metrics={
+            "chunks_total": total,
+            "chunks_failed": failures,
+            # Chunks the backend answered with nothing — silence or music read
+            # correctly. Distinct from failed: only failed moves `confidence`.
+            "chunks_empty": empty_ok,
+            "chars": len(full_text),
+            # Arabic phone speech lands very roughly at 2-15 chars/sec of
+            # audio; near-zero on a long call means lost speech even when
+            # every chunk "succeeded".
+            "chars_per_audio_sec": round(len(full_text) / duration, 2) if duration else 0.0,
+            "max_token_run": token_run,
+            "repetition_suspect": token_run >= 6,
+        },
     )

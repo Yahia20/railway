@@ -290,6 +290,7 @@ def transcribe(req: TranscribeRequest) -> dict:
         "sample_rate_hz": result.sample_rate_hz,
         "channels": result.channels,
         "confidence": result.confidence,
+        "asr_metrics": result.metrics,
         "diarization": result.diarization,
         "segments": [
             {"seq": s.seq, "start_sec": s.start_sec, "end_sec": s.end_sec,
