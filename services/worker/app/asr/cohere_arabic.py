@@ -184,9 +184,18 @@ class LocalBackend:
 
 
 class CohereAPIBackend:
-    """Cohere's hosted copy of the same weights. Lowest ops burden and a real
-    SLA. Confirm the endpoint against docs.cohere.com before relying on it —
-    the path below is not verified against a live key."""
+    """Cohere's hosted copy of the same weights. Lowest ops burden.
+
+    Endpoint verified against docs.cohere.com/reference/create-audio-transcription
+    (2026-08-11): POST /v2/audio/transcriptions, multipart with file/model/language,
+    transcription comes back in `text`.
+
+    Free keys are limited to 5 requests/minute, so the backend paces itself:
+    one request per ASR_MIN_REQUEST_INTERVAL seconds (default 12) and a backoff
+    retry on 429/5xx. Without the pacing a two-chunk call bursts past the limit
+    and the second chunk dies — which the caller records as a silent empty
+    segment, the exact failure mode that poisoned the first live batch.
+    """
 
     def __init__(self, api_key: str, base_url: str = "https://api.cohere.com"):
         import httpx
@@ -196,17 +205,39 @@ class CohereAPIBackend:
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=300.0,
         )
+        self._min_interval = float(os.getenv("ASR_MIN_REQUEST_INTERVAL", "12"))
+        self._last_request = 0.0
 
     def transcribe_file(self, path: str) -> str:
-        with open(path, "rb") as fh:
-            r = self._client.post(
-                "/v2/transcribe",
-                files={"file": (os.path.basename(path), fh, "audio/wav")},
-                data={"model": "cohere-transcribe-arabic-07-2026", "language": "ar"},
-            )
-        r.raise_for_status()
-        payload = r.json()
-        return (payload.get("text") or payload.get("transcript") or "").strip()
+        import time
+
+        import httpx
+
+        for attempt in range(4):
+            wait = self._min_interval - (time.monotonic() - self._last_request)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request = time.monotonic()
+
+            with open(path, "rb") as fh:
+                # The API rejects the request unless model/language appear
+                # BEFORE the file part in the multipart body (verified live,
+                # 400 otherwise). httpx encodes `data` fields before `files`,
+                # which satisfies this — do not swap to requests-style ordering.
+                r = self._client.post(
+                    "/v2/audio/transcriptions",
+                    files={"file": (os.path.basename(path), fh, "audio/wav")},
+                    data={"model": MODEL_ID.split("/")[-1], "language": "ar"},
+                )
+            if r.status_code == 429 or r.status_code >= 500:
+                if attempt == 3:
+                    r.raise_for_status()
+                time.sleep(15 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            payload = r.json()
+            return (payload.get("text") or payload.get("transcript") or "").strip()
+        raise httpx.HTTPStatusError("unreachable", request=r.request, response=r)
 
 
 def make_backend(kind: str | None = None):
@@ -218,6 +249,29 @@ def make_backend(kind: str | None = None):
     if kind == "cohere_api":
         return CohereAPIBackend(os.environ["COHERE_API_KEY"])
     raise ValueError(f"unknown ASR_BACKEND {kind!r}; expected space|local|cohere_api")
+
+
+_backend_cache: dict[str, object] = {}
+
+
+def shared_backend(kind: str | None = None):
+    """One backend instance per process, built lazily and reused.
+
+    A gradio Client spawns background threads that are never joined; building
+    one per request leaks them until the container hits its thread limit and
+    every request dies with "RuntimeError: can't start new thread" (took the
+    worker down after ~200 calls on 2026-08-12). On any error the cached
+    instance is dropped, so a wedged client (e.g. after the Space restarts)
+    costs one failed call, not a restart."""
+    key = (kind or os.getenv("ASR_BACKEND", "space")).lower()
+    if key not in _backend_cache:
+        _backend_cache[key] = make_backend(key)
+    return _backend_cache[key]
+
+
+def drop_shared_backend(kind: str | None = None) -> None:
+    key = (kind or os.getenv("ASR_BACKEND", "space")).lower()
+    _backend_cache.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +311,8 @@ def transcribe_call(path: str, backend=None, work_dir: str | None = None,
     """Transcribe one call recording into timestamped segments."""
     import tempfile
 
-    backend = backend or make_backend()
+    owns_backend = backend is None
+    backend = backend or shared_backend()
     work_dir = work_dir or tempfile.mkdtemp(prefix="asr_")
     os.makedirs(work_dir, exist_ok=True)
 
@@ -271,6 +326,11 @@ def transcribe_call(path: str, backend=None, work_dir: str | None = None,
                                   os.path.join(work_dir, f"chunk_{i:04d}.wav"))
         text = _transcribe_with_retry(backend, chunk_path)
         if text is None:
+            if owns_backend:
+                # The cached client may be wedged (Space restarted, dead
+                # session); rebuild rather than fail every future call.
+                drop_shared_backend()
+                backend = shared_backend()
             text, failures = "", failures + 1
         segments.append(Segment(seq=i, start_sec=round(start / rate, 2),
                                 end_sec=round(end / rate, 2), text=text))
