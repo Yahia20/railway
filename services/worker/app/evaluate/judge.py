@@ -23,8 +23,8 @@ from . import scoring
 
 PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
-PASS1_VERSION = "pass1-customer-v2"
-PASS2_VERSION = "pass2-agent-quality-v1"
+PASS1_VERSION = "pass1-customer-v3"
+PASS2_VERSION = "pass2-agent-quality-v2"
 
 DEFAULT_MODEL = "deepseek-chat"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -98,7 +98,9 @@ class DeepSeekClient:
         )
 
     def complete_json(self, prompt: str, temperature: float = 0.0,
-                      max_tokens: int = 4096, retries: int = 3) -> tuple[dict, dict]:
+                      max_tokens: int = 8000, retries: int = 3) -> tuple[dict, dict]:
+        # 8000 is a mitigation for long calls whose pass-2 JSON overran 4096
+        # and died truncated 3/3; the real fix is segmenting long transcripts.
         body = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -132,7 +134,7 @@ def build_pass2_prompt(conversation: str, input_type: Literal["chat", "call_tran
         else "channel_rules_chat_v1.md"
     )
     return (
-        _load("pass2_agent_quality_v1.md")
+        _load("pass2_agent_quality_v2.md")
         .replace("{{CHANNEL_RULES}}", channel_rules)
         .replace("{{METADATA}}", json.dumps(metadata or {}, ensure_ascii=False, indent=2))
         .replace("{{FOLLOWUP_HISTORY}}", followup_history or "unavailable")
@@ -143,7 +145,7 @@ def build_pass2_prompt(conversation: str, input_type: Literal["chat", "call_tran
 def run_pass1(conversation: str, client: DeepSeekClient | None = None) -> Pass1Result:
     """Extract the customer's request. Never mentions the agent's performance."""
     client = client or DeepSeekClient()
-    prompt = _load("pass1_customer_v2.md").replace("{{CONVERSATION}}", conversation)
+    prompt = _load("pass1_customer_v3.md").replace("{{CONVERSATION}}", conversation)
     payload, usage = client.complete_json(prompt)
     return Pass1Result(
         payload=payload,

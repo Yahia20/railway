@@ -166,6 +166,21 @@ def compute(modules: dict[str, dict[str, Any]]) -> ScoreResult:
     return ScoreResult(final, performance_level(final), weight_applied, scores, True, warnings)
 
 
+_AR_FOLD = str.maketrans({
+    # alef family, ya/alef-maqsura, ta-marbuta/ha — the spelling axes ASR is
+    # least consistent on. Folding both sides lets a genuine quote survive a
+    # one-glyph transcription drift while a fabricated one still fails.
+    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",
+    "ى": "ي", "ة": "ه",
+    "ـ": None,  # tatweel
+})
+_AR_DIACRITICS = dict.fromkeys(map(ord, "ًٌٍَُِّْ"), None)
+
+
+def _fold_arabic(text: str) -> str:
+    return " ".join(text.translate(_AR_FOLD).translate(_AR_DIACRITICS).split())
+
+
 def validate_evidence(payload: dict, conversation_text: str) -> list[str]:
     """Every quote in `evidence` must actually appear in the conversation.
 
@@ -173,17 +188,26 @@ def validate_evidence(payload: dict, conversation_text: str) -> list[str]:
     is worth running on every evaluation: a hallucinated quote in a coaching
     report is worse than no report, because the agent can prove it wrong and
     then discounts every future score.
+
+    Matching is exact first, then retried with Arabic orthography folded
+    (hamza/alef forms, ya vs alef maqsura, ta marbuta vs ha, diacritics,
+    tatweel) — ASR spells these inconsistently, and rejecting a real quote
+    over a hamza teaches the judge that citing evidence is pointless.
     """
     problems: list[str] = []
     haystack = " ".join(conversation_text.split())
+    folded_haystack = _fold_arabic(conversation_text)
 
     for i, item in enumerate(payload.get("evidence") or []):
         quote = (item.get("quote") or "").strip()
         if not quote:
             problems.append(f"evidence[{i}]: empty quote")
             continue
-        if " ".join(quote.split()) not in haystack:
-            problems.append(f"evidence[{i}]: quote not found in conversation: {quote[:60]!r}")
+        if " ".join(quote.split()) in haystack:
+            continue
+        if _fold_arabic(quote) in folded_haystack:
+            continue
+        problems.append(f"evidence[{i}]: quote not found in conversation: {quote[:60]!r}")
     return problems
 
 
