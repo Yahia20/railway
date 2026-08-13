@@ -23,7 +23,7 @@ from . import scoring
 
 PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
-PASS1_VERSION = "pass1-customer-v1"
+PASS1_VERSION = "pass1-customer-v2"
 PASS2_VERSION = "pass2-agent-quality-v1"
 
 DEFAULT_MODEL = "deepseek-chat"
@@ -143,7 +143,7 @@ def build_pass2_prompt(conversation: str, input_type: Literal["chat", "call_tran
 def run_pass1(conversation: str, client: DeepSeekClient | None = None) -> Pass1Result:
     """Extract the customer's request. Never mentions the agent's performance."""
     client = client or DeepSeekClient()
-    prompt = _load("pass1_customer_v1.md").replace("{{CONVERSATION}}", conversation)
+    prompt = _load("pass1_customer_v2.md").replace("{{CONVERSATION}}", conversation)
     payload, usage = client.complete_json(prompt)
     return Pass1Result(
         payload=payload,
