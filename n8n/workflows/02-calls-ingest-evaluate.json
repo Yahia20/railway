@@ -74,7 +74,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO call_ingest_jobs (uniqueid, filename, audio_uri, meta)\nVALUES ($1, $2, $3, $4::jsonb)\nON CONFLICT (uniqueid) DO UPDATE\n  SET filename  = EXCLUDED.filename,\n      audio_uri = EXCLUDED.audio_uri,\n      meta      = EXCLUDED.meta,\n      updated_at = now()\n  WHERE call_ingest_jobs.meta = '{}'::jsonb;",
+        "query": "INSERT INTO call_ingest_jobs (uniqueid, filename, audio_uri, meta, status, last_error)\nVALUES ($1, $2, $3, $4::jsonb,\n        CASE WHEN coalesce(($4::jsonb->>'size_bytes')::bigint, 999999) < 1024\n             THEN 'dead_letter' ELSE 'discovered' END,\n        CASE WHEN coalesce(($4::jsonb->>'size_bytes')::bigint, 999999) < 1024\n             THEN 'audio_too_small: WAV under 1KB is a header with no audio' END)\nON CONFLICT (uniqueid) DO UPDATE\n  SET filename  = EXCLUDED.filename,\n      audio_uri = EXCLUDED.audio_uri,\n      meta      = EXCLUDED.meta,\n      updated_at = now()\n  WHERE call_ingest_jobs.meta = '{}'::jsonb;",
         "options": {
           "queryReplacement": "={{ [ $json.external_id, $json.filename, $json.audio_uri, JSON.stringify($json) ] }}"
         }
