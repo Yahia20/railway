@@ -23,8 +23,8 @@ from . import scoring
 
 PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
-PASS1_VERSION = "pass1-customer-v3"
-PASS2_VERSION = "pass2-agent-quality-v2"
+PASS1_VERSION = "pass1-customer-v4"
+PASS2_VERSION = "pass2-agent-quality-v3"
 
 DEFAULT_MODEL = "deepseek-chat"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -134,7 +134,7 @@ def build_pass2_prompt(conversation: str, input_type: Literal["chat", "call_tran
         else "channel_rules_chat_v1.md"
     )
     return (
-        _load("pass2_agent_quality_v2.md")
+        _load("pass2_agent_quality_v3.md")
         .replace("{{CHANNEL_RULES}}", channel_rules)
         .replace("{{METADATA}}", json.dumps(metadata or {}, ensure_ascii=False, indent=2))
         .replace("{{FOLLOWUP_HISTORY}}", followup_history or "unavailable")
@@ -145,7 +145,7 @@ def build_pass2_prompt(conversation: str, input_type: Literal["chat", "call_tran
 def run_pass1(conversation: str, client: DeepSeekClient | None = None) -> Pass1Result:
     """Extract the customer's request. Never mentions the agent's performance."""
     client = client or DeepSeekClient()
-    prompt = _load("pass1_customer_v3.md").replace("{{CONVERSATION}}", conversation)
+    prompt = _load("pass1_customer_v4.md").replace("{{CONVERSATION}}", conversation)
     payload, usage = client.complete_json(prompt)
     return Pass1Result(
         payload=payload,
