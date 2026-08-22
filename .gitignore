@@ -74,3 +74,6 @@ venv/
 Thumbs.db
 /tmp/
 chunks/
+
+# local Claude Code settings (contain secrets)
+.claude/settings.local.json
