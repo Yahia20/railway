@@ -1,0 +1,279 @@
+{
+  "name": "01c · Chats — store only (production API)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "travelgate/chat-message",
+        "responseMode": "onReceived",
+        "responseCode": 200,
+        "options": {}
+      },
+      "id": "chat-api-webhook",
+      "name": "Chat API webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -880,
+        300
+      ],
+      "webhookId": "3f2c1d90-7a64-4d1e-9f0b-2c6e5a8b41d7",
+      "notes": "POST https://<n8n>/webhook/travelgate/chat-message\n\nAnswers 200 the moment the body is read, before any of the work below. responseMode 'onReceived' rather than a respondToWebhook node: with executionOrder v1 n8n runs sibling branches in canvas order, and a responder can end up behind the ingest chain — the sender then gets nothing and retries. This cannot be reordered by dragging a box.\n\nAccepts the array shape the production API sends, and also a single object, {messages:[...]} or {data:[...]}."
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * The production chat API delivers a FLAT ARRAY of message rows and repeats\n * every conversation-level column on each one:\n *\n *   dealid, crm_entity_id, contact_id, created_at, updated_at, conversation_id\n *\n * Fifty messages therefore carry fifty identical copies of the deal id and the\n * contact id. Grouping them back into one conversation HERE is what makes them\n * one interactions row instead of fifty. The database's unique keys are the\n * second line of defence, not the first: without this node a redelivery would\n * still store correctly, but the execution log would claim work it never did.\n *\n * This node must never throw. The webhook has already answered 200, so an\n * uncaught exception loses the delivery outright with nothing written down.\n * Unusable rows are counted and reported; the whole body is wrapped in a catch.\n */\n\nconst SENDER_ROLES = {\n  customer: 'customer', client: 'customer', user: 'customer', contact: 'customer',\n  agent: 'agent', operator: 'agent', manager: 'agent', employee: 'agent', staff: 'agent',\n  bot: 'bot', assistant: 'bot',\n  system: 'system',\n};\n\nconst CONVERSATION_KEYS = ['conversation_id', 'dialog_id', 'chat_id'];\nconst DEAL_KEYS         = ['dealid', 'deal_id', 'crm_entity_id', 'DealId', 'bitrix_deal_id'];\nconst CONTACT_KEYS      = ['contact_id', 'contactId', 'CONTACT_ID'];\nconst TEXT_KEYS         = ['message', 'content', 'text', 'body'];\nconst SENT_AT_KEYS      = ['timestamp', 'sent_at', 'message_created_at'];\nconst SENDER_KEYS       = ['sender_role', 'sender', 'role'];\nconst SENDER_ID_KEYS    = ['sender_id', 'senderId', 'author_id'];\nconst CONTENT_TYPE_KEYS = ['content_type', 'contentType', 'type'];\n\nfunction pick(row, keys) {\n  for (const k of keys) {\n    const v = row[k];\n    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();\n  }\n  return null;\n}\n\n// An ISO string Postgres can cast, or null. NEVER \"now\": a guessed timestamp\n// becomes a response-time metric two steps later and nothing marks it invented.\n// The offset is passed through untouched — timestamptz stores the instant, and\n// re-rendering it in UTC here would throw away what the source actually said.\nfunction isoOrNull(value) {\n  if (value === undefined || value === null) return null;\n  const text = String(value).trim().replace(' ', 'T');\n  if (!text) return null;\n  return Number.isNaN(Date.parse(text)) ? null : text;\n}\n\nfunction msOrNull(value) {\n  const text = isoOrNull(value);\n  return text === null ? null : Date.parse(text);\n}\n\nconst stats = {\n  rows_in: 0,\n  rows_stored: 0,\n  conversations: 0,\n  rejected_not_an_object: 0,\n  rejected_no_key: 0,\n  rejected_no_timestamp: 0,\n  duplicates_in_batch: 0,\n};\nlet conversations = [];\nlet crashed = null;\n\ntry {\n  const incoming = $input.first().json ?? {};\n  const body = incoming.body !== undefined ? incoming.body : incoming;\n\n  let rows;\n  if (Array.isArray(body))                   rows = body;\n  else if (Array.isArray(body?.messages))    rows = body.messages;\n  else if (Array.isArray(body?.data))        rows = body.data;\n  else if (body && typeof body === 'object') rows = [body];\n  else                                       rows = [];\n  stats.rows_in = rows.length;\n\n  const byConversation = new Map();\n\n  for (const row of rows) {\n    if (!row || typeof row !== 'object' || Array.isArray(row)) {\n      stats.rejected_not_an_object++;\n      continue;\n    }\n\n    // Nothing to file the message under. Storing it against a made-up key would\n    // create a thread that no later delivery could ever join.\n    const conversationId = pick(row, CONVERSATION_KEYS);\n    const dealId = pick(row, DEAL_KEYS);\n    const key = conversationId || (dealId ? 'deal-' + dealId : null);\n    if (!key) { stats.rejected_no_key++; continue; }\n\n    // chat_messages.sent_at is NOT NULL, and every response-gap metric reads it.\n    const sentAt = isoOrNull(pick(row, SENT_AT_KEYS));\n    if (!sentAt) { stats.rejected_no_timestamp++; continue; }\n\n    let conv = byConversation.get(key);\n    if (!conv) {\n      conv = {\n        external_id: key,\n        external_deal_id: null,\n        external_contact_id: null,\n        source_created_at: null,\n        source_updated_at: null,\n        messages: [],\n        seen: new Set(),\n        watermark: -Infinity,\n      };\n      byConversation.set(key, conv);\n    }\n\n    // Conversation metadata: every row carries a copy and they normally agree.\n    // When they disagree the copy from the most recently updated row wins,\n    // rather than whichever row happened to be parsed last.\n    const mark = msOrNull(row.updated_at) ?? Date.parse(sentAt);\n    if (mark >= conv.watermark) {\n      conv.watermark = mark;\n      conv.external_deal_id    = dealId ?? conv.external_deal_id;\n      conv.external_contact_id = pick(row, CONTACT_KEYS) ?? conv.external_contact_id;\n      conv.source_updated_at   = isoOrNull(row.updated_at) ?? conv.source_updated_at;\n    }\n    const created = isoOrNull(row.created_at);\n    if (created && (conv.source_created_at === null ||\n                    Date.parse(created) < Date.parse(conv.source_created_at))) {\n      conv.source_created_at = created;\n    }\n\n    const senderRaw = pick(row, SENDER_KEYS);\n    const sender = SENDER_ROLES[(senderRaw || '').toLowerCase()] ?? 'unknown';\n    const text = pick(row, TEXT_KEYS) ?? '';\n\n    // Same sender, same instant, same words = the same message twice. Nothing\n    // in this payload can distinguish a genuine repeat from a redelivery, and\n    // the chat_messages unique key collapses it either way — collapsing it here\n    // too keeps the count this node reports equal to what the database holds.\n    // Compare the parsed instant, not the string: +03:00 and Z can spell one.\n    const fingerprint = sender + '\\u0000' + Date.parse(sentAt) + '\\u0000' + text;\n    if (conv.seen.has(fingerprint)) { stats.duplicates_in_batch++; continue; }\n    conv.seen.add(fingerprint);\n\n    conv.messages.push({\n      sender,\n      sender_external_id: pick(row, SENDER_ID_KEYS),\n      body: text,\n      sent_at: sentAt,\n      content_type: pick(row, CONTENT_TYPE_KEYS),\n    });\n  }\n\n  for (const conv of byConversation.values()) {\n    if (conv.messages.length === 0) continue;\n    conv.messages.sort((a, b) => Date.parse(a.sent_at) - Date.parse(b.sent_at));\n    conversations.push({\n      external_id: conv.external_id,\n      external_deal_id: conv.external_deal_id,\n      external_contact_id: conv.external_contact_id,\n      source_created_at: conv.source_created_at,\n      source_updated_at: conv.source_updated_at,\n      started_at: conv.messages[0].sent_at,\n      ended_at: conv.messages[conv.messages.length - 1].sent_at,\n      messages: conv.messages,\n    });\n  }\n  conversations.sort((a, b) => a.external_id.localeCompare(b.external_id));\n  stats.conversations = conversations.length;\n  stats.rows_stored = conversations.reduce((n, c) => n + c.messages.length, 0);\n} catch (e) {\n  crashed = String((e && e.message) || e);\n  conversations = [];\n}\n\n// raw_events.external_ref holds a single value, so it is only meaningful when\n// the batch speaks about one deal — the normal case. A mixed batch gets null\n// rather than a comma-joined string no lookup could ever match.\nconst dealIds = [...new Set(conversations.map(c => c.external_deal_id).filter(Boolean))];\nconst externalRef = dealIds.length === 1 ? dealIds[0] : null;\n\n// Written to raw_events.process_error, and NOT cleared by the last node: a row\n// with processed_at set and process_error non-null means \"stored, minus these\".\nconst rejected = stats.rejected_not_an_object + stats.rejected_no_key + stats.rejected_no_timestamp;\nlet rejectReason = '';\nif (crashed !== null) {\n  rejectReason = 'normalizer failed: ' + crashed;\n} else if (conversations.length === 0) {\n  rejectReason = 'nothing storable: ' + stats.rows_in + ' row(s) in, ' + rejected + ' rejected'\n    + ' (' + stats.rejected_not_an_object + ' not objects, '\n    + stats.rejected_no_key + ' without conversation_id or dealid, '\n    + stats.rejected_no_timestamp + ' without a parseable timestamp)';\n} else if (rejected > 0) {\n  rejectReason = 'partial: ' + rejected + ' of ' + stats.rows_in + ' row(s) rejected'\n    + ' (' + stats.rejected_no_key + ' without a conversation key, '\n    + stats.rejected_no_timestamp + ' without a parseable timestamp, '\n    + stats.rejected_not_an_object + ' not objects)';\n}\n\nreturn [{ json: {\n  conversations,\n  external_ids: conversations.map(c => c.external_id),\n  external_ref: externalRef,\n  reject_reason: rejectReason,\n  stats,\n} }];\n"
+      },
+      "id": "normalize-and-group",
+      "name": "Normalize and group",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -660,
+        300
+      ],
+      "notes": "Turns the flat array into one conversation per thread, so the deal id / contact id / created_at / updated_at that repeat on every message row get written once.\n\nEmits exactly ONE item — every node below is set-based over a single jsonb parameter. That is deliberate: with one item per conversation, a batch covering two threads makes $('node').item ambiguous and downstream expressions silently read the wrong row."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Land the delivered body verbatim, once. Replay starts from here, never from\n-- the sender: this table is the only copy of what actually arrived.\n--\n-- Hash the NORMALISED jsonb, not the raw text. jsonb sorts keys and drops\n-- insignificant whitespace, so the same payload re-serialised in a different\n-- key order hashes the same and redelivery stays a no-op.\nWITH incoming AS (\n  SELECT nullif($1::text, '')                             AS external_ref,\n         $2::jsonb                                        AS payload,\n         encode(digest($2::jsonb::text, 'sha256'), 'hex') AS payload_hash,\n         nullif($3::text, '')                             AS process_error\n),\nins AS (\n  INSERT INTO raw_events (source, external_ref, payload, payload_hash, process_error)\n  SELECT 'bitrix_chat_api', external_ref, payload, payload_hash, process_error\n  FROM incoming\n  ON CONFLICT (source, payload_hash) DO NOTHING\n  RETURNING raw_id\n)\n-- ON CONFLICT DO NOTHING returns no rows on a redelivery, which is\n-- indistinguishable from a failed insert. Return the existing raw_id and an\n-- explicit is_new rather than inferring anything from the row count.\nSELECT\n  COALESCE(\n    (SELECT raw_id FROM ins),\n    (SELECT r.raw_id FROM raw_events r, incoming\n      WHERE r.source = 'bitrix_chat_api'\n        AND r.payload_hash = incoming.payload_hash)\n  )                                   AS raw_id,\n  EXISTS (SELECT 1 FROM ins)          AS is_new,\n  (SELECT payload_hash FROM incoming) AS payload_hash;",
+        "options": {
+          "queryReplacement": "={{ [ $json.external_ref, JSON.stringify($('Chat API webhook').item.json.body), $json.reject_reason ] }}"
+        }
+      },
+      "id": "land-raw-request",
+      "name": "Land raw request",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -440,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "notes": "Query parameters are an ARRAY expression, not a comma-separated string. The payload is JSON and full of commas, and n8n splits a comma-separated queryReplacement on every one of them — shredding both the JSON and the Arabic text into dozens of bogus parameters.\n\nRuns BEFORE the gate below, so a payload that cannot be used is still on disk with process_error explaining why."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "has-conversations",
+              "leftValue": "={{ ($('Normalize and group').item.json.conversations || []).length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "looseTypeValidation": true
+        }
+      },
+      "id": "anything-storable",
+      "name": "Anything storable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -220,
+        300
+      ],
+      "notes": "False when every row was rejected. The raw payload is already landed with processed_at NULL and process_error set, so the delivery stays recoverable — stopping here writes no half-built conversation.\n\nReads the Code node BY NAME: $json at this point is the Postgres node's output, not the normaliser's."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One row per conversation, carrying the metadata that arrived N times.\n-- ON CONFLICT makes a redelivery an UPDATE, never a second thread.\n--\n-- deal_id is linked only if a deals row for this bitrix id already exists.\n-- Ingest does not create a stub deal: a deal with no stage, no amount and no\n-- owner shows up in every funnel report as an open opportunity nobody knows\n-- anything about. external_deal_id keeps the id either way, so the link can be\n-- made later without re-reading the payload.\nINSERT INTO interactions (\n  external_source, external_id, channel,\n  external_deal_id, external_contact_id,\n  source_created_at, source_updated_at,\n  deal_id, started_at, ended_at\n)\nSELECT\n  'bitrix_chat_api',\n  c->>'external_id',\n  -- The API states no channel. 'other' is what bitrix_chats.py falls back to,\n  -- so the two ingest paths do not split one report into two rows.\n  'other'::channel,\n  c->>'external_deal_id',\n  c->>'external_contact_id',\n  (c->>'source_created_at')::timestamptz,\n  (c->>'source_updated_at')::timestamptz,\n  (SELECT d.deal_id FROM deals d WHERE d.bitrix_deal_id = c->>'external_deal_id'),\n  (c->>'started_at')::timestamptz,\n  (c->>'ended_at')::timestamptz\nFROM jsonb_array_elements($1::jsonb) AS c\nON CONFLICT (external_source, external_id) DO UPDATE SET\n  external_deal_id    = COALESCE(EXCLUDED.external_deal_id,    interactions.external_deal_id),\n  external_contact_id = COALESCE(EXCLUDED.external_contact_id, interactions.external_contact_id),\n  -- LEAST/GREATEST ignore nulls in Postgres, so a partial batch widens the\n  -- window the row knows about and can never narrow it.\n  source_created_at   = LEAST   (interactions.source_created_at, EXCLUDED.source_created_at),\n  source_updated_at   = GREATEST(interactions.source_updated_at, EXCLUDED.source_updated_at),\n  deal_id             = COALESCE(interactions.deal_id, EXCLUDED.deal_id),\n  started_at          = LEAST   (interactions.started_at, EXCLUDED.started_at),\n  ended_at            = GREATEST(interactions.ended_at,   EXCLUDED.ended_at),\n  updated_at          = now()\nRETURNING interaction_id, external_id, external_deal_id, external_contact_id,\n          (xmax = 0) AS conversation_created;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('Normalize and group').item.json.conversations) ] }}"
+        }
+      },
+      "id": "upsert-conversations",
+      "name": "Upsert conversations",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        0,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "notes": "The metadata that arrived once per message is written once per conversation. UNIQUE (external_source, external_id) is what makes a redelivery an UPDATE instead of a duplicate thread."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One row per message, deduplicated by the table's own key:\n--   UNIQUE (interaction_id, sender, sent_at, body_hash)\n-- body_hash is GENERATED, so a careless caller cannot bypass the guarantee.\n-- A redelivered thread inserts nothing and reports messages_inserted = 0.\nWITH ins AS (\n  INSERT INTO chat_messages (\n    interaction_id, seq, sender, body, sent_at, sender_external_id, content_type\n  )\n  SELECT\n    i.interaction_id,\n    -- Provisional position: whatever is already stored, plus this batch in time\n    -- order. The next node renumbers the whole thread, so this only has to be\n    -- sane in the case where that node never runs.\n    (mx.max_seq + row_number() OVER (PARTITION BY i.interaction_id\n                                     ORDER BY (t.m->>'sent_at')::timestamptz, t.ord))::int,\n    (t.m->>'sender')::speaker_role,\n    COALESCE(t.m->>'body', ''),\n    (t.m->>'sent_at')::timestamptz,\n    t.m->>'sender_external_id',\n    t.m->>'content_type'\n  FROM jsonb_array_elements($1::jsonb) AS c\n  JOIN interactions i\n    ON i.external_source = 'bitrix_chat_api'\n   AND i.external_id     = c->>'external_id'\n  CROSS JOIN LATERAL jsonb_array_elements(c->'messages') WITH ORDINALITY AS t(m, ord)\n  LEFT JOIN LATERAL (\n    SELECT COALESCE(max(seq), 0) AS max_seq\n    FROM chat_messages WHERE interaction_id = i.interaction_id\n  ) mx ON true\n  ON CONFLICT (interaction_id, sender, sent_at, body_hash) DO NOTHING\n  RETURNING message_id\n)\nSELECT count(*)::int AS messages_inserted FROM ins;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('Normalize and group').item.json.conversations) ] }}"
+        }
+      },
+      "id": "insert-messages",
+      "name": "Insert messages (dedup)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "notes": "messages_inserted is the number that answers 'did this store anything new?'. Post the same batch twice and the second run reports 0 — that is the dedup working, not a failure."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Renumber seq in time order, then recompute the counters FROM THE STORED ROWS.\n--\n-- Counting the payload instead would double every counter on a redelivery.\n-- Counting the table cannot: it is the same arithmetic over the same rows no\n-- matter how many times the batch arrives.\nWITH targets AS (\n  SELECT i.interaction_id\n  FROM jsonb_array_elements_text($1::jsonb) AS ext(external_id)\n  JOIN interactions i\n    ON i.external_source = 'bitrix_chat_api'\n   AND i.external_id     = ext.external_id\n),\nordered AS (\n  SELECT m.message_id,\n         row_number() OVER (PARTITION BY m.interaction_id\n                            ORDER BY m.sent_at, m.message_id)::int AS rn\n  FROM chat_messages m\n  JOIN targets t ON t.interaction_id = m.interaction_id\n),\n-- Nothing reads this CTE. A data-modifying WITH clause runs to completion\n-- regardless, which is exactly what is wanted here: messages that arrive out of\n-- order must not leave seq disagreeing with sent_at.\nrenumbered AS (\n  UPDATE chat_messages m\n     SET seq = o.rn\n    FROM ordered o\n   WHERE m.message_id = o.message_id\n     AND m.seq <> o.rn\n  RETURNING m.message_id\n),\nagg AS (\n  SELECT m.interaction_id,\n         count(*)::int                                     AS n_total,\n         count(*) FILTER (WHERE m.sender = 'customer')::int AS n_customer,\n         count(*) FILTER (WHERE m.sender = 'agent')::int    AS n_agent,\n         min(m.sent_at)                                     AS first_at,\n         max(m.sent_at)                                     AS last_at\n  FROM chat_messages m\n  JOIN targets t ON t.interaction_id = m.interaction_id\n  GROUP BY m.interaction_id\n)\nUPDATE interactions i SET\n  message_count          = agg.n_total,\n  customer_message_count = agg.n_customer,\n  agent_message_count    = agg.n_agent,\n  started_at             = agg.first_at,\n  ended_at               = agg.last_at,\n  handled_by             = CASE WHEN agg.n_agent > 0 THEN 'agent'::speaker_role\n                                ELSE i.handled_by END,\n  updated_at             = now()\nFROM agg\nWHERE i.interaction_id = agg.interaction_id\n-- first_response_seconds and is_after_hours stay NULL on purpose. Both are\n-- rules, not counts: the response gap has to skip non-text turns, and\n-- after-hours has to be read in PORTAL_TZ_OFFSET_HOURS rather than off the wall\n-- clock. Both already live in evaluate/metrics.py, and a second implementation\n-- in SQL is a second thing to keep in step. NULL means \"not computed yet\";\n-- 0 would be a claim.\nRETURNING i.interaction_id, i.external_id, i.external_deal_id,\n          i.external_contact_id, i.message_count, i.customer_message_count,\n          i.agent_message_count, i.started_at, i.ended_at;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('Normalize and group').item.json.external_ids) ] }}"
+        }
+      },
+      "id": "refresh-counters",
+      "name": "Renumber and refresh counters",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "notes": "Counters are recomputed from the stored rows, never accumulated from the payload — so they read the same after one delivery and after ten redeliveries of the same messages."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Close the loop. Any raw_events row with processed_at NULL is a delivery that\n-- landed and was never normalised — the partial index on (processed_at) makes\n-- that the replay queue, and it is empty when everything is healthy.\n--\n-- process_error is NOT cleared: when the normaliser dropped some rows it wrote\n-- down why, and \"stored, minus these\" is a state worth keeping.\nUPDATE raw_events\n   SET processed_at = COALESCE(processed_at, now())\n WHERE raw_id = $1::bigint\nRETURNING raw_id, processed_at, process_error;",
+        "options": {
+          "queryReplacement": "={{ [ $('Land raw request').item.json.raw_id ] }}"
+        }
+      },
+      "id": "mark-raw-processed",
+      "name": "Mark raw processed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "notes": "raw_id comes back from Postgres as a STRING (bigint), which is why the query casts $1::bigint rather than trusting the type."
+    }
+  ],
+  "connections": {
+    "Chat API webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize and group",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize and group": {
+      "main": [
+        [
+          {
+            "node": "Land raw request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Land raw request": {
+      "main": [
+        [
+          {
+            "node": "Anything storable?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything storable?": {
+      "main": [
+        [
+          {
+            "node": "Upsert conversations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert conversations": {
+      "main": [
+        [
+          {
+            "node": "Insert messages (dedup)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert messages (dedup)": {
+      "main": [
+        [
+          {
+            "node": "Renumber and refresh counters",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Renumber and refresh counters": {
+      "main": [
+        [
+          {
+            "node": "Mark raw processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  }
+}

@@ -13,7 +13,24 @@ making decisions, not after.
 ## Status in one line
 
 **Chats work end to end and are live.** Calls are built but never run — no Google
-Drive credentials. Bitrix is not yet sending real data.
+Drive credentials.
+
+**Bitrix is now sending real data** to `/webhook/travelgate/chat-message`, which
+is served by workflow **01c, n8n id `H7r5YWGJ3nNVA99Z`**, deployed from this repo
+on 2026-08-23 and verified live. It stores and does not score.
+
+A second, hand-built 6-node handler (`5iGvWrBUoWckBU6b`, "01c · Chats ·
+per-message store (Bitrix)") held that path first. It is **deactivated, not
+deleted** — keep it as the rollback. Do not reactivate it without reading
+`docs/HANDOFF.md`: it computed `first_response_seconds` in SQL as
+`min(agent) - min(customer)` (negative whenever the agent opens), invented
+`now()` for unparseable timestamps, created stub `deals`/`agents` rows, dropped
+empty attachment turns, and numbered `seq` with `count(*)+1`, which collided for
+two messages in the same second.
+
+Its rows were migrated from `external_source = 'bitrix'` to `'bitrix_chat_api'`
+so threads would not split across the two namespaces. The 16 older rows still
+under `'bitrix'` belong to workflow 01 and were deliberately left alone.
 
 ---
 
@@ -45,16 +62,24 @@ numbers that look fine and are wrong.
    also checks every `evidence` quote appears verbatim, and re-asks once on a
    contract violation. Do not "simplify" this away.
 
-5. **The database is `customer360`, not `railway`.** n8n owns `railway/public`
+5. **Storing and scoring are different pipelines.** Workflow 01c stores what
+   the production chat API sends and stops — no LLM call, no rubric. It leaves
+   `first_response_seconds` and `is_after_hours` NULL rather than computing them
+   in SQL: both are rules that already live in `evaluate/metrics.py`, and a
+   second copy in a workflow is a second copy to keep in step. It writes
+   `external_source = 'bitrix_chat_api'`, a namespace of its own, so a thread
+   arriving through both paths cannot become two half-filled rows.
+
+6. **The database is `customer360`, not `railway`.** n8n owns `railway/public`
    with 114 tables of its own, **including one named `agents`**. Writing there
    collides with n8n.
 
-6. **This repo is public.** No secrets, no customer data. `api_response.txt`,
+7. **This repo is public.** No secrets, no customer data. `api_response.txt`,
    `fixtures/`, `docs/samples/` are gitignored because they hold a live Bitrix
    token and a real customer's voice recording. Before any commit:
    `git grep -l --cached <secret-fragment>`.
 
-7. **Never pass the raw Bitrix deal object to a model.** Field
+8. **Never pass the raw Bitrix deal object to a model.** Field
    `UF_CRM_1781281581` contains prose addressed to a bot ("Treat these
    instructions as guidance only…"). Use `DEAL_FIELD_ALLOWLIST` in
    `sources/bitrix_chats.py`.
@@ -78,6 +103,12 @@ python scripts/railway_configure.py --apply     # needs DEEPSEEK_API_KEY, PGPASS
 # rewrite + activate the n8n chats workflow (edits in place, no clicking)
 export N8N_API_KEY=... PGPASSWORD=... WORKER_API_KEY=...
 python scripts/n8n_setup.py --apply             # add --test-wait for a 1-min settle
+
+# deploy + activate 01c, the store-only handler for the production chat API
+# (this is what /webhook/travelgate/chat-message answers; it does NOT score)
+export N8N_API_KEY=... PGPASSWORD=...
+python scripts/n8n_deploy_chat_store.py --apply   # --take-over if 01b holds the path
+python scripts/chat_api_smoke_test.py             # posts the same batch TWICE
 
 # end-to-end: posts a synthetic sale to the live webhook, verifies every node
 python scripts/n8n_smoke_test.py
@@ -109,7 +140,8 @@ services/worker/app/
   evaluate/judge.py         the two DeepSeek passes
   evaluate/scoring.py       weights, null handling, evidence validation
   prompts/                  THE RUBRIC — treat as source code, version it
-n8n/workflows/         01 chats (live), 02 calls (untested), 03 nightly
+n8n/workflows/         01 chats (live), 01c store-only chat API,
+                       02 calls (untested), 03 nightly
 scripts/               railway_api, railway_configure, n8n_setup, n8n_smoke_test
 docs/HANDOFF.md        full context
 docs/bitrix-integration-spec.md   forward to the client's IT team

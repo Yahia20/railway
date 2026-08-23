@@ -10,7 +10,13 @@ conversations. One endpoint, one JSON body, no libraries.
 نحتاج منكم إرسال محادثات العملاء (نصّياً) إلى رابط واحد عبر `POST`.
 
 **الرابط (Handler URL):**
-`https://n8n-production-a685c.up.railway.app/webhook/travelgate/chat`
+
+- للشكل الجديد (مصفوفة رسائل — القسم 7c):
+  `https://n8n-production-a685c.up.railway.app/webhook/travelgate/chat-message`
+- للشكل القديم (محادثة كاملة في `conversation_history` — القسم 2):
+  `https://n8n-production-a685c.up.railway.app/webhook/travelgate/chat`
+
+إعادة إرسال نفس الرسالة أو نفس المحادثة **آمنة**: لا يتم تخزينها مرتين.
 
 **الشرط الأهم:** المحادثة يجب أن تحتوي على **رسائل الموظّف وليس رسائل العميل فقط**.
 الهدف من النظام هو تقييم أداء الموظّف، وبدون رسائله لا يوجد شيء لتقييمه.
@@ -231,6 +237,100 @@ Two smaller things on the same response:
   thread cut off before the close scores near zero on closing quality, and the
   agent did nothing wrong. If the endpoint paginates, tell us the parameter.
 - **`sender_role` must distinguish `Bot` from `Agent`** — same reason as §3.
+
+---
+
+## 7c · The production push endpoint — the flat array you are sending
+
+**Handler URL (this one is live):**
+
+```
+POST https://n8n-production-a685c.up.railway.app/webhook/travelgate/chat-message
+Content-Type: application/json
+```
+
+This is the endpoint for the shape you are already producing: a **flat JSON
+array of message rows**, each row repeating the conversation's own columns.
+
+```json
+[
+  {
+    "message": "اتفضل استاذي الكريم البرنامج وفي انتظار رد حضرتك",
+    "dealid": "37800",
+    "crm_entity_id": "37800",
+    "contact_id": "49498",
+    "created_at": "2026-08-20T19:28:55+03:00",
+    "updated_at": "2026-08-23T12:15:10+03:00",
+    "conversation_id": "54008fdc-d08f-42e1-b257-f183e988c6c5",
+    "sender_id": "86",
+    "timestamp": "2026-08-23T12:31:09+03:00",
+    "sender_role": "Agent",
+    "content_type": "text"
+  }
+]
+```
+
+Nothing about it needs to change to be stored. Specifically:
+
+- **`dealid` on every row answers §7b.** No envelope change is needed for the
+  push endpoint — we read the deal id straight off the message rows.
+- **Repeating the conversation columns on every message is fine.** `dealid`,
+  `crm_entity_id`, `contact_id`, `created_at` and `updated_at` are grouped back
+  into one record per `conversation_id` on arrival and stored once, no matter
+  how many messages carry them.
+- **Re-sending is safe and expected.** Send one message, the last ten, or the
+  whole thread again — a message is identified by sender + timestamp + text, so
+  a repeat is discarded rather than stored twice. You never need to track what
+  you already sent.
+- **You may batch several conversations in one array.** They are separated by
+  `conversation_id`.
+- **`200 OK` comes back immediately**, before any processing. Do not wait on us.
+  Any non-2xx means we did not store it — please retry with backoff.
+
+### Required per row
+
+| Field | Required | Notes |
+|---|---|---|
+| `conversation_id` | **yes** | The thread key. `dealid` is used as a fallback if it is ever missing. |
+| `timestamp` | **yes** | ISO 8601 **with the timezone offset**. A row without a parseable one is dropped and reported — we will not guess a time, because every response-time metric is computed from it. |
+| `sender_role` | **yes** | `Customer` \| `Agent` \| `Bot` — `Agent` and `Bot` must be distinguishable, see §3 |
+| `message` | **yes** | The text as typed. May be empty for an attachment, if `content_type` says so. |
+| `sender_id` | strongly wanted | Bitrix user id, so we know *which* agent |
+| `dealid` / `crm_entity_id` | strongly wanted | Links the chat to its deal |
+| `contact_id` | strongly wanted | Identity matching |
+| `content_type` | strongly wanted | `text` for a normal message. Anything else is counted but not scored. |
+
+### Attachments — the one thing we still need from you
+
+A real message arrived on deal 38406 as `"message": ""` with
+`"content_type": "text"`. It was almost certainly an image or a voice note: the
+automation sends the row, but not the file and not its real type.
+
+We store that turn rather than dropping it, because a missing turn sits between
+a question and its answer and corrupts every response-time measurement. But an
+empty turn typed `text` is indistinguishable from a genuinely empty message, and
+we cannot score what we cannot see.
+
+Two changes would fix it, in order of importance:
+
+1. **Send the real `content_type`** — `image`, `voice`, `file`, `video` — rather
+   than `text`. This alone lets us count the turn honestly and exclude it from
+   text scoring instead of treating it as an empty sentence.
+2. **Send a link to the file** in a `file_url` field. Then a voice note can be
+   transcribed and scored like any other turn, which is where most of the
+   missing signal is.
+
+Until (1) arrives, any attachment is stored as an empty `text` turn.
+
+### If you get "webhook is not registered"
+
+```
+The requested webhook "POST travelgate/chat-message" is not registered.
+```
+
+That is on our side, not yours — it means the receiving workflow was not
+switched on yet. The URL is correct. Tell us and we will activate it; nothing
+about your request needs to change.
 
 ---
 
