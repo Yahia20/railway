@@ -1,4 +1,4 @@
--- 008 — the production chat API: the source keys that arrive on every message.
+-- 011 — the production chat API: the source keys that arrive on every message.
 --
 -- The API delivers a flat ARRAY of message rows and repeats every
 -- conversation-level column on each one:
