@@ -56,6 +56,11 @@ class Transcription:
     diarization: Literal["none", "dual_channel", "pyannote", "provider", "manual"] = "none"
     speaker_map: dict = field(default_factory=dict)
 
+    # Honest health measurements (see transcribe_call). `confidence` above is
+    # only chunk return rate; these say what actually came back and whether it
+    # looks like speech or like a decoder stuck in a loop.
+    metrics: dict = field(default_factory=dict)
+
     def as_dialogue(self) -> str:
         """Timestamped rendering for the judge prompt.
 
@@ -184,11 +189,28 @@ class LocalBackend:
 
 
 class CohereAPIBackend:
-    """Cohere's hosted copy of the same weights. Lowest ops burden and a real
-    SLA. Confirm the endpoint against docs.cohere.com before relying on it —
-    the path below is not verified against a live key."""
+    """Cohere's hosted copy of the same weights. Lowest ops burden.
+
+    Endpoint verified against docs.cohere.com/reference/create-audio-transcription
+    (2026-08-11): POST /v2/audio/transcriptions, multipart with file/model/language,
+    transcription comes back in `text`.
+
+    Free keys are limited to 5 requests/minute, so the backend paces itself:
+    one request per ASR_MIN_REQUEST_INTERVAL seconds (default 12) and a backoff
+    retry on 429/5xx. Without the pacing a two-chunk call bursts past the limit
+    and the second chunk dies — which the caller records as a silent empty
+    segment, the exact failure mode that poisoned the first live batch.
+    """
+
+    # This backend retries transport errors itself (with rate-limit pacing),
+    # so the generic outer retry in _transcribe_with_retry must not wrap it —
+    # nested loops multiplied to 12 requests per chunk worst case, and burned
+    # free-tier quota exactly when the API was already refusing.
+    handles_transport_retries = True
 
     def __init__(self, api_key: str, base_url: str = "https://api.cohere.com"):
+        import threading
+
         import httpx
 
         self._client = httpx.Client(
@@ -196,17 +218,49 @@ class CohereAPIBackend:
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=300.0,
         )
+        self._min_interval = float(os.getenv("ASR_MIN_REQUEST_INTERVAL", "12"))
+        self._last_request = 0.0
+        # FastAPI runs sync handlers on a thread pool: two concurrent requests
+        # would both read a stale _last_request and burst past the 5/min limit
+        # unless the pacing check-and-set is atomic.
+        self._pace_lock = threading.Lock()
 
     def transcribe_file(self, path: str) -> str:
-        with open(path, "rb") as fh:
-            r = self._client.post(
-                "/v2/transcribe",
-                files={"file": (os.path.basename(path), fh, "audio/wav")},
-                data={"model": "cohere-transcribe-arabic-07-2026", "language": "ar"},
-            )
-        r.raise_for_status()
-        payload = r.json()
-        return (payload.get("text") or payload.get("transcript") or "").strip()
+        import time
+
+        import httpx
+
+        for attempt in range(3):
+            with self._pace_lock:
+                wait = self._min_interval - (time.monotonic() - self._last_request)
+                if wait > 0:
+                    time.sleep(wait)
+                self._last_request = time.monotonic()
+
+            with open(path, "rb") as fh:
+                # The API rejects the request unless model/language appear
+                # BEFORE the file part in the multipart body (verified live,
+                # 400 otherwise). httpx encodes `data` fields before `files`,
+                # which satisfies this — do not swap to requests-style ordering.
+                r = self._client.post(
+                    "/v2/audio/transcriptions",
+                    files={"file": (os.path.basename(path), fh, "audio/wav")},
+                    data={"model": MODEL_ID.split("/")[-1], "language": "ar"},
+                )
+            if r.status_code == 429 or r.status_code >= 500:
+                if attempt == 2:
+                    r.raise_for_status()
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    pause = max(float(retry_after), 1.0) if retry_after else 15.0 * (attempt + 1)
+                except ValueError:
+                    pause = 15.0 * (attempt + 1)
+                time.sleep(pause)
+                continue
+            r.raise_for_status()
+            payload = r.json()
+            return (payload.get("text") or payload.get("transcript") or "").strip()
+        raise httpx.HTTPStatusError("unreachable", request=r.request, response=r)
 
 
 def make_backend(kind: str | None = None):
@@ -218,6 +272,29 @@ def make_backend(kind: str | None = None):
     if kind == "cohere_api":
         return CohereAPIBackend(os.environ["COHERE_API_KEY"])
     raise ValueError(f"unknown ASR_BACKEND {kind!r}; expected space|local|cohere_api")
+
+
+_backend_cache: dict[str, object] = {}
+
+
+def shared_backend(kind: str | None = None):
+    """One backend instance per process, built lazily and reused.
+
+    A gradio Client spawns background threads that are never joined; building
+    one per request leaks them until the container hits its thread limit and
+    every request dies with "RuntimeError: can't start new thread" (took the
+    worker down after ~200 calls on 2026-08-12). On any error the cached
+    instance is dropped, so a wedged client (e.g. after the Space restarts)
+    costs one failed call, not a restart."""
+    key = (kind or os.getenv("ASR_BACKEND", "space")).lower()
+    if key not in _backend_cache:
+        _backend_cache[key] = make_backend(key)
+    return _backend_cache[key]
+
+
+def drop_shared_backend(kind: str | None = None) -> None:
+    key = (kind or os.getenv("ASR_BACKEND", "space")).lower()
+    _backend_cache.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +319,15 @@ def _transcribe_with_retry(backend, chunk_path: str) -> str | None:
     """
     import time
 
+    if getattr(backend, "handles_transport_retries", False):
+        # The backend already paces and retries transport errors internally;
+        # wrapping it again multiplies the attempts (3×4 = 12 requests per
+        # chunk at worst) and turns one throttled minute into a burned quota.
+        try:
+            return backend.transcribe_file(chunk_path)
+        except Exception:                       # noqa: BLE001
+            return None
+
     for attempt in range(ASR_RETRIES):
         try:
             return backend.transcribe_file(chunk_path)
@@ -252,34 +338,84 @@ def _transcribe_with_retry(backend, chunk_path: str) -> str | None:
     return None
 
 
+def _max_token_run(text: str) -> int:
+    """Longest run of one token repeated consecutively. ASR decoders that get
+    stuck emit the same word dozens of times; real Gulf/Egyptian speech rarely
+    repeats a token more than a handful of times in a row."""
+    best = run = 0
+    prev = None
+    for tok in text.split():
+        run = run + 1 if tok == prev else 1
+        prev = tok
+        best = max(best, run)
+    return best
+
+
 def transcribe_call(path: str, backend=None, work_dir: str | None = None,
                     target_sec: float = 40.0) -> Transcription:
     """Transcribe one call recording into timestamped segments."""
     import tempfile
 
-    backend = backend or make_backend()
+    owns_backend = backend is None
+    backend = backend or shared_backend()
     work_dir = work_dir or tempfile.mkdtemp(prefix="asr_")
     os.makedirs(work_dir, exist_ok=True)
 
     pcm, rate, channels = read_pcm(path)
     cuts = chunk_at_silences(pcm, rate, target_sec=target_sec)
 
-    segments, failures = [], 0
+    segments, failures, empty_ok = [], 0, 0
+    failed_seqs: set[int] = set()
     for i in range(len(cuts) - 1):
         start, end = cuts[i], cuts[i + 1]
         chunk_path = _write_chunk(pcm[start:end], rate,
                                   os.path.join(work_dir, f"chunk_{i:04d}.wav"))
         text = _transcribe_with_retry(backend, chunk_path)
         if text is None:
+            if owns_backend:
+                # The cached client may be wedged (Space restarted, dead
+                # session); rebuild rather than fail every future call.
+                drop_shared_backend()
+                backend = shared_backend()
             text, failures = "", failures + 1
+            failed_seqs.add(i)
+        elif not text:
+            empty_ok += 1
         segments.append(Segment(seq=i, start_sec=round(start / rate, 2),
                                 end_sec=round(end / rate, 2), text=text))
 
     total = len(segments) or 1
+    raw_full_text = " ".join(s.text for s in segments if s.text).strip()
+    duration = round(len(pcm) / rate, 2)
+    token_run = _max_token_run(raw_full_text)
+
+    # Contamination removal + loop truncation, per chunk, before anything
+    # downstream sees the text. Segments carry CLEAN text from here on; the
+    # removed literals live in the metrics ledger, reconstructible exactly.
+    from . import text_quality
+
+    chunk_results = []
+    for s in segments:
+        cq = text_quality.clean_chunk(s.text, seq=s.seq)
+        s.text = cq.clean_text
+        chunk_results.append(cq)
+    full_text = " ".join(s.text for s in segments if s.text).strip()
+    clean_chars = len(full_text.replace(text_quality.GAP, ""))
+
+    quality = text_quality.assess_call(
+        chunk_results,
+        chunk_durations=[s.end_sec - s.start_sec for s in segments],
+        failed_seqs=failed_seqs,
+        total_duration=duration,
+        clean_chars=clean_chars,
+        raw_chars=len(raw_full_text),
+        chunks_empty=empty_ok,
+    )
+
     return Transcription(
-        full_text=" ".join(s.text for s in segments if s.text).strip(),
+        full_text=full_text,
         segments=segments,
-        duration_seconds=round(len(pcm) / rate, 2),
+        duration_seconds=duration,
         sample_rate_hz=rate,
         channels=channels,
         # Not a model confidence — the model does not emit one. This is the
@@ -287,4 +423,26 @@ def transcribe_call(path: str, backend=None, work_dir: str | None = None,
         # measure. Named honestly so nobody reads it as acoustic certainty.
         confidence=round((total - failures) / total, 2),
         diarization="none",
+        metrics={
+            "chunks_total": total,
+            "chunks_failed": failures,
+            # Chunks the backend answered with nothing — silence or music read
+            # correctly. Distinct from failed: only failed moves `confidence`.
+            "chunks_empty": empty_ok,
+            "chars": len(raw_full_text),
+            "clean_chars": clean_chars,
+            # Arabic phone speech lands very roughly at 2-15 chars/sec of
+            # audio; near-zero on a long call means lost speech even when
+            # every chunk "succeeded".
+            "chars_per_audio_sec": round(len(raw_full_text) / duration, 2) if duration else 0.0,
+            "max_token_run": token_run,
+            "repetition_suspect": token_run >= 6,
+            "asr_quality_status": quality["status"],
+            "quality": quality,
+            "cleaning": {
+                "version": text_quality.POLICY_VERSION,
+                "ops": [op for cq in chunk_results for op in cq.ops],
+                "flags": [f for cq in chunk_results for f in cq.flags],
+            },
+        },
     )

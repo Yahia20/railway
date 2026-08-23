@@ -2,48 +2,34 @@
   "name": "02 · Calls — Drive poll, transcribe & evaluate",
   "nodes": [
     {
+      "id": "every-15-min",
+      "name": "Every 15 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -200,
+        300
+      ],
       "parameters": {
         "rule": {
           "interval": [
             {
               "field": "cronExpression",
-              "expression": "0 1 * * *"
+              "expression": "*/15 * * * *"
             }
           ]
         }
-      },
-      "id": "sched",
-      "name": "Daily 01:00",
-      "type": "n8n-nodes-base.scheduleTrigger",
-      "typeVersion": 1.2,
-      "position": [
-        -760,
-        300
-      ]
+      }
     },
     {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "SELECT coalesce(max(finished_at), now() - interval '2 days') AS since\nFROM job_runs\nWHERE job_name = 'calls_ingest' AND status = 'succeeded';",
-        "options": {}
-      },
-      "id": "watermark",
-      "name": "Read watermark",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
+      "id": "list-recent-recordings",
+      "name": "List recent recordings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
       "position": [
-        -540,
+        20,
         300
       ],
-      "credentials": {
-        "postgres": {
-          "id": "railway-pg",
-          "name": "Railway Postgres"
-        }
-      },
-      "notes": "Resume from the last SUCCESSFUL run, not from 'now'. A failed run must not silently skip the window it was meant to cover."
-    },
-    {
       "parameters": {
         "method": "POST",
         "url": "={{ $env.WORKER_URL }}/calls/list",
@@ -58,76 +44,79 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ since: $('Read watermark').item.json.since }) }}",
+        "jsonBody": "={{ JSON.stringify({ since: new Date(Date.now() - 21*24*3600*1000).toISOString(), limit: 2000 }) }}",
         "options": {
           "timeout": 120000
-        }
-      },
-      "id": "list-files",
-      "name": "List new recordings",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        -320,
-        300
-      ],
-      "notes": "Returns every field /calls/parse-name would, plus audio_uri, so no per-file decode call."
-    },
-    {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "SELECT NOT EXISTS (\n  SELECT 1 FROM interactions\n  WHERE external_source = 'asterisk_drive' AND external_id = $1\n) AS is_new;",
-        "options": {
-          "queryReplacement": "={{ [ $json.uniqueid ] }}"
-        }
-      },
-      "id": "seen",
-      "name": "Already ingested?",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "position": [
-        120,
-        300
-      ],
-      "credentials": {
-        "postgres": {
-          "id": "railway-pg",
-          "name": "Railway Postgres"
         }
       }
     },
     {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "version": 2
-          },
-          "conditions": [
-            {
-              "leftValue": "={{ $json.is_new }}",
-              "rightValue": true,
-              "operator": {
-                "type": "boolean",
-                "operation": "true",
-                "singleValue": true
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "id": "if-new",
-      "name": "New recording?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
+      "id": "one-item-per-recording",
+      "name": "One item per recording",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
-        340,
+        240,
         300
-      ]
+      ],
+      "parameters": {
+        "jsCode": "// /calls/list answers once per batch; the rest of the workflow is per call.\n// Drive holds duplicate copies of the same call (\"name (1).wav\"): identity is\n// the Asterisk uniqueid, the Drive file is just storage. Keep one copy per\n// uniqueid (largest file wins) so a duplicate never costs a second ASR+judge.\nconst { recordings = [] } = $input.first().json;\nconst best = new Map();\nfor (const r of recordings) {\n  const prev = best.get(r.external_id);\n  if (!prev || (r.size_bytes || 0) > (prev.size_bytes || 0)) best.set(r.external_id, r);\n}\nreturn [...best.values()].map(r => ({ json: r }));"
+      }
     },
     {
+      "id": "register-discoveries",
+      "name": "Register discoveries",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO call_ingest_jobs (uniqueid, filename, audio_uri, meta, status, last_error)\nVALUES ($1, $2, $3, $4::jsonb,\n        CASE WHEN coalesce(($4::jsonb->>'size_bytes')::bigint, 999999) < 1024\n             THEN 'dead_letter' ELSE 'discovered' END,\n        CASE WHEN coalesce(($4::jsonb->>'size_bytes')::bigint, 999999) < 1024\n             THEN 'audio_too_small: WAV under 1KB is a header with no audio' END)\nON CONFLICT (uniqueid) DO UPDATE\n  SET filename  = EXCLUDED.filename,\n      audio_uri = EXCLUDED.audio_uri,\n      meta      = EXCLUDED.meta,\n      updated_at = now()\n  WHERE call_ingest_jobs.meta = '{}'::jsonb;",
+        "options": {
+          "queryReplacement": "={{ [ $json.external_id, $json.filename, $json.audio_uri, JSON.stringify($json) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      }
+    },
+    {
+      "id": "claim-work",
+      "name": "Claim work",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        680,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One claim per run, bounded. Statuses re-enter the queue on failure with a\n-- retry budget; nothing is ever silently skipped forever (the old is_new gate\n-- stranded stored-but-unevaluated calls, and the old watermark missed whole\n-- day folders uploaded behind it). Failed jobs cool off 45 minutes before\n-- re-claim: the free ASR Space throttles under rapid repeat batches, and\n-- without the cool-down a temporary throttle burns the retry budget of the\n-- whole backlog in an hour while fresh work is starved.\nUPDATE call_ingest_jobs j\nSET updated_at = now()\nWHERE j.uniqueid IN (\n  SELECT uniqueid FROM call_ingest_jobs\n  WHERE meta <> '{}'::jsonb\n    AND (\n      status IN ('discovered','transcribed')\n      OR (status IN ('asr_failed','judge_failed')\n          AND retries < 5\n          AND updated_at < now() - interval '45 minutes')\n    )\n  ORDER BY discovered_at\n  LIMIT 25\n)\nRETURNING j.uniqueid, j.filename, j.audio_uri, j.meta, j.retries, j.status;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "cohere-arabic-asr",
+      "name": "Cohere Arabic ASR",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        300
+      ],
       "parameters": {
         "method": "POST",
         "url": "={{ $env.WORKER_URL }}/calls/transcribe",
@@ -142,69 +131,205 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ audio_path: $('One item per recording').item.json.audio_uri, filename: $('One item per recording').item.json.filename }) }}",
+        "jsonBody": "={{ JSON.stringify({ audio_path: $json.audio_uri, filename: $json.filename }) }}",
         "options": {
-          "timeout": 900000
+          "timeout": 900000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2500
+            }
+          }
         }
       },
-      "id": "transcribe",
-      "name": "Cohere Arabic ASR",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        560,
-        300
-      ],
-      "notes": "drive://<id> — the worker downloads it. n8n and the worker have separate filesystems."
+      "onError": "continueRegularOutput"
     },
     {
+      "id": "transcript-usable",
+      "name": "Transcript usable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        300
+      ],
       "parameters": {
-        "operation": "executeQuery",
-        "query": "WITH r AS (SELECT $1::jsonb AS meta, $2::jsonb AS tr),\nins AS (\n  INSERT INTO interactions (\n    external_source, external_id, channel, started_at, duration_seconds,\n    customer_phone_raw, customer_phone_e164, agent_id, handled_by\n  )\n  SELECT 'asterisk_drive', meta->>'uniqueid', 'phone_call'::channel,\n         (meta->>'started_at')::timestamptz,\n         round((tr->>'duration_seconds')::numeric)::int,\n         meta->>'customer_phone_raw', meta->>'customer_phone_e164',\n         (SELECT agent_id FROM agents WHERE phone_extension = meta->>'agent_extension'),\n         'agent'::speaker_role\n  FROM r\n  ON CONFLICT (external_source, external_id) DO UPDATE SET updated_at = now()\n  RETURNING interaction_id\n)\nINSERT INTO transcripts (\n  interaction_id, audio_uri, duration_seconds, sample_rate_hz, channels,\n  asr_provider, asr_model_version, asr_confidence, language,\n  full_text, segments, diarization\n)\nSELECT ins.interaction_id, r.meta->>'audio_uri',\n       (r.tr->>'duration_seconds')::numeric,\n       (r.tr->>'sample_rate_hz')::int, (r.tr->>'channels')::int,\n       r.tr->>'provider', r.tr->>'model_version',\n       (r.tr->>'confidence')::numeric, 'ar',\n       r.tr->>'full_text', coalesce(r.tr->'segments', '[]'::jsonb),\n       r.tr->>'diarization'\nFROM ins, r\nON CONFLICT (interaction_id) DO UPDATE SET\n  full_text      = EXCLUDED.full_text,\n  segments       = EXCLUDED.segments,\n  asr_confidence = EXCLUDED.asr_confidence\nRETURNING interaction_id;",
-        "options": {
-          "queryReplacement": "={{ [ JSON.stringify($('One item per recording').item.json), JSON.stringify($('Cohere Arabic ASR').item.json) ] }}"
-        }
-      },
-      "id": "store-transcript",
-      "name": "Store call + transcript",
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ !$json.error && ($json.full_text || '').trim().length > 0 && ($json.confidence || 0) >= 0.7 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "mark-asr-failed",
+      "name": "Mark ASR failed",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        780,
-        300
+        1340,
+        520
       ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE call_ingest_jobs\nSET status = CASE WHEN retries + 1 >= 5 THEN 'dead_letter' ELSE 'asr_failed' END,\n    retries = retries + 1,\n    last_error = left($2, 500),\n    updated_at = now()\nWHERE uniqueid = $1;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, JSON.stringify({ error: $json.error || 'empty or low-confidence transcript', confidence: $json.confidence || 0, text_len: ($json.full_text || '').length }) ] }}"
+        }
+      },
       "credentials": {
         "postgres": {
-          "id": "railway-pg",
-          "name": "Railway Postgres"
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
         }
       }
     },
     {
+      "id": "store-call-and-transcript",
+      "name": "Store call + transcript",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1340,
+        180
+      ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Everything the judge is allowed to treat as fact about follow-up.\n-- If this returns no rows the worker sends 'unavailable' and Module 4 scores null.\nSELECT coalesce(string_agg(\n  format('  - [%s] %s by %s, %sh after this call',\n         i.started_at, i.channel,\n         coalesce(a.full_name, 'unknown'),\n         round((extract(epoch from (i.started_at - $2::timestamptz))/3600.0)::numeric, 1)),\n  E'\\n' ORDER BY i.started_at), '') AS history\nFROM interactions i\nLEFT JOIN agents a ON a.agent_id = i.agent_id\nWHERE i.customer_phone_e164 = $1\n  AND i.started_at > $2::timestamptz\n  AND i.started_at < $2::timestamptz + interval '14 days';",
+        "query": "WITH r AS (SELECT $1::jsonb AS meta, $2::jsonb AS tr),\nins AS (\n  INSERT INTO interactions (\n    external_source, external_id, channel, started_at, duration_seconds,\n    customer_phone_raw, customer_phone_e164, agent_id, handled_by\n  )\n  SELECT 'asterisk_drive', meta->>'uniqueid', 'phone_call'::channel,\n         (meta->>'started_at')::timestamptz,\n         round((tr->>'duration_seconds')::numeric)::int,\n         meta->>'customer_phone_raw', meta->>'customer_phone_e164',\n         -- 'q' recordings carry the QUEUE extension (3009), not a person.\n         -- Attributing them to an agent row makes every scorecard wrong.\n         CASE WHEN meta->>'kind' = 'q' THEN NULL\n              ELSE (SELECT agent_id FROM agents WHERE phone_extension = meta->>'agent_extension') END,\n         'agent'::speaker_role\n  FROM r\n  ON CONFLICT (external_source, external_id) DO UPDATE SET updated_at = now()\n  RETURNING interaction_id\n)\nINSERT INTO transcripts (\n  interaction_id, audio_uri, duration_seconds, sample_rate_hz, channels,\n  asr_provider, asr_model_version, asr_confidence, language,\n  full_text, segments, diarization, asr_metrics\n)\nSELECT ins.interaction_id, r.meta->>'audio_uri',\n       (r.tr->>'duration_seconds')::numeric,\n       (r.tr->>'sample_rate_hz')::int, (r.tr->>'channels')::int,\n       r.tr->>'provider', r.tr->>'model_version',\n       (r.tr->>'confidence')::numeric, 'ar',\n       r.tr->>'full_text', coalesce(r.tr->'segments', '[]'::jsonb),\n       r.tr->>'diarization', coalesce(r.tr->'asr_metrics', '{}'::jsonb)\nFROM ins, r\nON CONFLICT (interaction_id) DO UPDATE SET\n  full_text      = EXCLUDED.full_text,\n  segments       = EXCLUDED.segments,\n  asr_confidence = EXCLUDED.asr_confidence,\n  asr_metrics    = EXCLUDED.asr_metrics\nRETURNING interaction_id;",
         "options": {
-          "queryReplacement": "={{ [ $('One item per recording').item.json.customer_phone_e164, $('One item per recording').item.json.started_at ] }}"
+          "queryReplacement": "={{ [ JSON.stringify($('Claim work').item.json.meta), JSON.stringify($('Cohere Arabic ASR').item.json) ] }}"
         }
       },
-      "id": "followups",
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      }
+    },
+    {
+      "id": "link-job-transcribed",
+      "name": "Link job transcribed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1560,
+        180
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE call_ingest_jobs\nSET status = 'transcribed', interaction_id = $2::uuid, updated_at = now()\nWHERE uniqueid = $1\nRETURNING interaction_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, $json.interaction_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      }
+    },
+    {
+      "id": "asr-quality-red",
+      "name": "ASR quality red?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1670,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $('Cohere Arabic ASR').item.json.asr_quality_status === 'red' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "mark-unscoreable",
+      "name": "Mark unscoreable",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1890,
+        420
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- ASR quality gate said red: too much of the audio is unaccounted for\n-- (failed chunks, decoder loops, contamination-dominated text) to score an\n-- agent on what remains. The transcript IS stored for audit; the job goes\n-- straight to dead_letter with the gate detail. No retry: re-transcribing\n-- the same audio reproduces the same acoustics.\nUPDATE call_ingest_jobs\nSET status = 'dead_letter',\n    last_error = left('asr_quality_red: ' || $2, 500),\n    updated_at = now()\nWHERE uniqueid = $1;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, JSON.stringify(($('Cohere Arabic ASR').item.json.asr_metrics || {}).quality || {}) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      }
+    },
+    {
+      "id": "build-follow-up-history",
       "name": "Build follow-up history",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1000,
-        300
+        1780,
+        180
       ],
-      "credentials": {
-        "postgres": {
-          "id": "railway-pg",
-          "name": "Railway Postgres"
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Everything the judge is allowed to treat as fact about follow-up.\n-- If this returns no rows the worker sends 'unavailable' and Module 4 scores null.\nSELECT coalesce(string_agg(\n  format('  - [%s] %s by %s, %sh after this call',\n         i.started_at, i.channel,\n         coalesce(a.full_name, 'unknown'),\n         round((extract(epoch from (i.started_at - $2::timestamptz))/3600.0)::numeric, 1)),\n  E'\\n' ORDER BY i.started_at), '') AS history\nFROM interactions i\nLEFT JOIN agents a ON a.agent_id = i.agent_id\nWHERE i.customer_phone_e164 = $1\n  AND i.started_at > $2::timestamptz\n  AND i.started_at < $2::timestamptz + interval '14 days';",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.meta.customer_phone_e164, $('Claim work').item.json.meta.started_at ] }}"
         }
       },
-      "notes": "Postgres format() only understands %s, %I, %L and %%. A C-style %.1f is rejected at runtime with 'unrecognized format() type specifier' — rounding belongs in SQL, not the format string."
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      }
     },
     {
+      "id": "two-ai-passes",
+      "name": "Two AI passes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2000,
+        180
+      ],
       "parameters": {
         "method": "POST",
         "url": "={{ $env.WORKER_URL }}/evaluate",
@@ -224,101 +349,145 @@
           "timeout": 300000
         }
       },
-      "id": "evaluate",
-      "name": "Two AI passes",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        1220,
-        300
-      ]
+      "onError": "continueRegularOutput"
     },
     {
+      "id": "evaluation-ok",
+      "name": "Evaluation ok?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2220,
+        180
+      ],
       "parameters": {
-        "operation": "executeQuery",
-        "query": "WITH r AS (SELECT $2::jsonb AS d)\nINSERT INTO agent_evaluations (\n  interaction_id, agent_id, schema_version, prompt_version, rubric_version, model,\n  input_type, source_quality, final_score, performance_level, weight_applied,\n  m1_reception, m2_offer, m3_objections, m4_followup, m5_closing,\n  breakdown, evidence, stage_reached, behavior_flags,\n  top_strength, top_weakness, top_recommendation, notes, raw_response\n)\nSELECT $1::uuid, i.agent_id, '1.0',\n  d->'pass2'->>'prompt_version', d->>'rubric_version', d->'pass2'->>'model',\n  'call_transcript'::input_type,\n  (d->>'asr_confidence')::numeric,\n  (d->'pass2'->>'final_score')::numeric,\n  d->'pass2'->>'performance_level',\n  (d->'pass2'->>'weight_applied')::numeric,\n  (d->'pass2'->'modules'->>'module1_reception')::numeric,\n  (d->'pass2'->'modules'->>'module2_offer')::numeric,\n  (d->'pass2'->'modules'->>'module3_objections')::numeric,\n  (d->'pass2'->'modules'->>'module4_followup')::numeric,\n  (d->'pass2'->'modules'->>'module5_closing')::numeric,\n  coalesce(d->'pass2'->'payload'->'modules', '{}'::jsonb),\n  coalesce(d->'pass2'->'payload'->'evidence', '[]'::jsonb),\n  nullif(d->'pass2'->'payload'->>'stage_reached', '')::conversation_stage,\n  coalesce(d->'pass2'->'payload'->'behavior_flags', '[]'::jsonb),\n  d->'pass2'->'payload'->'summary'->>'top_strength',\n  d->'pass2'->'payload'->'summary'->>'top_weakness',\n  d->'pass2'->'payload'->'summary'->>'top_recommendation',\n  d->'pass2'->'payload'->>'notes',\n  d->'pass2'->'payload'\nFROM interactions i, r WHERE i.interaction_id = $1::uuid\nON CONFLICT (interaction_id) DO UPDATE SET\n  final_score       = EXCLUDED.final_score,\n  performance_level = EXCLUDED.performance_level,\n  weight_applied    = EXCLUDED.weight_applied,\n  raw_response      = EXCLUDED.raw_response,\n  updated_at        = now();",
-        "options": {
-          "queryReplacement": "={{ [ $('Store call + transcript').item.json.interaction_id, JSON.stringify(Object.assign({}, $('Two AI passes').item.json, { asr_confidence: $('Cohere Arabic ASR').item.json.confidence })) ] }}"
-        }
-      },
-      "id": "store-eval",
-      "name": "Store evaluation",
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ !$json.error && !!$json.pass1 && !!$json.pass2 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "mark-judge-failed",
+      "name": "Mark judge failed",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1440,
-        300
+        2440,
+        380
       ],
-      "credentials": {
-        "postgres": {
-          "id": "railway-pg",
-          "name": "Railway Postgres"
-        }
-      },
-      "notes": "Reads $('Two AI passes') by name, never $json: a Postgres node outputs {success:true}, so anything chained after one and using $json silently receives that instead of the data it wanted."
-    },
-    {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO job_runs (job_name, status, finished_at, items_in, items_ok)\nVALUES ('calls_ingest', 'succeeded', now(), $1::int, $1::int);",
+        "query": "UPDATE call_ingest_jobs\nSET status = CASE WHEN retries + 1 >= 5 THEN 'dead_letter' ELSE 'judge_failed' END,\n    retries = retries + 1,\n    last_error = left($2, 500),\n    updated_at = now()\nWHERE uniqueid = $1;",
         "options": {
-          "queryReplacement": "={{ [ $items().length ] }}"
+          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, JSON.stringify($json.error || $json) ] }}"
         }
       },
-      "id": "mark-run",
-      "name": "Advance watermark",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "position": [
-        1660,
-        300
-      ],
       "credentials": {
         "postgres": {
-          "id": "railway-pg",
-          "name": "Railway Postgres"
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
         }
       }
     },
     {
-      "parameters": {
-        "jsCode": "// /calls/list answers once per batch; the rest of the workflow is per call.\nconst { recordings = [] } = $input.first().json;\nreturn recordings.map(r => ({ json: r }));"
-      },
-      "id": "split-recordings",
-      "name": "One item per recording",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
+      "id": "store-customer-analysis",
+      "name": "Store customer analysis",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
       "position": [
-        -100,
-        300
+        2440,
+        60
       ],
-      "notes": "A Code node rather than Split Out: this is the one list-flattening node in the pipeline, and Code exists on every n8n version."
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH r AS (SELECT $2::jsonb AS d)\nINSERT INTO interaction_analysis (\n  interaction_id, schema_version, prompt_version, model, input_type,\n  language, intent, summary_ar, confidence, uncertain_fields, raw_response\n)\nSELECT\n  $1::uuid,\n  '1.0',\n  d->'pass1'->>'prompt_version',\n  d->'pass1'->>'model',\n  'call_transcript'::input_type,\n  left(d->'pass1'->'payload'->>'language', 2),\n  d->'pass1'->'payload'->>'intent',\n  d->'pass1'->'payload'->>'summary_ar',\n  (d->'pass1'->'payload'->>'confidence')::numeric,\n  coalesce(d->'pass1'->'payload'->'uncertain_fields', '[]'::jsonb),\n  d->'pass1'->'payload'\nFROM r\nON CONFLICT (interaction_id) DO UPDATE SET\n  summary_ar   = EXCLUDED.summary_ar,\n  confidence   = EXCLUDED.confidence,\n  raw_response = EXCLUDED.raw_response,\n  updated_at   = now()\nRETURNING interaction_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Link job transcribed').item.json.interaction_id, JSON.stringify($('Two AI passes').item.json) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      }
+    },
+    {
+      "id": "store-evaluation",
+      "name": "Store evaluation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2660,
+        60
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH r AS (SELECT $2::jsonb AS d)\nINSERT INTO agent_evaluations (\n  interaction_id, agent_id, schema_version, prompt_version, rubric_version, model,\n  input_type, source_quality, final_score, performance_level, weight_applied,\n  m1_reception, m2_offer, m3_objections, m4_followup, m5_closing,\n  breakdown, evidence, stage_reached, behavior_flags,\n  top_strength, top_weakness, top_recommendation, notes, raw_response\n)\nSELECT $1::uuid, i.agent_id, '1.0',\n  d->'pass2'->>'prompt_version', d->>'rubric_version', d->'pass2'->>'model',\n  'call_transcript'::input_type,\n  (d->>'asr_confidence')::numeric,\n  (d->'pass2'->>'final_score')::numeric,\n  d->'pass2'->>'performance_level',\n  (d->'pass2'->>'weight_applied')::numeric,\n  (d->'pass2'->'modules'->>'module1_reception')::numeric,\n  (d->'pass2'->'modules'->>'module2_offer')::numeric,\n  (d->'pass2'->'modules'->>'module3_objections')::numeric,\n  (d->'pass2'->'modules'->>'module4_followup')::numeric,\n  (d->'pass2'->'modules'->>'module5_closing')::numeric,\n  coalesce(d->'pass2'->'payload'->'modules', '{}'::jsonb),\n  coalesce(d->'pass2'->'payload'->'evidence', '[]'::jsonb),\n  nullif(d->'pass2'->'payload'->>'stage_reached', '')::conversation_stage,\n  coalesce(d->'pass2'->'payload'->'behavior_flags', '[]'::jsonb),\n  d->'pass2'->'payload'->'summary'->>'top_strength',\n  d->'pass2'->'payload'->'summary'->>'top_weakness',\n  d->'pass2'->'payload'->'summary'->>'top_recommendation',\n  d->'pass2'->'payload'->>'notes',\n  d->'pass2'->'payload'\nFROM interactions i, r WHERE i.interaction_id = $1::uuid\nON CONFLICT (interaction_id) DO UPDATE SET\n  final_score       = EXCLUDED.final_score,\n  performance_level = EXCLUDED.performance_level,\n  weight_applied    = EXCLUDED.weight_applied,\n  raw_response      = EXCLUDED.raw_response,\n  updated_at        = now()\nRETURNING interaction_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Link job transcribed').item.json.interaction_id, JSON.stringify(Object.assign({}, $('Two AI passes').item.json, { asr_confidence: $('Cohere Arabic ASR').item.json.confidence })) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      }
+    },
+    {
+      "id": "mark-evaluated",
+      "name": "Mark evaluated",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2880,
+        60
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE call_ingest_jobs\nSET status = 'evaluated', updated_at = now()\nWHERE uniqueid = $1;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      }
     }
   ],
   "connections": {
-    "Daily 01:00": {
+    "Every 15 min": {
       "main": [
         [
           {
-            "node": "Read watermark",
+            "node": "List recent recordings",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Read watermark": {
-      "main": [
-        [
-          {
-            "node": "List new recordings",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "List new recordings": {
+    "List recent recordings": {
       "main": [
         [
           {
@@ -333,25 +502,25 @@
       "main": [
         [
           {
-            "node": "Already ingested?",
+            "node": "Register discoveries",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Already ingested?": {
+    "Register discoveries": {
       "main": [
         [
           {
-            "node": "New recording?",
+            "node": "Claim work",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "New recording?": {
+    "Claim work": {
       "main": [
         [
           {
@@ -366,7 +535,25 @@
       "main": [
         [
           {
+            "node": "Transcript usable?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transcript usable?": {
+      "main": [
+        [
+          {
             "node": "Store call + transcript",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark ASR failed",
             "type": "main",
             "index": 0
           }
@@ -375,6 +562,35 @@
     },
     "Store call + transcript": {
       "main": [
+        [
+          {
+            "node": "Link job transcribed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Link job transcribed": {
+      "main": [
+        [
+          {
+            "node": "ASR quality red?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ASR quality red?": {
+      "main": [
+        [
+          {
+            "node": "Mark unscoreable",
+            "type": "main",
+            "index": 0
+          }
+        ],
         [
           {
             "node": "Build follow-up history",
@@ -399,6 +615,35 @@
       "main": [
         [
           {
+            "node": "Evaluation ok?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluation ok?": {
+      "main": [
+        [
+          {
+            "node": "Store customer analysis",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark judge failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store customer analysis": {
+      "main": [
+        [
+          {
             "node": "Store evaluation",
             "type": "main",
             "index": 0
@@ -410,7 +655,7 @@
       "main": [
         [
           {
-            "node": "Advance watermark",
+            "node": "Mark evaluated",
             "type": "main",
             "index": 0
           }
@@ -421,10 +666,5 @@
   "settings": {
     "executionOrder": "v1",
     "saveManualExecutions": true
-  },
-  "tags": [
-    {
-      "name": "customer360"
-    }
-  ]
+  }
 }

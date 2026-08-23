@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
+import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
@@ -252,24 +254,32 @@ def transcribe(req: TranscribeRequest) -> dict:
     process can open. Downloading here keeps the audio on one machine and off
     the wire between them.
     """
-    path, downloaded = req.audio_path, False
-    if path.startswith("drive://"):
-        source = _call_source_or_503()
-        rec = CallRecording(
-            external_id=(req.filename or path.removeprefix("drive://")).removesuffix(".wav"),
-            external_source=getattr(source, "name", "asterisk_drive"),
-            audio_uri=path,
-            started_at=datetime.now(timezone.utc),
+    # Everything this request writes (downloaded audio, silence chunks) lives in
+    # one per-request directory and is deleted on the way out. The disk here is
+    # ephemeral and small; without this, each call leaks its full audio size and
+    # the service eventually dies with opaque 500s on every download.
+    os.makedirs(settings.work_dir, exist_ok=True)
+    scratch = tempfile.mkdtemp(prefix="asr_req_", dir=settings.work_dir)
+    try:
+        path = req.audio_path
+        if path.startswith("drive://"):
+            source = _call_source_or_503()
+            rec = CallRecording(
+                external_id=(req.filename or path.removeprefix("drive://")).removesuffix(".wav"),
+                external_source=getattr(source, "name", "asterisk_drive"),
+                audio_uri=path,
+                started_at=datetime.now(timezone.utc),
+            )
+            path = source.download(rec, scratch)
+
+        if not os.path.exists(path):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"audio not found: {path}")
+
+        result = cohere_arabic.transcribe_call(
+            path, work_dir=scratch, target_sec=settings.asr_chunk_seconds
         )
-        path = source.download(rec, settings.work_dir)
-        downloaded = True
-
-    if not os.path.exists(path):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"audio not found: {path}")
-
-    result = cohere_arabic.transcribe_call(
-        path, work_dir=settings.work_dir, target_sec=settings.asr_chunk_seconds
-    )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
     return {
         "full_text": result.full_text,
         "dialogue": result.as_dialogue(),
@@ -280,6 +290,12 @@ def transcribe(req: TranscribeRequest) -> dict:
         "sample_rate_hz": result.sample_rate_hz,
         "channels": result.channels,
         "confidence": result.confidence,
+        "asr_metrics": result.metrics,
+        # Top-level so the n8n IF node can branch on it without digging into
+        # the metrics blob. red = do not evaluate: too much audio is
+        # unaccounted for (failed chunks, decoder loops, contamination-
+        # dominated text) to score an agent on what remains.
+        "asr_quality_status": result.metrics.get("asr_quality_status", "green"),
         "diarization": result.diarization,
         "segments": [
             {"seq": s.seq, "start_sec": s.start_sec, "end_sec": s.end_sec,
