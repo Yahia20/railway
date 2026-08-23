@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import shutil
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -102,6 +101,14 @@ def ready() -> dict:
         "asr_backend": settings.asr_backend,
         "rubric_version": scoring.RUBRIC_VERSION,
         "prompt_versions": {"pass1": judge.PASS1_VERSION, "pass2": judge.PASS2_VERSION},
+        "prompt_files": {"pass1": judge.PASS1_PROMPT_FILE, "pass2": judge.PASS2_PROMPT_FILE},
+        # What this worker will actually ask for. The env var wins over the
+        # default, so a stale DEEPSEEK_MODEL on the platform is invisible in the
+        # source and visible only here — and after 2026-08-22 the value that
+        # matters is whether it still says `deepseek-chat`, an alias the vendor
+        # scheduled for removal on 2026-07-24.
+        "judge_model": settings.deepseek_model or judge.DEFAULT_MODEL,
+        "judge_thinking": settings.deepseek_thinking or judge.DEFAULT_THINKING,
         "default_phone_region": settings.default_phone_region,
     }
 
@@ -318,25 +325,46 @@ def transcribe(req: TranscribeRequest) -> dict:
 # Evaluate
 # ---------------------------------------------------------------------------
 
-# Below this many characters of actual speech there is no conversation to grade.
-MIN_SCOREABLE_CHARS = 20
-
-# A transcript arrives as "[00:00] text" or "[00:00] AGENT: text", and that
-# scaffolding is not speech. Counting it let "[00:00] ألو السلام عليكم" — a
-# hangup, sixteen characters of Arabic — clear a twenty character floor and be
-# scored 33.1 "Below Average" on 2026-08-11. Measure what was said.
-_TRANSCRIPT_FURNITURE = re.compile(
-    r"^\s*\[\d{1,2}:\d{2}(?::\d{2})?\]\s*(?:[A-Z_]{3,12}:)?\s*", re.MULTILINE
-)
+# Below this many NORMALISED characters of speech there is no conversation to
+# grade — timestamps, speaker labels and whitespace runs removed first, so the
+# count is of what was said and not of how it was rendered.
+#
+# 100, raised from 20 in PR2 iteration 2 and still env-overridable. The
+# sensitivity table on the day-13 run (81 calls: 6 / 9 / 11 / 24 below
+# 20 / 50 / 100 / 200) is the evidence: the five calls between 50 and 100
+# characters are greeting and dead-air fragments, two of which carried a stored
+# score of 36.9 that described nothing. 20 let a whole call of
+# "هلا صباح الخير هلا صباح الخير" (29 characters) be graded 33.1 in one run and
+# 0.0 in another — the same call, twice, with no agent behaviour in between.
+#
+# A duration floor was considered and rejected: duration counts silence, hold
+# music and IVR routing, none of which is a conversation.
+#
+# Moving the gate does make new scores incomparable with old ones below 100
+# characters. That is the point — those old scores were not measurements — but
+# it is a deployment decision, so it stays an env var and is recorded in
+# docs/PR2-judge-integrity.md rather than living only in this constant.
+MIN_SCOREABLE_CHARS = int(os.getenv("MIN_SCOREABLE_CHARS", "100"))
 
 
 def spoken_content(transcript: str) -> str:
-    """The transcript with timestamps and speaker labels removed."""
-    return " ".join(_TRANSCRIPT_FURNITURE.sub("", transcript or "").split())
+    """The transcript with timestamps and speaker labels removed.
+
+    Delegates to the validator's normaliser so the gate and quote matching
+    share one definition of "what was actually said". Two definitions would
+    mean a call the gate calls empty and the validator calls quotable.
+    """
+    return scoring.strip_transcript_furniture(transcript)
 
 
 def _unscoreable(reason: str) -> dict:
-    """A refusal shaped like a result, so callers store it like one."""
+    """A refusal shaped like a result, so callers store it like one.
+
+    Every key a successful `pass2` carries is present here with its
+    not-applicable value. A consumer that has to test for a missing key is a
+    consumer that will one day forget to, and the failure mode of forgetting is
+    a `None` treated as a score of zero.
+    """
     return {
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "rubric_version": scoring.RUBRIC_VERSION,
@@ -350,12 +378,44 @@ def _unscoreable(reason: str) -> dict:
             # that was never asked, which would read as a real evaluation.
             "model": "none (refused before any model call)",
             "usage": None, "input_hash": None,
+            # Same keys as a real result, so a consumer never has to branch on
+            # their absence. Third status value: neither a good evaluation nor
+            # a self-contradicting one — there was nothing to evaluate.
+            "contract_status": "unscoreable",
+            "contract_violations": [], "evidence_rejected": [],
+            "ungradeable_modules": [], "pre_enforcement_score": None,
         },
     }
 
 
 @app.post("/evaluate", dependencies=[Depends(require_api_key)])
 def evaluate(req: EvaluateRequest) -> dict:
+    """Run the two passes and return both, scored locally.
+
+    **The usable-score rule.** `pass2` always carries `contract_status`,
+    `gradeable` and `final_score`, on every path including the pre-model
+    refusal. A score may be stored, averaged, reported or shown to an agent
+    ONLY when all three agree:
+
+        contract_status == "ok"  AND  gradeable  AND  final_score is not None
+
+    Any other combination is a row that records why there is no number, and it
+    must be stored as such — with a null score — never retried as a judge
+    fault and never counted in a denominator. The four statuses:
+
+    - `ok` — scored. `gradeable` true and `final_score` a number.
+    - `contract_failed` — the response still contradicted itself after one
+      correction. No score; `contract_violations` says what broke.
+    - `ungradeable` — too little of the rubric survived evidence enforcement to
+      average. No score; `ungradeable_modules` says which modules were struck.
+    - `unscoreable` — the transcript held too little speech to grade and no
+      model was called at all.
+
+    The three fields are redundant on purpose. `final_score` alone cannot
+    distinguish "no number because the call was empty" from "no number because
+    the judge broke its own contract", and every reporting bug this pipeline
+    has had came from a consumer inferring one from the other.
+    """
     settings.validate_for("judge")
 
     # An empty transcript is not a bad conversation, it is a missing one, and
@@ -367,12 +427,14 @@ def evaluate(req: EvaluateRequest) -> dict:
     body = spoken_content(req.conversation)
     if len(body) < MIN_SCOREABLE_CHARS:
         return _unscoreable(
-            f"transcript holds {len(body)} characters of speech, below the "
-            f"{MIN_SCOREABLE_CHARS} needed to score: treated as a failed or "
+            f"transcript holds {len(body)} normalised characters of speech "
+            f"(timestamps, speaker labels and whitespace runs removed), below "
+            f"the {MIN_SCOREABLE_CHARS} needed to score: treated as a failed or "
             f"abandoned call, not a badly handled one"
         )
 
-    client = judge.DeepSeekClient(settings.deepseek_api_key, settings.deepseek_model)
+    client = judge.DeepSeekClient(settings.deepseek_api_key, settings.deepseek_model,
+                                  thinking=settings.deepseek_thinking)
 
     out: dict[str, Any] = {
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
@@ -384,6 +446,10 @@ def evaluate(req: EvaluateRequest) -> dict:
         out["pass1"] = {
             "payload": p1.payload, "prompt_version": p1.prompt_version,
             "model": p1.model, "usage": p1.usage, "input_hash": p1.input_hash,
+            # Also inside payload; lifted out because the alert rules read it
+            # and should not have to reach through a jsonb blob to find out
+            # whether the quote behind a follow-up task was ever real.
+            "pass1_validation": p1.validation,
         }
 
     if req.run_pass2:
@@ -396,9 +462,13 @@ def evaluate(req: EvaluateRequest) -> dict:
                 metadata=req.metadata, followup_history=req.followup_history, client=client,
             )
         except (scoring.RubricError, judge.JudgeError) as exc:
+            # 422 now means only one thing: the model's output was not usable
+            # JSON at all. A response that parses but contradicts itself comes
+            # back 200 with contract_status="contract_failed" and no score —
+            # the caller stores the row and can see why it has no number.
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"judge response violated the rubric contract: {exc}",
+                f"judge response was structurally unusable: {exc}",
             ) from exc
         out["pass2"] = {
             "payload": p2.payload,
@@ -412,6 +482,17 @@ def evaluate(req: EvaluateRequest) -> dict:
             "model": p2.model,
             "usage": p2.usage,
             "input_hash": p2.input_hash,
+            "contract_status": p2.contract_status,
+            "contract_violations": p2.contract_violations,
+            "evidence_rejected": p2.evidence_rejected,
+            # Additive. Names the modules struck out as `evidence_ungroundable`
+            # — every deduction in them discarded — which is why the score can
+            # be null on a response with no contract violation at all.
+            "ungradeable_modules": p2.ungradeable_modules,
+            # The weighted score of the breakdown the model returned, taken
+            # before evidence enforcement touched it. Diagnostic only — it is
+            # NOT a usable score and must never be stored as one.
+            "pre_enforcement_score": p2.pre_enforcement_score,
         }
 
     return out

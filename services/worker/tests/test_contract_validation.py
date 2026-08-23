@@ -5,6 +5,18 @@ q-3009-0500000000-20260701-170522, not a hypothetical.
 """
 import pytest
 
+# Two conversations long enough to clear the 100-character speech gate, so a
+# test about contract handling is testing contract handling and not the gate.
+REAL_SHORT_CALL = (
+    "[00:00] AGENT: ألو السلام عليكم معك خالد من ترافل جيت\n"
+    "[00:04] CUSTOMER: عليكم السلام، أبغى عرض لتركيا لعائلة أربعة أشخاص\n"
+    "[00:18] AGENT: أبشر، أحسب لك العرض وأرسله لك على الواتساب\n"
+)
+REFUSAL_CALL = (
+    "[00:01] CUSTOMER: لو سمحت أبغى تذكرة من الرياض إلى عدن الأسبوع الجاي\n"
+    "[00:09] AGENT: ما عندنا رحلات إلى عدن، بس عندنا الرياض جدة والرياض دبي\n"
+)
+
 from app.evaluate import scoring
 
 
@@ -58,13 +70,18 @@ def test_legitimate_nulls_pass():
     assert scoring.validate_nullability(modules) == []
 
 
+def _no_objections():
+    """A Module 3 with nothing scored — the shape of a call with no pushback."""
+    return dict.fromkeys(scoring.CRITERION_MAX["module3_objections"], None)
+
+
 def test_stage_contradicting_a_null_offer_is_caught():
     """The real failure: stage_reached='offer_presented' while offer_completeness
     was null and the model's own notes said no offer was made."""
     modules = _modules(module2_offer={
         "attitude": 25, "offer_completeness": None,
         "value_selling": 20, "alternative_offer": None,
-    })
+    }, module3_objections=_no_objections())
     problems = scoring.validate_stage_consistency({"stage_reached": "offer_presented"}, modules)
     assert len(problems) == 1
     assert "Pick one" in problems[0]
@@ -75,7 +92,7 @@ def test_pre_offer_stages_are_consistent_with_a_null_offer(stage):
     modules = _modules(module2_offer={
         "attitude": 25, "offer_completeness": None,
         "value_selling": 20, "alternative_offer": None,
-    })
+    }, module3_objections=_no_objections())
     assert scoring.validate_stage_consistency({"stage_reached": stage}, modules) == []
 
 
@@ -91,9 +108,99 @@ def test_contract_violations_aggregates_both_checks():
     modules = _modules(module2_offer={
         "attitude": 25, "offer_completeness": None,
         "value_selling": None, "alternative_offer": None,
-    })
+    }, module3_objections=_no_objections())
     problems = scoring.contract_violations({"stage_reached": "offer_presented"}, modules)
     assert len(problems) == 2
+
+
+# ── the stage gate is per-field, and one field is deliberately outside it ───
+#
+# PR2 round 4. Step 0 used to name three of the four objections as requiring
+# `negotiation` or later and say nothing about the fourth, and the judge
+# generalised the rule to all four: on `174898da` it wrote "the conversation
+# never reached a price offer or closing stage, so Modules 3, 4 and 5 were
+# dropped" and returned `refusal_check` false with every objection null, on a
+# call where visa assistance was refused four times. The prompt is the
+# functional fix; this is the contract guard, and its shape has to match — a
+# closed rule that applies only to the fields it names.
+
+@pytest.mark.parametrize("criterion",
+                         ["price_objection", "competitor_objection",
+                          "thinking_time_objection"])
+@pytest.mark.parametrize("stage", ["reception", "offer_presented"])
+def test_a_pushback_objection_before_negotiation_is_a_violation(criterion, stage):
+    """These three are all pushback on something the agent said, so none of
+    them can exist before the agent said it and the customer argued with it."""
+    breakdown = _no_objections()
+    breakdown[criterion] = 25
+    modules = _modules(module3_objections=breakdown)
+    problems = scoring.validate_stage_consistency({"stage_reached": stage}, modules)
+    assert len(problems) == 1
+    assert criterion in problems[0]
+    assert "negotiation or later" in problems[0]
+
+
+@pytest.mark.parametrize("stage", ["reception", "offer_presented"])
+@pytest.mark.parametrize("score", [0, 15, 25])
+def test_an_unavailable_service_objection_before_negotiation_is_NOT_a_violation(
+        stage, score):
+    """The whole point of the round.
+
+    A customer asks for something the agency does not sell and is turned away
+    at the door. Nothing is ever quoted, so the call ends at `reception` — and
+    that is the population this criterion exists to catch, not an edge case.
+    Rejecting it here would re-ask the model until it reproduced the false
+    negative the prompt was just changed to stop producing.
+    """
+    breakdown = _no_objections()
+    breakdown["unavailable_service_objection"] = score
+    modules = _modules(module3_objections=breakdown)
+    assert scoring.validate_stage_consistency({"stage_reached": stage}, modules) == []
+    assert scoring.hard_violations({"stage_reached": stage}, modules) == []
+
+
+def test_the_refusal_link_still_holds_at_reception():
+    """What is NOT relaxed. The stage gate is gone; the contract is not.
+
+    `validate_refusal_link` is where `unavailable_service_objection` is checked,
+    and it is checked at every stage, in both directions — which is exactly why
+    it can be left out of the stage rule without leaving the criterion
+    unguarded.
+    """
+    breakdown = _no_objections()
+    modules = _modules(module3_objections=breakdown)
+    modules["module3_objections"]["refusal_check"] = {
+        "customer_requested_something_specific": True,
+        "agent_refused_or_declared_unavailable": True,
+        "refusal_quote": "ما عندنا رحلات إلى عدن",
+    }
+    problems = scoring.hard_violations({"stage_reached": "reception"}, modules)
+    assert len(problems) == 1
+    assert "must carry a number" in problems[0]
+
+
+def test_a_reception_refusal_that_is_scored_and_flagged_passes_every_check():
+    """The `174898da` shape, answered the way round 4 requires."""
+    breakdown = _no_objections()
+    breakdown["unavailable_service_objection"] = 15
+    modules = _modules(module2_offer={
+        "attitude": 25, "offer_completeness": None,
+        "value_selling": 20, "alternative_offer": None,
+    }, module3_objections=breakdown)
+    modules["module3_objections"]["refusal_check"] = {
+        "customer_requested_something_specific": True,
+        "agent_refused_or_declared_unavailable": True,
+        "refusal_quote": "التأشيرات ما نشتغل فيها احنا نهائيا",
+    }
+    assert scoring.hard_violations({"stage_reached": "reception"}, modules) == []
+
+
+def test_the_gated_list_is_the_three_the_reviewer_named():
+    """Written down so a fourth entry needs a deliberate edit and a reason."""
+    assert scoring.NEGOTIATION_GATED_OBJECTIONS == (
+        "price_objection", "competitor_objection", "thinking_time_objection")
+    assert "unavailable_service_objection" not in scoring.NEGOTIATION_GATED_OBJECTIONS
+    assert scoring.PRE_NEGOTIATION_STAGES == frozenset({"reception", "offer_presented"})
 
 
 def test_out_of_range_criterion_is_a_contract_violation():
@@ -205,12 +312,69 @@ def test_short_or_empty_transcripts_are_refused_not_scored(text, monkeypatch):
     assert "not a badly handled one" in p2["warnings"][0]
 
 
-def test_a_real_short_call_still_reaches_the_judge(monkeypatch):
-    """The floor must not swallow genuinely brief but real conversations."""
-    from app.main import MIN_SCOREABLE_CHARS
+def test_every_pass2_path_carries_the_same_status_keys(monkeypatch):
+    """A consumer must never have to branch on a key being absent.
 
-    real = "ألو السلام عليكم -- عليكم السلام هلا معك خالد من ترافل جيت"
-    assert len(real.strip()) >= MIN_SCOREABLE_CHARS
+    The usable-score rule is `contract_status == "ok" AND gradeable AND
+    final_score is not None`, and it is only checkable if all three are present
+    on every path. The pre-model refusal used to omit `ungradeable_modules`,
+    so a consumer reading it either crashed or defaulted -- and the default
+    that costs money is reading a missing score as a zero.
+    """
+    from fastapi.testclient import TestClient
+
+    from app import main
+    from app.evaluate import scoring
+
+    monkeypatch.setattr(main.settings, "worker_api_key", "k", raising=False)
+    monkeypatch.setattr(main.settings, "deepseek_api_key", "sk-test", raising=False)
+    client = TestClient(main.app)
+
+    refused = client.post(
+        "/evaluate", json={"conversation": "ألو", "input_type": "call_transcript"},
+        headers={"X-API-Key": "k"}).json()["pass2"]
+    assert refused["contract_status"] == "unscoreable"
+
+    modules = {key: {"score": None, "breakdown": dict(caps)}
+               for key, caps in scoring.CRITERION_MAX.items()}
+    payload = {"schema_version": "1.0", "stage_reached": "closing",
+               "modules": modules, "evidence": []}
+    monkeypatch.setattr(main.judge, "DeepSeekClient",
+                        lambda *a, **kw: _Stub(payload, payload))
+    scored = client.post(
+        "/evaluate",
+        json={"conversation": REAL_SHORT_CALL, "input_type": "call_transcript",
+              "run_pass1": False},
+        headers={"X-API-Key": "k"}).json()["pass2"]
+    assert scored["contract_status"] == "ok"
+
+    # Same keys, whatever happened.
+    assert set(refused) == set(scored), set(refused) ^ set(scored)
+    for block in (refused, scored):
+        for key in ("contract_status", "gradeable", "final_score",
+                    "ungradeable_modules", "contract_violations",
+                    "evidence_rejected", "prompt_version", "model"):
+            assert key in block, key
+
+    # And the rule itself agrees with the status on both.
+    def usable(p2):
+        return (p2["contract_status"] == "ok" and p2["gradeable"]
+                and p2["final_score"] is not None)
+
+    assert usable(scored) is True
+    assert usable(refused) is False
+
+
+def test_a_real_short_call_still_reaches_the_judge(monkeypatch):
+    """The floor must not swallow genuinely brief but real conversations.
+
+    Raised to 100 normalised characters in PR2 iteration 2. A greeting plus one
+    stated requirement plus one agent commitment clears it; a greeting alone
+    does not, which is the whole point of the move.
+    """
+    from app.main import MIN_SCOREABLE_CHARS, spoken_content
+
+    assert len(spoken_content(REAL_SHORT_CALL)) >= MIN_SCOREABLE_CHARS
 
 
 def test_failed_chunk_is_distinct_from_a_silent_one():
@@ -273,8 +437,32 @@ def test_a_hangup_is_refused_not_scored(monkeypatch):
 def test_a_real_conversation_is_not_swallowed_by_the_floor():
     from app.main import spoken_content, MIN_SCOREABLE_CHARS
 
-    real = "[00:00] ألو السلام عليكم -- عليكم السلام هلا معك خالد من ترافل جيت"
-    assert len(spoken_content(real)) >= MIN_SCOREABLE_CHARS
+    assert len(spoken_content(REAL_SHORT_CALL)) >= MIN_SCOREABLE_CHARS
+
+
+def test_the_gate_counts_normalised_speech_not_rendering():
+    """Padding a transcript with segment markers must not talk it past the gate."""
+    from app.main import spoken_content
+
+    padded = "".join(f"[{m:02d}:00] AGENT: هلا " for m in range(12))
+    assert len(spoken_content(padded)) < 100        # 12 x "هلا " is 47 chars of speech
+    assert "[" not in spoken_content(padded)
+    assert "AGENT" not in spoken_content(padded)
+
+
+def test_the_gate_reason_says_the_count_is_normalised(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+
+    monkeypatch.setattr(main.settings, "worker_api_key", "k", raising=False)
+    monkeypatch.setattr(main.settings, "deepseek_api_key", "sk-test", raising=False)
+    p2 = TestClient(main.app).post(
+        "/evaluate",
+        json={"conversation": "[00:00] AGENT: هلا", "input_type": "call_transcript"},
+        headers={"X-API-Key": "k"},
+    ).json()["pass2"]
+    assert "normalised characters of speech" in p2["warnings"][0]
+    assert "timestamps, speaker labels and whitespace runs removed" in p2["warnings"][0]
 
 
 def test_a_refusal_still_fills_the_not_null_columns(monkeypatch):
@@ -293,3 +481,145 @@ def test_a_refusal_still_fills_the_not_null_columns(monkeypatch):
         assert p2[column], f"{column} would violate NOT NULL"
     assert p2["final_score"] is None          # nullable, and must stay null
     assert p2["gradeable"] is False
+
+
+# ── the refusal ↔ objection link ────────────────────────────────────────────
+# pass2 v3 declares this a contract violation in words — "setting the flag true
+# and the objection null is a contract violation" — and nothing checked it. Both
+# directions remove a real judgement: one drops 25% of the weight out of the
+# grade, the other marks the agent on an event the same response says never
+# happened.
+
+def _module3(refused, scored, **rest):
+    modules = _modules(module3_objections={
+        "price_objection": None, "competitor_objection": None,
+        "thinking_time_objection": None, "unavailable_service_objection": scored,
+    })
+    modules["module3_objections"]["refusal_check"] = {
+        "customer_requested_something_specific": True,
+        "agent_refused_or_declared_unavailable": refused,
+        "refusal_quote": "ما عندنا رحلات إلى عدن",
+        **rest,
+    }
+    return modules
+
+
+def test_a_refusal_with_a_null_objection_is_a_contract_violation():
+    problems = scoring.validate_refusal_link(_module3(True, None))
+    assert len(problems) == 1
+    assert "must carry a number" in problems[0]
+
+
+def test_an_objection_scored_without_a_refusal_is_a_contract_violation():
+    problems = scoring.validate_refusal_link(_module3(False, 15))
+    assert len(problems) == 1
+    assert "cannot be scored without the refusal" in problems[0]
+
+
+@pytest.mark.parametrize("refused,scored", [(True, 0), (True, 15), (True, 25),
+                                            (False, None)])
+def test_agreeing_answers_pass(refused, scored):
+    assert scoring.validate_refusal_link(_module3(refused, scored)) == []
+
+
+def test_a_missing_refusal_check_block_is_not_a_violation():
+    """Older stored payloads and pass2 v1/v2 have no such field. Absence is not
+    a contradiction — there is only one answer, so nothing can disagree."""
+    modules = _modules()
+    assert scoring.validate_refusal_link(modules) == []
+    modules["module3_objections"]["refusal_check"] = {"refusal_quote": None}
+    assert scoring.validate_refusal_link(modules) == []
+
+
+def test_the_link_is_part_of_contract_violations():
+    modules = _module3(True, None)
+    problems = scoring.contract_violations({"stage_reached": "reception"}, modules)
+    assert any("refusal_check" in p for p in problems)
+    assert problems == scoring.hard_violations({"stage_reached": "reception"}, modules)
+
+
+# ── a self-contradicting response returns, it does not raise ────────────────
+# 422 used to be the answer to "the model contradicted itself", which loses the
+# payload, the reason and the row. It now means only "the output was not usable
+# JSON". A contradiction comes back 200 with no score and the violations named.
+
+class _Stub:
+    def __init__(self, *responses, model="stub-model"):
+        self.model = model
+        self._responses = list(responses)
+        self.prompts = []
+
+    def complete_json(self, prompt, **_):
+        import copy
+        self.prompts.append(prompt)
+        i = min(len(self.prompts) - 1, len(self._responses) - 1)
+        return copy.deepcopy(self._responses[i]), {"prompt_tokens": 1, "completion_tokens": 1}
+
+
+def _contradictory():
+    return {"schema_version": "1.0", "stage_reached": "reception",
+            "modules": _module3(True, None), "evidence": []}
+
+
+def test_an_unresolved_contradiction_is_returned_not_raised():
+    from app.evaluate import judge
+
+    payload = _contradictory()
+    client = _Stub(payload, payload)
+    result = judge.run_pass2("[00:01] AGENT: ما عندنا رحلات إلى عدن", "call_transcript",
+                             client=client)
+
+    assert len(client.prompts) == 2                  # asked again, once
+    assert result.contract_status == "contract_failed"
+    assert result.score.final_score is None
+    assert result.score.gradeable is False
+    assert result.payload["final_score"] is None
+    assert result.payload["contract_status"] == "contract_failed"
+    assert any("refusal_check" in v for v in result.contract_violations)
+    # The evaluation itself is still there to look at.
+    assert result.payload["modules"]["module3_objections"]["refusal_check"]
+
+
+def test_a_contract_failure_is_http_200_with_a_status(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+
+    payload = _contradictory()
+    monkeypatch.setattr(main.settings, "worker_api_key", "k", raising=False)
+    monkeypatch.setattr(main.settings, "deepseek_api_key", "sk-test", raising=False)
+    monkeypatch.setattr(main.judge, "DeepSeekClient",
+                        lambda *a, **kw: _Stub(payload, payload))
+
+    r = TestClient(main.app).post(
+        "/evaluate",
+        json={"conversation": REFUSAL_CALL,
+              "input_type": "call_transcript", "run_pass1": False},
+        headers={"X-API-Key": "k"},
+    )
+    assert r.status_code == 200
+    p2 = r.json()["pass2"]
+    assert p2["contract_status"] == "contract_failed"
+    assert p2["final_score"] is None and p2["gradeable"] is False
+    assert p2["contract_violations"] and p2["evidence_rejected"] == []
+    for column in ("model", "prompt_version"):
+        assert p2[column], f"{column} would violate NOT NULL"
+
+
+def test_structurally_unusable_json_is_still_a_422(monkeypatch):
+    """The one thing that is not a result: output with no `modules` at all."""
+    from fastapi.testclient import TestClient
+    from app import main
+
+    monkeypatch.setattr(main.settings, "worker_api_key", "k", raising=False)
+    monkeypatch.setattr(main.settings, "deepseek_api_key", "sk-test", raising=False)
+    monkeypatch.setattr(main.judge, "DeepSeekClient",
+                        lambda *a, **kw: _Stub({"sorry": "I cannot do that"}))
+
+    r = TestClient(main.app).post(
+        "/evaluate",
+        json={"conversation": REAL_SHORT_CALL,
+              "input_type": "call_transcript", "run_pass1": False},
+        headers={"X-API-Key": "k"},
+    )
+    assert r.status_code == 422
+    assert "structurally unusable" in r.json()["detail"]

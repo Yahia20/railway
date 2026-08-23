@@ -135,3 +135,41 @@ def test_deduction_without_evidence_is_flagged():
     )
     assert len(problems) == 1
     assert "module1_reception" in problems[0]
+
+
+# ── the span validator, used by both passes ─────────────────────────────────
+# `quote_problem` is the one place that decides whether a quote is real. Pass-1
+# field validation, pass-2 evidence warnings and criterion-level enforcement all
+# route through it, so a quote can never be genuine to one caller and fabricated
+# to another.
+
+def test_quote_problem_reports_why_not_just_that():
+    spans = scoring.conversation_spans("AGENT: أرسل لك العرض [[ASR_GAP]] بكرة الصبح")
+
+    assert scoring.quote_problem("أرسل لك العرض", *spans) is None
+    assert scoring.quote_problem("", *spans) == "empty quote"
+    assert scoring.quote_problem(None, *spans) == "empty quote"
+    assert "ASR gap marker" in scoring.quote_problem("العرض [[ASR_GAP]]", *spans)
+    # Across the seam: both halves are real, the sentence is not.
+    assert "not found" in scoring.quote_problem("أرسل لك العرض بكرة الصبح", *spans)
+
+
+def test_quote_is_valid_folds_arabic_orthography():
+    assert scoring.quote_is_valid("احسب لك العرض", "AGENT: أحسب لك العرض")
+    assert not scoring.quote_is_valid("أحسب لك الفيزا", "AGENT: أحسب لك العرض")
+
+
+def test_an_unsupported_deduction_is_restored_to_its_cap_not_to_null():
+    """Null would drop the criterion from the denominator and inflate the
+    module — the source rubric's automatic full marks coming back in through
+    the side door. The cap leaves the agent whole and the denominator honest."""
+    modules = {"module1_reception": {"breakdown": {
+        "greeting": 25, "understanding_confirmation": 25,
+        "missing_info_request": 0, "next_step_transition": 25}}}
+
+    rejected = scoring.enforce_criterion_evidence({"evidence": []}, modules, "لا شيء")
+    breakdown = modules["module1_reception"]["breakdown"]
+
+    assert breakdown["missing_info_request"] == 25
+    assert rejected[0]["restored_to"] == 25 and rejected[0]["model_score"] == 0
+    assert scoring.module_score("module1_reception", breakdown) == 100.0

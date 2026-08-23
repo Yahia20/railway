@@ -131,6 +131,61 @@ def compute_call_metrics(started_at: datetime, duration_seconds: float,
     )
 
 
+def later_contact_line(entry: dict) -> str:
+    """One `Subsequent contact` bullet, in the format production actually sends.
+
+    THE AUTHORITATIVE RENDERER IS SQL, not this file: the block that reaches the
+    judge in production is built by the `Build follow-up history` node of
+    n8n/workflows/02-calls-ingest-evaluate.json, dumped for review to
+    scripts/sql/02_build_follow_up_history.sql. This function exists so that
+    Python-side callers emit the SAME bullet, and
+    `scripts/compare_day.py:render_current_history` mirrors it field for field.
+    `test_followup_history_block.py` fails if the two ever disagree.
+
+    Every field here is load-bearing and each one fixes a measured defect. On
+    day 13 four calls had later same-phone interactions in the database and all
+    of them still scored Module 4 = null, because the old bullet
+    (`{channel} by {by}`) rendered "phone_call by unknown" for essentially the
+    whole corpus:
+
+      * DIRECTION. A customer calling back in is not the agent following up, and
+        Module 4 grades only what the AGENT did. With the direction unstated,
+        `null` is the honest answer, and the model gave it.
+      * THE HANDLER. Queue recordings deliberately carry `agent_id = NULL` - the
+        extension in a queue filename is the QUEUE, not a person - so "no
+        individual agent recorded (queue recording)" has to be distinguishable
+        from "we do not know".
+      * THE MESSAGE TEXT. Criterion 3 is follow-up MESSAGE QUALITY, 30 of the
+        module's 100 points, and is unanswerable from a bullet without it.
+    """
+    channel = str(entry.get("channel") or "phone_call")
+
+    if channel == "phone_call" and str(entry.get("kind") or "") == "q":
+        direction = ("INBOUND: the customer called in, this is not an agent "
+                     "follow-up")
+    elif entry.get("direction"):
+        direction = f"direction {entry['direction']}"
+    else:
+        direction = "direction not recorded"
+
+    if entry.get("agent_name"):
+        handler = str(entry["agent_name"])
+    elif entry.get("is_bot_handled"):
+        handler = "the qualification bot, not a human agent"
+    elif str(entry.get("kind") or "") == "q":
+        handler = "no individual agent recorded (queue recording)"
+    else:
+        handler = "not recorded"
+
+    body = entry.get("first_message")
+    message = f': "{str(body)[:300]}"' if body else ""
+    hours = entry.get("hours_after")
+    hours_text = f"{float(hours):.1f}" if isinstance(hours, (int, float)) else "?"
+
+    return (f"  - [{entry.get('started_at', '?')}] {channel}, {direction}, "
+            f"{hours_text}h after this conversation, handled by {handler}{message}")
+
+
 def followup_history_block(promises: list[dict], later_contacts: list[dict]) -> str:
     """Render the FOLLOW-UP HISTORY block for the judge prompt.
 
@@ -138,6 +193,11 @@ def followup_history_block(promises: list[dict], later_contacts: list[dict]) -> 
     the prompt reads as "score Module 4 null". That is the honest answer before
     the chats integration lands: for a call alone, we cannot see whether the
     agent followed up on WhatsApp afterwards.
+
+    The `Subsequent contact` lines are rendered by `later_contact_line`, so this
+    block and the SQL production actually runs cannot drift apart. The promises
+    section has no SQL counterpart: it is derived from the conversation itself
+    rather than from the customer's timeline.
     """
     if not promises and not later_contacts:
         return "unavailable"
@@ -151,11 +211,9 @@ def followup_history_block(promises: list[dict], later_contacts: list[dict]) -> 
     lines.append("")
     if later_contacts:
         lines.append("Subsequent contact with this customer:")
-        for c in later_contacts:
-            lines.append(
-                f"  - [{c['started_at']}] {c['channel']} by {c['by']}, "
-                f"{c['hours_after']:.1f}h after this conversation: {c.get('first_message', '')}"
-            )
+        lines.extend(later_contact_line(c) for c in
+                     sorted(later_contacts,
+                            key=lambda e: str(e.get("started_at") or "")))
     else:
         lines.append("Subsequent contact with this customer: NONE recorded.")
     return "\n".join(lines)

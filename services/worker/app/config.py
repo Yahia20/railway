@@ -34,7 +34,22 @@ class Settings:
 
     # --- DeepSeek ---------------------------------------------------------
     deepseek_api_key: str | None = field(default_factory=lambda: _env("DEEPSEEK_API_KEY"))
-    deepseek_model: str = field(default_factory=lambda: _env("DEEPSEEK_MODEL", "deepseek-chat"))
+    # No default here on purpose. `None` means "whatever the judge's
+    # DEFAULT_MODEL says", so the model id lives in exactly one place
+    # (`evaluate/judge.py`) next to the evidence for choosing it, and this file
+    # cannot drift into naming a second one. DEEPSEEK_MODEL still overrides.
+    #
+    # It used to default to `deepseek-chat`, which as of 2026-08-22 is a legacy
+    # ALIAS the changelog scheduled for removal on 2026-07-24 and which no
+    # longer appears in GET /models, the API reference or the pricing table.
+    # Two defaults for one setting is how a rename gets undone by the copy
+    # nobody remembered: check `DEEPSEEK_MODEL` in the Railway environment
+    # before trusting this (scripts/railway_configure.py still sets the alias).
+    deepseek_model: str | None = field(default_factory=lambda: _env("DEEPSEEK_MODEL"))
+    # "disabled" reproduces what the `deepseek-chat` alias did. See
+    # judge.DEFAULT_THINKING — enabling it is a new scoring baseline, not a
+    # tuning knob.
+    deepseek_thinking: str | None = field(default_factory=lambda: _env("DEEPSEEK_THINKING"))
 
     # --- ASR --------------------------------------------------------------
     asr_backend: str = field(default_factory=lambda: _env("ASR_BACKEND", "space"))

@@ -2,8 +2,12 @@
 """Release-1 ASR text cleaning. Every case here is a failure mode a real
 transcript actually produced (2026-08-09 batch, 10-call validation trial);
 the text is synthetic but the shapes are not."""
+import pytest
+
 from app.asr.text_quality import (
     GAP,
+    HARMLESS_CONTROL_TOKENS,
+    LOST_AUDIO_CONTROL_TOKENS,
     ChunkQuality,
     assess_call,
     clean_chunk,
@@ -50,6 +54,265 @@ def test_atsign_blank_removed_but_bare_word_kept():
     assert "@@@" not in cq.clean_text
     # the genuine word فراغ (a real gap in a schedule) must survive
     assert "في فراغ في الجدول" in cq.clean_text
+
+
+# --- Model control tokens ("<hesitation>") ---------------------------------
+
+def test_control_token_removed_without_leaving_a_gap():
+    raw = "ايه الصوت <hesitation> واضح يا فندم"
+    cq = _roundtrip(raw)
+    assert "<hesitation>" not in cq.clean_text
+    # No marker and no doubled space: the utterance is continuous speech, and
+    # a GAP here would stop the judge quoting across it.
+    assert cq.clean_text == "ايه الصوت واضح يا فندم"
+    assert GAP not in cq.clean_text
+    assert cq.control_tokens == 1
+
+
+def test_harmless_token_ledger_reconstructs_and_leaves_no_marker():
+    raw = "طيب <hesitation> نكمل <hesitation> الحجز"
+    cq = _roundtrip(raw)          # _roundtrip asserts the char-for-char rebuild
+    assert cq.clean_text == "طيب نكمل الحجز"
+    assert cq.control_tokens == 2
+    assert [op["pattern_id"] for op in cq.ops] == ["control_token_v1"] * 2
+    assert all(op["replacement_text"] == "" for op in cq.ops)
+
+
+# --- F2: lost-audio markers are NOT harmless punctuation -------------------
+# Sol's finding: q1 deleted <inaudible>/<noise>/<silence> with no marker, so a
+# judge could quote straight across audio nobody heard. They are missing audio
+# and get the same GAP as any other Tier-1 removal.
+
+@pytest.mark.parametrize("tok", sorted(LOST_AUDIO_CONTROL_TOKENS))
+def test_every_lost_audio_token_becomes_a_gap(tok):
+    raw = f"العميل قال السعر <{tok}> والموظف رد عليه"
+    cq = _roundtrip(raw)
+    assert f"<{tok}>" not in cq.clean_text
+    assert cq.clean_text == f"العميل قال السعر {GAP} والموظف رد عليه"
+    assert [op["pattern_id"] for op in cq.ops] == ["control_token_gap_v1"]
+    assert cq.control_gaps == 1
+    assert cq.control_tokens == 0      # not the harmless class
+
+
+def test_lost_audio_token_is_a_hard_quote_boundary_for_the_judge():
+    from app.evaluate.scoring import validate_evidence
+
+    cq = clean_chunk("العميل سأل عن السعر <inaudible> الموظف قال مع السلامة")
+    crossing = {"evidence": [{"quote": "عن السعر الموظف قال"}]}
+    assert validate_evidence(crossing, cq.clean_text)
+    assert validate_evidence({"evidence": [{"quote": "سأل عن السعر"}]},
+                             cq.clean_text) == []
+
+
+def test_lost_audio_chars_are_tier1_but_never_invented_seconds():
+    """They ARE missing audio, so they bill characters. They do NOT bill
+    seconds: no token timestamps exist and a marker's length says nothing
+    about the audio behind it."""
+    raw = "تمام <inaudible_speech> يا فندم نكمل الحجز بكرة ان شاء الله"
+    cq = _roundtrip(raw)
+    q = assess_call([cq], [100.0], set(), 100.0,
+                    clean_chars=800, raw_chars=len(raw), chunks_empty=0)
+    assert q["tier1_chars_removed"] == len("<inaudible_speech>")
+    assert q["control_token_gaps"] == 1
+    assert q["invalid_seconds"] == 0.0        # no fabricated audio accounting
+    assert q["status"] == "amber"             # normal any-removal trigger
+
+
+def test_unknown_control_token_is_left_alone_and_flagged():
+    """Deleting a marker we cannot classify is the failure this rule exists to
+    prevent, so the text is untouched and a flag carries it to a human."""
+    raw = "تمام <foo_bar> يا فندم <foo_bar> نكمل"
+    cq = _roundtrip(raw)
+    assert cq.clean_text == raw               # verbatim
+    assert not cq.ops
+    assert cq.unknown_control_tokens == 2
+    assert cq.flags == [{"flag": "unknown_control_token",
+                         "token": "<foo_bar>", "count": 2}]
+    q = assess_call([cq], [100.0], set(), 100.0,
+                    clean_chars=800, raw_chars=len(raw), chunks_empty=0)
+    assert q["unknown_control_tokens"] == 2
+    assert q["tier1_chars_removed"] == 0
+    assert q["status"] == "amber"             # existing any-flag path, no new one
+
+
+def test_allowlist_is_only_what_was_observed():
+    """The model card documents no control-token vocabulary, so nothing joins
+    the allowlist on the strength of looking like filler."""
+    assert HARMLESS_CONTROL_TOKENS == frozenset({"hesitation"})
+    assert not (HARMLESS_CONTROL_TOKENS & LOST_AUDIO_CONTROL_TOKENS)
+
+
+# --- F3: harmless control chars stay out of every status calculation -------
+
+def test_merged_with_contamination_bills_only_the_contamination():
+    raw = "تمام <hesitation> التفريغ والتدقيق قصي البياتي طيب نكمل الحجز"
+    cq = _roundtrip(raw)
+    assert len(cq.ops) == 1                   # one merged span, one GAP
+    op = cq.ops[0]
+    assert "+" in op["pattern_id"]
+    assert op["control_chars"] == len("<hesitation> ")
+    q = assess_call([cq], [90.0], set(), 90.0,
+                    clean_chars=800, raw_chars=len(raw), chunks_empty=0)
+    # exactly the watermark's characters, not the token's
+    assert q["tier1_chars_removed"] == (
+        len(op["removed_text"]) - len("<hesitation> "))
+    assert q["control_tokens_removed"] == 1
+
+
+def test_harmless_chars_excluded_from_density():
+    """20 <hesitation>s inflate raw length by 260 chars. On a short call that
+    is enough to cross the >22 chars/sec density trigger; it must not."""
+    before, after = "ايوه يا فندم تمام", "نكمل الحجز بكرة"
+    speech = f"{before} {after}"
+    raw = before + " " + " ".join(["<hesitation>"] * 20) + " " + after
+    cq = _roundtrip(raw)
+    assert cq.clean_text == speech
+    assert len(raw) / 12.0 > 22               # raw length WOULD trip it
+    q = assess_call([cq], [12.0], set(), 12.0,
+                    clean_chars=len(speech), raw_chars=len(raw), chunks_empty=0)
+    assert q["speech_chars"] == len(speech)
+    assert q["speech_chars"] / 12.0 <= 22
+    assert q["status"] == "green"
+
+
+def test_harmless_chars_excluded_from_ngram_corroboration():
+    """A 6-15 run is only invalid when corroborated. A wall of control tokens
+    must not do the corroborating: that would charge the chunk's whole
+    duration to invalid_seconds."""
+    run = " ".join(["لا"] * 8)
+    raw = ("بص يا باشا " + run + " " + " ".join(["<hesitation>"] * 30)
+           + " طيب نشوف حل تاني")
+    cq = _roundtrip(raw)
+    assert cq.warn_run == 8
+    assert cq.ngram_fraction < 0.45
+    q = assess_call([cq], [120.0], set(), 120.0,
+                    clean_chars=800, raw_chars=len(raw), chunks_empty=0)
+    assert q["invalid_seconds"] == 0.0
+    assert q["status"] == "amber"             # warn_only, not invalid
+
+
+# --- F3: boundary regressions ----------------------------------------------
+
+def test_boundary_tokens_at_chunk_start_and_end():
+    assert _roundtrip("<inaudible> تمام يا فندم").clean_text == \
+        f"{GAP} تمام يا فندم"
+    assert _roundtrip("تمام يا فندم <inaudible>").clean_text == \
+        f"تمام يا فندم {GAP}"
+    assert _roundtrip("<hesitation> تمام").clean_text == "تمام"
+    assert _roundtrip("تمام <hesitation>").clean_text == "تمام"
+    assert _roundtrip("<inaudible>").clean_text == GAP
+
+
+def test_boundary_token_adjacent_to_an_existing_gap_marker():
+    for raw in (f"العميل {GAP} <hesitation> الموظف",
+                f"العميل <hesitation> {GAP} الموظف"):
+        cq = _roundtrip(raw)
+        # the pre-existing marker is neither doubled nor eaten
+        assert cq.clean_text.count(GAP) == 1
+        assert "<hesitation>" not in cq.clean_text
+    cq = _roundtrip(f"العميل {GAP} <inaudible> الموظف")
+    assert cq.clean_text.count(GAP) == 2
+    assert cq.control_gaps == 1
+
+
+def test_boundary_twenty_lost_audio_tokens_in_a_row_collapse_to_one_gap():
+    raw = "تقدر تساعدني " + " ".join(["<inaudible>"] * 20) + " طيب نشوف حل"
+    cq = _roundtrip(raw)
+    assert not cq.hard_loop                   # a marker stream, not a loop
+    assert cq.control_gaps == 20
+    assert cq.clean_text.count(GAP) == 1      # adjacent spans merge
+    assert cq.clean_text == f"تقدر تساعدني {GAP} طيب نشوف حل"
+    q = assess_call([cq], [120.0], set(), 120.0,
+                    clean_chars=400, raw_chars=len(raw), chunks_empty=0)
+    assert q["invalid_seconds"] == 0.0
+    assert q["tier1_chars_removed"] > 200
+    assert q["status"] == "red"               # >= 40 chars and >= 25% of speech
+
+
+def test_boundary_mixed_harmless_and_lost_audio_tokens():
+    raw = "الصوت <hesitation> واضح <inaudible> بس مش سامعك <hesitation> كويس"
+    cq = _roundtrip(raw)
+    assert cq.control_tokens == 2
+    assert cq.control_gaps == 1
+    assert cq.clean_text == f"الصوت واضح {GAP} بس مش سامعك كويس"
+    q = assess_call([cq], [60.0], set(), 60.0,
+                    clean_chars=len(cq.clean_text), raw_chars=len(raw),
+                    chunks_empty=0)
+    assert q["tier1_chars_removed"] == len("<inaudible>")
+    assert q["speech_chars"] == len(raw) - 2 * len("<hesitation> ")
+
+
+def test_boundary_back_to_back_mixed_tokens_do_not_glue_words():
+    cq = _roundtrip("الصوت <hesitation><inaudible> واضح")
+    assert cq.clean_text == f"الصوت {GAP} واضح"
+    cq = _roundtrip("الصوت <inaudible><hesitation> واضح")
+    assert cq.clean_text == f"الصوت {GAP} واضح"
+
+
+def test_control_token_at_edges_collapses_whitespace():
+    assert _roundtrip("<hesitation> تمام").clean_text == "تمام"
+    assert _roundtrip("تمام <hesitation>").clean_text == "تمام"
+
+
+def test_back_to_back_control_tokens_do_not_glue_words():
+    raw = "الصوت <hesitation><hesitation> واضح"
+    cq = _roundtrip(raw)
+    assert cq.clean_text == "الصوت واضح"
+    assert cq.control_tokens == 2
+
+
+def test_control_token_counted_in_metrics_without_moving_status():
+    raw = "ايه الصوت <hesitation> واضح يا فندم وشكرا لحضرتك على الاتصال"
+    cq = clean_chunk(raw)
+    q = assess_call([cq], [100.0], set(), 100.0,
+                    clean_chars=800, raw_chars=800, chunks_empty=0)
+    assert q["control_tokens_removed"] == 1
+    assert q["tier1_chars_removed"] == 0   # not contamination
+    assert q["invalid_seconds"] == 0.0
+    assert q["status"] == "green"           # status-neutral by design
+
+
+def test_control_token_run_is_not_a_decoder_loop():
+    raw = "تقدر تساعدني " + " ".join(["<hesitation>"] * 20) + " طيب نشوف حل"
+    cq = _roundtrip(raw)
+    assert not cq.hard_loop        # machine punctuation, not lost audio
+    assert cq.control_tokens == 20
+    assert cq.clean_text == "تقدر تساعدني طيب نشوف حل"
+    q = assess_call([cq], [120.0], set(), 120.0,
+                    clean_chars=800, raw_chars=900, chunks_empty=0)
+    assert q["invalid_seconds"] == 0.0
+    assert q["status"] == "green"
+
+
+def test_arabic_speech_untouched_by_control_token_rule():
+    raw = "ايه يا فندم الحجز اتعمل امبارح والتذكرة وصلت على الايميل"
+    cq = _roundtrip(raw)
+    assert cq.clean_text == raw
+    assert not cq.ops and cq.control_tokens == 0
+
+
+def test_bare_angle_brackets_untouched():
+    # a price range read aloud / stray punctuation: no closing tag, no removal
+    raw = "السعر < من 3000 و > من 5000 يا فندم <hesitation2 غير مكتمل"
+    cq = _roundtrip(raw)
+    assert cq.clean_text == raw
+    assert not cq.ops and cq.control_tokens == 0
+
+
+def test_asr_gap_marker_untouched_by_control_token_rule():
+    raw = f"العميل سأل عن السعر {GAP} الموظف قال مع السلامة"
+    cq = _roundtrip(raw)
+    assert cq.clean_text == raw
+    assert not cq.ops and cq.control_tokens == 0
+
+
+def test_control_token_adjacent_to_contamination_still_gets_a_gap():
+    raw = "تمام <hesitation> التفريغ والتدقيق قصي البياتي طيب نكمل"
+    cq = _roundtrip(raw)
+    assert "قصي البياتي" not in cq.clean_text
+    assert "<hesitation>" not in cq.clean_text
+    assert GAP in cq.clean_text     # real contamination was removed here
+    assert cq.control_tokens == 1
 
 
 # --- URL-garbage chains (trial discovery) ----------------------------------

@@ -93,7 +93,16 @@ def main() -> int:
         "PORT": "8000",
         "WORKER_API_KEY": worker_api_key,
         "DEEPSEEK_API_KEY": deepseek,
-        "DEEPSEEK_MODEL": "deepseek-chat",
+        # The explicit model id, not the `deepseek-chat` alias: that alias was
+        # scheduled for removal on 2026-07-24 and still answers, so nothing
+        # fails loudly when it stops. It resolved to V4 Flash NON-thinking,
+        # while an explicit v4 request defaults to thinking ENABLED — so the
+        # rename is only behaviour-preserving with DEEPSEEK_THINKING set too.
+        # An environment variable beats every default in the source, so setting
+        # these here is what actually decides what production asks for; verify
+        # on /ready, which reports judge_model and judge_thinking.
+        "DEEPSEEK_MODEL": "deepseek-v4-flash",
+        "DEEPSEEK_THINKING": "disabled",
         # customer360, NOT railway — n8n owns railway/public and already has a
         # table called `agents` that would collide with ours.
         "DATABASE_URL": f"postgresql://postgres:{pg_password}@postgres.railway.internal:5432/customer360",

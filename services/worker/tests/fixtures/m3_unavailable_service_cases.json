@@ -1,0 +1,323 @@
+{
+  "about": "Regression cases for module3_objections.unavailable_service_objection.",
+  "why_synthetic": "Every snippet below is written for this file. No line is copied from a real customer transcript: this repository is public and the day-13 corpus is PDPL-protected personal data. Each case reproduces the PATTERN and the SHAPE of a real misjudgement, not its text.",
+  "prompt": "pass2_agent_quality_v6.md (v6 = v5 with Step 0's stage rules made closed and field-specific)",
+  "fixture_policy": {
+    "_source": "The round-4 review (gpt-5.6-sol) on the v5 audit. Two rounds running, a synthetic control passed while the real call it stood for failed, because the fixtures were clean dialogues that exercised the rule instead of reproducing the shape of the transcript. These four rules are the fix, and tests/test_m3_fixtures.py enforces every one of them offline.",
+    "1_stage_shape": "Every case declares `expected_stage`. A case that expects the objection to fire at `reception` carries no price, no package and no offer anywhere in it, and stops within a couple of turns of the refusal. Do not clean these into offer-stage dialogues: the population this criterion exists to catch is the customer who is turned away before anything is quoted.",
+    "2_asr_damage": "Cases marked `noisy` carry production ASR damage: a mid-turn truncation (a turn that ends in `-`), at least one misrecognised token listed in `misrecognitions`, and an `[[ASR_GAP]]` marker. The gap sits between the customer's request and the agent's refusal, so no quote can bridge it — `[[ASR_GAP]]` is a hard boundary for evidence and a judge that wants one tidy span covering both has to invent it. Not every case is noisy: the clean ones are what tell a prompt failure apart from an ASR-handling one.",
+    "3_partial_evidence": "`fragments.request` and `fragments.refusal` are the exact contiguous spans the two halves of the two-question test are identifiable from. Each is a strict substring of one turn — never a whole tidy sentence — they live in different turns, and in a noisy case they live on opposite sides of the gap. `refusal` is null on cases where no refusal of a sold product exists to find.",
+    "4_m4_pair": "The Module-4 pair is not in this file: it is built in `scripts/compare_day.py::m4_fixture_cases`, and its history blocks are rendered through `render_current_history` so the judge sees the block production renders today. The two cases differ only in the direction and content of that block."
+  },
+  "how_to_run": "These are prompt-behaviour cases: they need the live judge and cannot run in a unit test. `python scripts/compare_day.py --m3-fixtures --out <dir>` runs them once through the real model when DEEPSEEK_API_KEY is set and writes m3_fixtures.md; add `--repeat 3` to run every case three times and report the per-case majority alongside all three outputs, which is how a margin effect on a borderline case is told from a stable verdict. The report also prints the `stage_reached` each run chose, which is what makes a stage-gating failure visible instead of showing up only as a null. `tests/test_m3_fixtures.py` checks the file itself - schema, uniqueness, the fixture policy above, and that every case clears the speech gate - without calling anything.",
+  "reading_the_expectation": "`expect.unavailable_service_objection` is either \"null\" (the objection must NOT fire) or \"scored\" (it must carry a number). `expect.refusal_check` is the value agent_refused_or_declared_unavailable must hold. `expected_stage` is the stage the transcript actually reaches; it is asserted about the FIXTURE's shape offline and reported next to each run, not used as a pass/fail gate on the model. Other criteria are named in `also_expected` as commentary only.",
+  "cases": [
+    {
+      "id": "hr_routing",
+      "stands_for": "0aa8273b",
+      "day13_outcome": "v4 wrongly fired the objection (scored 15)",
+      "pattern": "job application / HR routing — a job seeker is not a customer buying a trip",
+      "exclusion_rule": 1,
+      "input_type": "call_transcript",
+      "expected_stage": "reception",
+      "noisy": false,
+      "conversation": "[00:00] AGENT: ألو مساء الخير، معك سعود من ترافل جيت للسفر والسياحة، تفضلي\n[00:06] CUSTOMER: مساء النور، أنا حابة أعرف عن الوظائف المتاحة عندكم وكيف أقدم عليها\n[00:14] AGENT: الاتش آر هم اللي ينزلون الوظائف المطلوبة على بروفايل الشركة، حضرتك ادخلي عليه عشان تعرفي إيه الوظائف وإيه المتطلبات\n[00:26] CUSTOMER: تمام، الله يعطيك العافية، شكرا لك\n",
+      "fragments": {
+        "request": "أعرف عن الوظائف المتاحة عندكم",
+        "refusal": null
+      },
+      "expect": {
+        "unavailable_service_objection": "null",
+        "refusal_check": false
+      },
+      "why": "The caller never asked to buy a tourism product. Directing her to the HR portal is correct routing, not a declaration that a trip is unavailable. Stage stays `reception` and must not be a reason to score or to skip anything."
+    },
+    {
+      "id": "supplier_price_disclaimer",
+      "stands_for": "596c957a",
+      "day13_outcome": "v4 wrongly fired the objection (scored 25)",
+      "pattern": "agent cannot control airline pricing but keeps selling — the service was offered, only the price was disclaimed",
+      "exclusion_rule": 4,
+      "input_type": "call_transcript",
+      "expected_stage": "negotiation",
+      "noisy": false,
+      "conversation": "[00:00] AGENT: أهلا وسهلا، معك خالد من ترافل جيت، تفضل\n[00:05] CUSTOMER: أبغى تذكرة من الرياض إلى دبي ذهاب وعودة لشخصين\n[00:12] AGENT: تمام، التذكرة ذهاب وعودة للشخص بألفين ومية ريال في التواريخ اللي طلبتها\n[00:20] CUSTOMER: ألفين ومية؟ غالية شوي صراحة\n[00:25] AGENT: والله أنا مش بقدر أتحكم في أسعار الطيران، بس أقدر أشوف لك تواريخ ثانية أرخص وأجهز لك باكج شامل الفندق\n[00:37] CUSTOMER: طيب شوف لي وأرد عليك\n",
+      "fragments": {
+        "request": "تذكرة من الرياض إلى دبي",
+        "refusal": null
+      },
+      "expect": {
+        "unavailable_service_objection": "null",
+        "refusal_check": false
+      },
+      "also_expected": "price_objection is scored — the agent quoted, the customer pushed back. That is the objection that arose, and the stage rule for it still holds: `negotiation`.",
+      "why": "The flight is still on sale and alternatives are offered in the same turn. Declining responsibility for a supplier's price is not declaring the product unavailable."
+    },
+    {
+      "id": "no_branch_in_this_city",
+      "stands_for": "bb02b597",
+      "day13_outcome": "v4 wrongly fired the objection (scored 0) on a bare \"لا والله\"",
+      "pattern": "office / branch absence — where the company has premises is not a product it sells",
+      "exclusion_rule": 2,
+      "input_type": "call_transcript",
+      "expected_stage": "reception",
+      "noisy": true,
+      "misrecognitions": [
+        "جدت"
+      ],
+      "conversation": "[00:00] AGENT: ترافل جيت، مساء الخير، معك محم-\n[00:04] CUSTOMER: مساء النور، أنا ساكن في جدت، عندكم فرع هنا أقدر أجيكم في-\n[00:11] CUSTOMER: يعني مكتب في المدينة أقدر أزوره وأخلص فيه؟\n[[ASR_GAP]]\n[00:19] AGENT: لا والله، فروعنا كلها في الرياض فقط، فرع الروضة وفرع الحمراء\n[00:27] CUSTOMER: طيب ما فيها مشكلة، نكمل على التليفون والواتساب\n[00:33] AGENT: أبشر، عشان أجهز لك العرض أبغى أعرف الوجهة والتواريخ وعدد المسافرين\n",
+      "fragments": {
+        "request": "مكتب في المدينة أقدر أزوره",
+        "refusal": "فروعنا كلها في الرياض فقط"
+      },
+      "expect": {
+        "unavailable_service_objection": "null",
+        "refusal_check": false
+      },
+      "why": "\"لا والله\" answers a question about branches, and it now answers it across an ASR gap, so nothing can be quoted as one span from request to answer. The trip was never requested and never refused; the agent moves straight on to qualifying it."
+    },
+    {
+      "id": "denies_the_price_is_high",
+      "stands_for": "bb68337f",
+      "day13_outcome": "v4 wrongly fired the objection (scored 0) alongside price_objection 25→0, compounding to −38.5",
+      "pattern": "denying the price is high / saying no cheaper option exists — this is the ANSWER to a price objection, not a service refusal",
+      "exclusion_rule": 5,
+      "input_type": "call_transcript",
+      "expected_stage": "negotiation",
+      "noisy": false,
+      "conversation": "[00:00] AGENT: عرض تركيا لأربعة أشخاص ستة أيام بأحد عشر ألف ريال شامل الفندق والتذاكر والتنقلات\n[00:14] CUSTOMER: أحد عشر ألف؟ إنتوا غاليين شوي مقارنة بغيركم\n[00:21] AGENT: لا والله ولا غاليين ولا حاجة، ده أفضل سعر في السوق وما في أرخص من كذا\n[00:31] CUSTOMER: طيب خليني أفكر وأرد عليك\n",
+      "fragments": {
+        "request": "عرض تركيا لأربعة أشخاص ستة أيام",
+        "refusal": null
+      },
+      "expect": {
+        "unavailable_service_objection": "null",
+        "refusal_check": false
+      },
+      "also_expected": "price_objection is scored, and low — the agent neither asked why nor defended the value. thinking_time_objection is scored too: an explicit deferral after an offer. Both require `negotiation`, and this case is at `negotiation`.",
+      "why": "Counting the same complaint twice, once as price and once as unavailability, drags Module 3 to zero from both ends on a single customer sentence."
+    },
+    {
+      "id": "third_party_online_booking",
+      "stands_for": "1583ff50",
+      "day13_outcome": "v4 correctly DROPPED an objection the old run had scored — this fixture locks that drop in",
+      "pattern": "support for a booking made elsewhere — declining to service someone else's sale",
+      "exclusion_rule": 3,
+      "input_type": "call_transcript",
+      "expected_stage": "reception",
+      "noisy": false,
+      "conversation": "[00:00] AGENT: ألو ترافل جيت، معك عبدالله، تفضل\n[00:05] CUSTOMER: أنا حاجز تذكرة من موقع ثاني على النت وأبغى أغير تاريخ السفر\n[00:14] AGENT: للأسف الحجز ده مش من عندنا، لازم تتواصل مع الشركة اللي حجزت منها، هم اللي يقدروا يعدلوه لك\n[00:26] CUSTOMER: تمام فهمت، الله يعطيك العافية\n",
+      "fragments": {
+        "request": "حاجز تذكرة من موقع ثاني",
+        "refusal": null
+      },
+      "expect": {
+        "unavailable_service_objection": "null",
+        "refusal_check": false
+      },
+      "why": "The customer is not trying to buy anything. Referring him back to the seller of an existing third-party booking is the correct answer, and there is no offer to score. `reception` is the honest stage and is not a reason to drop the module."
+    },
+    {
+      "id": "third_party_airline_booking",
+      "stands_for": "303c297b",
+      "day13_outcome": "v4 correctly DROPPED an objection the old run had scored — this fixture locks that drop in",
+      "pattern": "support for a booking made direct with the airline",
+      "exclusion_rule": 3,
+      "input_type": "call_transcript",
+      "expected_stage": "reception",
+      "noisy": true,
+      "misrecognitions": [
+        "الحطوط"
+      ],
+      "conversation": "[00:00] AGENT: أهلين، معك سارة من ترافل جيت، تفض-\n[00:04] CUSTOMER: تذكرتي اتأجلت وأبغى أعرف وش أس-\n[00:12] CUSTOMER: أنا حجزتها من الحطوط مباشرة مو من عندكم أصلا\n[[ASR_GAP]]\n[00:20] AGENT: احنا ما نقدر نتابع حجز محجوز من الخطوط مباشرة\n[00:28] AGENT: خدمة عملاء الخطوط هم اللي يعدلونه لك\n[00:34] CUSTOMER: أوكي مشكورة، مع السلامة\n",
+      "fragments": {
+        "request": "حجزتها من الحطوط مباشرة",
+        "refusal": "ما نقدر نتابع حجز محجوز من الخطوط مباشرة"
+      },
+      "expect": {
+        "unavailable_service_objection": "null",
+        "refusal_check": false
+      },
+      "why": "Same pattern as the case above, on the airline side, and now at `reception` with production ASR damage. Nothing this company sells was requested or refused — this is the case that fails first if removing the stage gate has turned every early no into an objection."
+    },
+    {
+      "id": "discount_refused",
+      "stands_for": "eacba4ad",
+      "day13_outcome": "v4 correctly DROPPED an objection the old run had scored — this fixture locks that drop in",
+      "pattern": "refusing a discount — the trip itself was never refused",
+      "exclusion_rule": 6,
+      "input_type": "call_transcript",
+      "expected_stage": "negotiation",
+      "noisy": false,
+      "conversation": "[00:00] AGENT: باكج مسقط خمس ليالي بأربعة آلاف ريال شامل الفندق والفطور والتنقلات\n[00:12] CUSTOMER: ما في خصم؟ نزل لي مية ريال وأحجز طول\n[00:19] AGENT: لا والله ما نقدر ننزل أكثر من كذا، السعر ده صافي وما عليه عمولة\n[00:28] CUSTOMER: طيب خليني أشوف وأرجعلك\n",
+      "fragments": {
+        "request": "باكج مسقط خمس ليالي",
+        "refusal": null
+      },
+      "expect": {
+        "unavailable_service_objection": "null",
+        "refusal_check": false
+      },
+      "also_expected": "price_objection is scored — the customer pushed back on a quoted price and asked for a reduction.",
+      "why": "The package remained available at its price throughout. A refused discount is a price outcome, and the prompt has excluded it since v3."
+    },
+    {
+      "id": "positive_control_bare_route_refusal",
+      "stands_for": "none — positive control",
+      "day13_outcome": "n/a",
+      "pattern": "a genuine categorical refusal of a tourism product, with no alternative offered",
+      "exclusion_rule": null,
+      "input_type": "call_transcript",
+      "expected_stage": "reception",
+      "noisy": false,
+      "conversation": "[00:00] AGENT: ترافل جيت، أهلا وسهلا، معك فهد\n[00:04] CUSTOMER: أبغى تذكرة من الرياض إلى عدن الأسبوع الجاي لشخصين\n[00:12] AGENT: لا والله ما عندنا رحلات إلى عدن، ولا بنقدم الوجهة دي أصلا\n[00:20] CUSTOMER: يعني ما فيه أي طريقة أسافر معكم؟\n[00:25] AGENT: لا ما فيه، عدن مو ضمن وجهاتنا نهائيا\n[00:31] CUSTOMER: خلاص ما عليه، مع السلامة\n",
+      "fragments": {
+        "request": "تذكرة من الرياض إلى عدن",
+        "refusal": "ما عندنا رحلات إلى عدن"
+      },
+      "expect": {
+        "unavailable_service_objection": "scored",
+        "refusal_check": true
+      },
+      "also_expected": "scored 0 — a bare refusal with no apology, referral or alternative.",
+      "why": "The exclusion list must not teach the judge that the objection never fires. A named destination requested and categorically refused is exactly what it is for — and the whole call stays at `reception`, because nothing was ever quoted. Under v5 that alone was enough to drop the module."
+    },
+    {
+      "id": "positive_control_refusal_with_alternative",
+      "stands_for": "none — positive control",
+      "day13_outcome": "n/a",
+      "pattern": "a genuine categorical refusal handled well, on a call that DOES reach an offer — the stage-gated control for the round-4 change",
+      "exclusion_rule": null,
+      "input_type": "call_transcript",
+      "expected_stage": "negotiation",
+      "noisy": false,
+      "conversation": "[00:00] AGENT: ترافل جيت، مساء الخير، معك ريم\n[00:04] CUSTOMER: أبغى باكج أثينا لشخصين في شهر تسعة\n[00:11] AGENT: للأسف أثينا مش متاحة عندنا حاليا ولا بنسيّرها، بس عندي باكج إسطنبول ستة أيام بسبعة آلاف ريال شامل الفندق والتنقلات\n[00:28] CUSTOMER: سبعة آلاف؟ غالي مقارنة باللي شفته على النت\n[00:35] AGENT: السعر ده شامل كل شي وما عليه رسوم إضافية، وأقدر أرسل لك التفاصيل الآن\n[00:46] CUSTOMER: طيب أرسلي لي وأشوفها\n",
+      "fragments": {
+        "request": "باكج أثينا لشخصين",
+        "refusal": "أثينا مش متاحة عندنا حاليا"
+      },
+      "expect": {
+        "unavailable_service_objection": "scored",
+        "refusal_check": true
+      },
+      "also_expected": "scored high — immediate, honest, redirected to a viable alternative in the same turn. price_objection is scored as well, and `stage_reached` is `negotiation`: this is the case that fails if round 4's un-gating has been read as \"Module 3 belongs to reception calls\".",
+      "why": "Every other scored case in this file now stops at `reception`, which is the shape the real false negatives had. One scored case must still reach an offer and be argued over, or the suite would pass a prompt that had simply moved the blind spot to the other end."
+    },
+    {
+      "id": "destination_refusal_with_sold_redirect",
+      "stands_for": "e779317b",
+      "day13_outcome": "v4.1 wrongly WITHDREW the objection the old run had scored - the agent refused Turkey groups and offered Azerbaijan, and the withdrawal cost the agent 94.2 -> 69.8",
+      "pattern": "a destination this company sells is refused and the customer is redirected to another destination this company sells, on a call that never reaches a price - the redirect is the HANDLING, not a reason the refusal never happened",
+      "exclusion_rule": null,
+      "input_type": "call_transcript",
+      "expected_stage": "reception",
+      "noisy": true,
+      "misrecognitions": [
+        "قروبات"
+      ],
+      "conversation": "[00:00] AGENT: ألو ترافل جيت مساء الخير، معك ناص-\n[00:05] CUSTOMER: مساء النور، احنا قروبات عشرة أشخاص وناويين تركيا شهر عش-\n[00:14] CUSTOMER: يعني برنامج جروبات لتركيا، عندكم شي فيها؟\n[[ASR_GAP]]\n[00:23] AGENT: تركيا الجروبات وقفناها هالسنة، ما عندنا فيها شي أبدا\n[00:31] CUSTOMER: طيب وش عندكم يعني\n[00:34] AGENT: عندنا جروبات أذربيجان باكو شغالة بنفس الفترة، أقدر أشوف لك التفاصيل وأرجع لك\n[00:45] CUSTOMER: طيب شوف لي وأنا أنتظر منك\n",
+      "fragments": {
+        "request": "برنامج جروبات لتركيا",
+        "refusal": "تركيا الجروبات وقفناها هالسنة"
+      },
+      "expect": {
+        "unavailable_service_objection": "scored",
+        "refusal_check": true
+      },
+      "also_expected": "scored 25 - the refusal is immediate and honest, and a viable company-sold alternative is named in the same turn. The COUNTERWEIGHT paragraph is what keeps it numeric; the round-4 stage rules are what let it be reached at all.",
+      "why": "The exclusion list says nothing about alternatives, but v4.1 was read as though it did. Nothing here is priced, nothing is packaged and the call ends with the agent going away to look - the real call's shape. The customer asked for Turkey groups and cannot have them; that is the objection, and how the agent redirected is the score."
+    },
+    {
+      "id": "visa_assistance_refusal",
+      "stands_for": "174898da",
+      "day13_outcome": "v4.1 wrongly WITHDREW the objection - a visa is named in the prompt's own list of tourism products. The withdrawal RAISED the call 47.7 -> 88.8 by nulling Module 3 out of the denominator. v5 did not fix it: Module 3 was dropped on STAGE grounds before the exclusion list was read",
+      "pattern": "visa assistance refused outright on a call that never reaches an offer - the exact shape v5 could not score",
+      "exclusion_rule": null,
+      "input_type": "call_transcript",
+      "expected_stage": "reception",
+      "noisy": true,
+      "misrecognitions": [
+        "بريطاليا"
+      ],
+      "conversation": "[00:00] AGENT: ترافل جيت، أهلا وسهلا، معك من-\n[00:04] CUSTOMER: أنا ناوية أسافر بريطاليا للدراسة وأبغى مساعدة في التأشي-\n[00:13] CUSTOMER: يعني ملف التأشيرة والتقديم عليها، تشتغلون فيها عندكم؟\n[[ASR_GAP]]\n[00:22] AGENT: لا والله، التأشيرات ما نشتغل فيها احنا نهائيا\n[00:29] AGENT: ولا فرع من فروعنا يقدمها، دوري لك على مكتب ثاني\n[00:37] CUSTOMER: طيب حتى لو أدفع رسوم زيادة عندكم؟\n[00:41] AGENT: لا ما ينفع، احنا ما نقدم الخدمة دي أصلا\n[00:47] CUSTOMER: طيب الله يعطيك العافية\n",
+      "fragments": {
+        "request": "ملف التأشيرة والتقديم عليها",
+        "refusal": "التأشيرات ما نشتغل فيها احنا نهائيا"
+      },
+      "expect": {
+        "unavailable_service_objection": "scored",
+        "refusal_check": true
+      },
+      "also_expected": "scored 15 at best - the refusal is categorical and the referral is vague, with no named alternative. This is the case the round exists for: nothing is ever quoted, so `stage_reached` is `reception` and under v5 the module was dropped before the refusal was ever considered.",
+      "why": "The prompt's own trigger names a visa as a tourism product. The customer asks twice, including offering to pay, and is refused twice. Nothing here is a price, a package or an offer - and that must not be a reason to withdraw the objection."
+    },
+    {
+      "id": "airport_transfer_refusal",
+      "stands_for": "none - counterweight control (airport transfer vs call transfer)",
+      "day13_outcome": "n/a",
+      "pattern": "airport / ground transfer refused before anything is quoted - a sold tourism service, and NOT the administrative call transfer excluded by item 6",
+      "exclusion_rule": null,
+      "input_type": "call_transcript",
+      "expected_stage": "reception",
+      "noisy": true,
+      "misrecognitions": [
+        "المتار"
+      ],
+      "conversation": "[00:00] AGENT: مساء الخير، ترافل جيت، معك سلط-\n[00:04] CUSTOMER: أنا ناوي أسافر دبي وأبغى استقبال وتوصيل من المتار للفن-\n[00:13] CUSTOMER: يعني توصيلة من المطار للفندق ورجعة، توفرونها؟\n[[ASR_GAP]]\n[00:22] AGENT: لا، الاستقبال والتوصيل من المطار ما نوفره في دبي أبدا\n[00:31] CUSTOMER: طيب ما فيه أي حل عندكم؟\n[00:35] AGENT: لا ما فيه، دبروا حالكم بتاكسي\n[00:40] CUSTOMER: أوكي، الله يعطيك العافية\n",
+      "fragments": {
+        "request": "توصيلة من المطار للفندق ورجعة",
+        "refusal": "التوصيل من المطار ما نوفره في دبي أبدا"
+      },
+      "expect": {
+        "unavailable_service_objection": "scored",
+        "refusal_check": true
+      },
+      "also_expected": "scored 0 - the agent tells the customer to sort their own taxi out, with no apology and no company alternative.",
+      "why": "Exclusion item 6 excludes refusing to TRANSFER THE PHONE CALL. An airport transfer is a ground-transport product this company sells, and the two share an English word and nothing else. This case and `phone_call_transfer_refused` are a matched pair: if the judge gets one right and the other wrong, it has confused the two senses."
+    },
+    {
+      "id": "travel_insurance_refusal",
+      "stands_for": "none - counterweight control",
+      "day13_outcome": "n/a",
+      "pattern": "travel insurance refused - a sold tourism service, not an administrative accommodation",
+      "exclusion_rule": null,
+      "input_type": "call_transcript",
+      "expected_stage": "reception",
+      "noisy": false,
+      "conversation": "[00:00] AGENT: ألو ترافل جيت، معك ريما، تفضلي\n[00:04] CUSTOMER: أبغى تأمين سفر طبي يغطي الرحلة كلها، تصدرونه عندكم؟\n[00:15] AGENT: للأسف تأمين السفر ما نصدره ولا نبيعه عندنا، ما نقدر نساعدك فيه\n[00:26] CUSTOMER: طيب أسوي كيف؟\n[00:29] AGENT: والله ما أدري، دوري لك على شركة تأمين\n[00:35] CUSTOMER: طيب الله يعطيك العافية\n",
+      "fragments": {
+        "request": "تأمين سفر طبي يغطي الرحلة كلها",
+        "refusal": "تأمين السفر ما نصدره ولا نبيعه عندنا"
+      },
+      "expect": {
+        "unavailable_service_objection": "scored",
+        "refusal_check": true
+      },
+      "also_expected": "scored 0 - \"and I don't know\" is neither an apology nor a referral nor an alternative.",
+      "why": "Travel insurance sits beside the visa in the counterweight paragraph for the same reason: it is an add-on the company sells, and refusing it is refusing a product, not declining a favour. Nothing was quoted, so the call ends at `reception` — kept clean on purpose, so that a failure here cannot be blamed on ASR damage."
+    },
+    {
+      "id": "phone_call_transfer_refused",
+      "stands_for": "none - boundary control for the counterweight",
+      "day13_outcome": "n/a",
+      "pattern": "refusing to TRANSFER THE PHONE CALL to another department - the administrative action excluded by item 6, and the trip is still on offer",
+      "exclusion_rule": 6,
+      "input_type": "call_transcript",
+      "expected_stage": "reception",
+      "noisy": false,
+      "conversation": "[00:00] AGENT: ترافل جيت، صباح الخير، معك بدر، تفضل\n[00:05] CUSTOMER: ممكن تحولني على قسم المحاسبة؟ أبغى أكلم واحد منهم بالتليفون\n[00:16] AGENT: لا ما أقدر أحولك، التحويل الداخلي موقوف عندنا، بس قول لي وش تبغى وأنا أخدمك\n[00:30] CUSTOMER: أبغى أعرف باكج جدة أسطنبول لأربعة أشخاص\n[00:38] AGENT: تمام، أجهز لك العرض وأرسله لك اليوم\n[00:44] CUSTOMER: الله يعطيك العافية\n",
+      "fragments": {
+        "request": "تحولني على قسم المحاسبة",
+        "refusal": null
+      },
+      "expect": {
+        "unavailable_service_objection": "null",
+        "refusal_check": false
+      },
+      "also_expected": "no objection of any kind - the customer never pushed back on anything the company sells.",
+      "why": "The counterweight must not be read as 'every refusal now fires', and round 4 makes that risk sharper: with the stage gate gone, a `reception` call that contains the word 'no' is the easiest thing in the world to over-score. Refusing an internal call transfer is exclusion item 6 exactly as written, and the agent goes straight on to quoting the package."
+    }
+  ],
+  "counterweight_cases": "Five cases were added in PR2 round 3 against the v5 COUNTERWEIGHT paragraph. Four must FIRE the objection: the two real v4.1 false negatives (e779317b, 174898da) plus the two products the counterweight names explicitly (airport/ground transfer, travel insurance). The fifth, `phone_call_transfer_refused`, must NOT fire: it is the boundary that stops the counterweight being read as 'every refusal counts', and it deliberately uses the same English word as the airport-transfer case.",
+  "round4_cases": "Round 4 rebuilt the file rather than adding to it. Five cases are now noisy, five scored cases now stop at `reception` with nothing priced — the shape `174898da` has and every clean v5 fixture lacked — and `positive_control_refusal_with_alternative` was moved the other way, to a call that does reach an offer and does get argued over, so that a prompt which merely relocated the blind spot from reception to negotiation fails here."
+}

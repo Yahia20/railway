@@ -74,7 +74,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO call_ingest_jobs (uniqueid, filename, audio_uri, meta, status, last_error)\nVALUES ($1, $2, $3, $4::jsonb,\n        CASE WHEN coalesce(($4::jsonb->>'size_bytes')::bigint, 999999) < 1024\n             THEN 'dead_letter' ELSE 'discovered' END,\n        CASE WHEN coalesce(($4::jsonb->>'size_bytes')::bigint, 999999) < 1024\n             THEN 'audio_too_small: WAV under 1KB is a header with no audio' END)\nON CONFLICT (uniqueid) DO UPDATE\n  SET filename  = EXCLUDED.filename,\n      audio_uri = EXCLUDED.audio_uri,\n      meta      = EXCLUDED.meta,\n      updated_at = now()\n  WHERE call_ingest_jobs.meta = '{}'::jsonb;",
+        "query": "-- lease-exempt: this is the row's FIRST appearance. There is no lease to\n-- carry yet, and the ON CONFLICT clause only refreshes Drive metadata on a\n-- row whose meta is still '{}' -- it can never touch status or a lease.\nINSERT INTO call_ingest_jobs (uniqueid, filename, audio_uri, meta, status, last_error)\nVALUES ($1, $2, $3, $4::jsonb,\n        CASE WHEN coalesce(($4::jsonb->>'size_bytes')::bigint, 999999) < 1024\n             THEN 'dead_letter' ELSE 'discovered' END,\n        CASE WHEN coalesce(($4::jsonb->>'size_bytes')::bigint, 999999) < 1024\n             THEN 'audio_too_small: WAV under 1KB is a header with no audio' END)\nON CONFLICT (uniqueid) DO UPDATE\n  SET filename  = EXCLUDED.filename,\n      audio_uri = EXCLUDED.audio_uri,\n      meta      = EXCLUDED.meta,\n      updated_at = now()\n  WHERE call_ingest_jobs.meta = '{}'::jsonb\nRETURNING uniqueid, status, last_error;",
         "options": {
           "queryReplacement": "={{ [ $json.external_id, $json.filename, $json.audio_uri, JSON.stringify($json) ] }}"
         }
@@ -84,21 +84,24 @@
           "id": "eYWvPxQFAwKs0bOu",
           "name": "railway-pg (api)"
         }
-      }
+      },
+      "notes": "A leaf: discovery no longer feeds the claim. The claim hangs off its own branch from the trigger, because chaining it here meant a Drive listing that returned zero recordings emitted zero items and the whole queue stopped draining -- the backlog would sit still on any quiet day. RETURNING is for the run log: without it every execution reports {success:true} and you cannot see what was registered."
     },
     {
-      "id": "claim-work",
-      "name": "Claim work",
+      "id": "recover-expired-leases",
+      "name": "Recover expired leases",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        680,
-        300
+        20,
+        620
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- One claim per run, bounded. Statuses re-enter the queue on failure with a\n-- retry budget; nothing is ever silently skipped forever (the old is_new gate\n-- stranded stored-but-unevaluated calls, and the old watermark missed whole\n-- day folders uploaded behind it). Failed jobs cool off 45 minutes before\n-- re-claim: the free ASR Space throttles under rapid repeat batches, and\n-- without the cool-down a temporary throttle burns the retry budget of the\n-- whole backlog in an hour while fresh work is starved.\nUPDATE call_ingest_jobs j\nSET updated_at = now()\nWHERE j.uniqueid IN (\n  SELECT uniqueid FROM call_ingest_jobs\n  WHERE meta <> '{}'::jsonb\n    AND (\n      status IN ('discovered','transcribed')\n      OR (status IN ('asr_failed','judge_failed')\n          AND retries < 5\n          AND updated_at < now() - interval '45 minutes')\n    )\n  ORDER BY discovered_at\n  LIMIT 25\n)\nRETURNING j.uniqueid, j.filename, j.audio_uri, j.meta, j.retries, j.status;",
-        "options": {}
+        "query": "-- lease-exempt: this IS the lease breaker. Matching on claim_token would\n-- defeat its only purpose, which is to reclaim rows from workers that are\n-- gone. It is safe because it only touches rows whose claim_until has\n-- already passed, and it clears the token as it goes.\n-- Give back the work of executions that died holding a lease.\n--\n-- 'transcribing' and 'evaluating' mean \"a worker holds this row right now\".\n-- If the worker crashed, was cancelled, or hung past claim_until, nothing else\n-- would ever pick the row up again: it is not 'discovered', not failed, and\n-- not terminal, so no claim predicate matches it. That is a permanent loss of\n-- exactly the kind 008 exists to prevent, and it is invisible -- the row looks\n-- busy forever.\n--\n-- Recovery puts the row back in the stage-appropriate failed state so the\n-- normal retry budget applies, and only dead-letters it once that budget is\n-- spent. The cooldown is the same 45 minutes the failure paths use: a run that\n-- died because the ASR Space was throttling must not be re-claimed instantly.\n--\n-- The attempt was already counted at claim time, so recovery does not count it\n-- again -- that is the whole point of counting at claim: a worker that dies\n-- without writing anything still spent an attempt, and a poison row cannot be\n-- claimed forever.\n--\n-- $1 = cooldown minutes, $2 = max attempts per stage.\nUPDATE call_ingest_jobs j\nSET status = CASE\n      WHEN j.status = 'transcribing' AND j.asr_attempts   >= $2 THEN 'dead_letter'\n      WHEN j.status = 'evaluating'   AND j.judge_attempts >= $2 THEN 'dead_letter'\n      WHEN j.status = 'transcribing'                            THEN 'asr_failed'\n      ELSE                                                           'judge_failed'\n    END,\n    last_error = left('lease_expired: held as ' || j.status\n                      || ' by token ' || coalesce(j.claim_token::text, 'none')\n                      || ', lease ended ' || to_char(j.claim_until, 'YYYY-MM-DD HH24:MI:SSOF')\n                      || ' (asr_attempts=' || j.asr_attempts\n                      || ', judge_attempts=' || j.judge_attempts || ')', 500),\n    next_attempt_at = now() + ($1 * interval '1 minute'),\n    retries       = j.retries + 1,\n    claim_token   = NULL,\n    claimed_at    = NULL,\n    claim_until   = NULL,\n    updated_at    = now()\nWHERE j.status IN ('transcribing', 'evaluating')\n  AND j.claim_until IS NOT NULL\n  AND j.claim_until < now()\nRETURNING j.uniqueid, j.status, j.asr_attempts, j.judge_attempts, j.last_error;",
+        "options": {
+          "queryReplacement": "={{ [ 45, 5 ] }}"
+        }
       },
       "credentials": {
         "postgres": {
@@ -106,7 +109,98 @@
           "name": "railway-pg (api)"
         }
       },
-      "executeOnce": true
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "notes": "Hangs off the trigger on its own branch rather than off the discovery chain. With executionOrder v1 the topmost branch runs first, so discovery still completes before anything is claimed -- but a listing that returns zero recordings can no longer stop the queue from draining the backlog, which is what happens when the claim is chained behind a node that emitted no items. Always Output Data for the same reason: recovering nothing is the normal case."
+    },
+    {
+      "id": "claim-work",
+      "name": "Claim work",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        240,
+        620
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: this is where the lease is TAKEN. It selects only rows with\n-- claim_until IS NULL and stamps a fresh token under FOR UPDATE SKIP LOCKED.\n-- Atomically take ownership of a bounded batch of work.\n--\n-- The old version only stamped updated_at. Two overlapping executions -- the\n-- schedule fires every 15 minutes and a batch of 25 recordings routinely runs\n-- longer than that -- therefore selected the SAME rows and both transcribed and\n-- both judged them: double Cohere spend, double DeepSeek spend, and two\n-- writers racing for one transcripts row.\n--\n-- What makes this claim safe:\n--   FOR UPDATE SKIP LOCKED  a concurrent claim walks past locked candidates\n--                           instead of blocking on them or taking them.\n--   status -> transcribing / evaluating\n--                           the row is visibly in flight, so it matches no\n--                           claim predicate until it is released or its lease\n--                           expires and the recovery sweep reopens it.\n--   claim_token             stamped here and required by every terminal write,\n--                           so an execution that lost its lease cannot\n--                           overwrite whoever picked the work up afterwards.\n--   per-stage attempts      incremented for the stage actually being entered,\n--                           so a judge bug can no longer burn the ASR retry\n--                           budget of the whole backlog.\n--\n-- previous_status is returned alongside work_stage because the failure paths\n-- need to know which stage they are failing, and this node's output is the\n-- authoritative copy of that for the rest of the run.\n--\n-- $1 = batch size, $2 = lease seconds, $3 = max attempts per stage.\nWITH candidates AS (\n  SELECT j.uniqueid,\n         j.status AS previous_status\n  FROM call_ingest_jobs j\n  WHERE j.meta <> '{}'::jsonb\n    AND j.claim_until IS NULL\n    AND j.next_attempt_at <= now()\n    AND (\n          (j.status IN ('discovered', 'asr_failed')    AND j.asr_attempts   < $3)\n       OR (j.status IN ('transcribed', 'judge_failed') AND j.judge_attempts < $3)\n    )\n  ORDER BY j.next_attempt_at, j.discovered_at, j.uniqueid\n  FOR UPDATE SKIP LOCKED\n  LIMIT $1\n)\nUPDATE call_ingest_jobs j\nSET status = CASE WHEN c.previous_status IN ('discovered', 'asr_failed')\n                  THEN 'transcribing' ELSE 'evaluating' END,\n    asr_attempts   = j.asr_attempts\n                     + CASE WHEN c.previous_status IN ('discovered', 'asr_failed')\n                            THEN 1 ELSE 0 END,\n    judge_attempts = j.judge_attempts\n                     + CASE WHEN c.previous_status IN ('transcribed', 'judge_failed')\n                            THEN 1 ELSE 0 END,\n    claim_token = gen_random_uuid(),\n    claimed_at  = now(),\n    claim_until = now() + ($2 * interval '1 second'),\n    updated_at  = now()\nFROM candidates c\nWHERE j.uniqueid = c.uniqueid\nRETURNING j.uniqueid,\n          j.filename,\n          j.audio_uri,\n          j.meta,\n          j.interaction_id,\n          j.claim_token,\n          j.claim_until,\n          j.asr_attempts,\n          j.judge_attempts,\n          c.previous_status,\n          CASE WHEN c.previous_status IN ('discovered', 'asr_failed')\n               THEN 'transcribe' ELSE 'evaluate' END AS work_stage;",
+        "options": {
+          "queryReplacement": "={{ [ 6, 10800, 5 ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      },
+      "executeOnce": true,
+      "notes": "Batch 6, lease 10800 s (3 h), cap 5. The arithmetic, because a lease that expires while the work is still running is worse than no lease at all: n8n runs a node to completion over EVERY item before the next node starts, and 'Cohere Arabic ASR' batches at one item per 2.5 s with a 900 s timeout. Worst case for the last item of a batch of N is therefore N*(900+2.5) ASR + N*300 judge + DB. N=6 -> 5415 + 1800 + ~60 = 7275 s. 10800 s leaves ~48% margin. The old 25 x 900 s was 22562 s of ASR alone against a 900 s lease: every batch past the first item was unfenced by construction. 'Store call + transcript' and 'Begin judge attempt' renew the lease as the item moves between phases, so the 3 h only has to cover one phase, not the whole execution."
+    },
+    {
+      "id": "route-by-work-stage",
+      "name": "Route by work stage",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        460,
+        620
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "is-transcribe",
+                    "leftValue": "={{ $json.work_stage }}",
+                    "rightValue": "transcribe",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "transcribe"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "is-evaluate",
+                    "leftValue": "={{ $json.work_stage }}",
+                    "rightValue": "evaluate",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "evaluate"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "A job claimed as 'transcribed' or 'judge_failed' already HAS a stored transcript. Wiring those straight into the ASR node -- which is what the old workflow did -- meant every judge retry paid for a second transcription AND overwrote the transcript the retry was supposed to be re-reading. Unmatched items (an empty claim emits {success:true}) fall out here: no fallback output, so the run ends quietly."
     },
     {
       "id": "cohere-arabic-asr",
@@ -114,8 +208,8 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        900,
-        300
+        700,
+        460
       ],
       "parameters": {
         "method": "POST",
@@ -146,12 +240,12 @@
     },
     {
       "id": "transcript-usable",
-      "name": "Transcript usable?",
+      "name": "Transcript returned?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        1120,
-        300
+        920,
+        460
       ],
       "parameters": {
         "conditions": {
@@ -161,7 +255,7 @@
           },
           "conditions": [
             {
-              "leftValue": "={{ !$json.error && ($json.full_text || '').trim().length > 0 && ($json.confidence || 0) >= 0.7 }}",
+              "leftValue": "={{ !$json.error && ($json.full_text || '').trim().length > 0 }}",
               "rightValue": true,
               "operator": {
                 "type": "boolean",
@@ -173,30 +267,8 @@
           "combinator": "and"
         },
         "options": {}
-      }
-    },
-    {
-      "id": "mark-asr-failed",
-      "name": "Mark ASR failed",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "position": [
-        1340,
-        520
-      ],
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "UPDATE call_ingest_jobs\nSET status = CASE WHEN retries + 1 >= 5 THEN 'dead_letter' ELSE 'asr_failed' END,\n    retries = retries + 1,\n    last_error = left($2, 500),\n    updated_at = now()\nWHERE uniqueid = $1;",
-        "options": {
-          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, JSON.stringify({ error: $json.error || 'empty or low-confidence transcript', confidence: $json.confidence || 0, text_len: ($json.full_text || '').length }) ] }}"
-        }
       },
-      "credentials": {
-        "postgres": {
-          "id": "eYWvPxQFAwKs0bOu",
-          "name": "railway-pg (api)"
-        }
-      }
+      "notes": "Confidence is deliberately NOT tested here any more. The old gate asked `error || empty || confidence < 0.7` in one condition, so a transcript that was both red-quality and low-confidence was classified as a plain ASR failure BEFORE the asr_quality_status test could see it: never stored for audit, and retried against audio whose acoustics cannot change. This gate now asks one question -- did ASR return text worth storing at all?"
     },
     {
       "id": "store-call-and-transcript",
@@ -204,14 +276,14 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1340,
-        180
+        1140,
+        360
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH r AS (SELECT $1::jsonb AS meta, $2::jsonb AS tr),\nins AS (\n  INSERT INTO interactions (\n    external_source, external_id, channel, started_at, duration_seconds,\n    customer_phone_raw, customer_phone_e164, agent_id, handled_by\n  )\n  SELECT 'asterisk_drive', meta->>'uniqueid', 'phone_call'::channel,\n         (meta->>'started_at')::timestamptz,\n         round((tr->>'duration_seconds')::numeric)::int,\n         meta->>'customer_phone_raw', meta->>'customer_phone_e164',\n         -- 'q' recordings carry the QUEUE extension (3009), not a person.\n         -- Attributing them to an agent row makes every scorecard wrong.\n         CASE WHEN meta->>'kind' = 'q' THEN NULL\n              ELSE (SELECT agent_id FROM agents WHERE phone_extension = meta->>'agent_extension') END,\n         'agent'::speaker_role\n  FROM r\n  ON CONFLICT (external_source, external_id) DO UPDATE SET updated_at = now()\n  RETURNING interaction_id\n)\nINSERT INTO transcripts (\n  interaction_id, audio_uri, duration_seconds, sample_rate_hz, channels,\n  asr_provider, asr_model_version, asr_confidence, language,\n  full_text, segments, diarization, asr_metrics\n)\nSELECT ins.interaction_id, r.meta->>'audio_uri',\n       (r.tr->>'duration_seconds')::numeric,\n       (r.tr->>'sample_rate_hz')::int, (r.tr->>'channels')::int,\n       r.tr->>'provider', r.tr->>'model_version',\n       (r.tr->>'confidence')::numeric, 'ar',\n       r.tr->>'full_text', coalesce(r.tr->'segments', '[]'::jsonb),\n       r.tr->>'diarization', coalesce(r.tr->'asr_metrics', '{}'::jsonb)\nFROM ins, r\nON CONFLICT (interaction_id) DO UPDATE SET\n  full_text      = EXCLUDED.full_text,\n  segments       = EXCLUDED.segments,\n  asr_confidence = EXCLUDED.asr_confidence,\n  asr_metrics    = EXCLUDED.asr_metrics\nRETURNING interaction_id;",
+        "query": "-- Lease-fenced -- see the lease CTE below.\n--\n-- Three durable writes and one lease renewal that must not be able to happen\n-- apart, so they are one statement:\n--\n--   1. upsert the interaction\n--   2. upsert the transcript\n--   3. link the stored interaction_id onto the job row\n--   4. renew the lease, because the judge phase starts next\n--\n-- WHY THE FENCE. ASR is not deterministic and the model version moves. An\n-- execution whose lease expired and whose row was recovered and re-claimed by a\n-- newer worker used to be able to overwrite that worker's transcript here and\n-- only find out at the terminal UPDATE, which reported \"0 rows\" to nobody. The\n-- lease CTE is the whole guard: `r` selects FROM lease, so with no matching\n-- lease row `r` is empty, `ins` is empty, the transcripts INSERT is empty, the\n-- final UPDATE matches nothing, and the node returns zero rows. 'Transcript\n-- stored?' turns that into a hard stop.\n--\n-- WHY THE HANDOFF IS HERE. The old 'Link job transcribed' node set\n-- status = 'evaluating' and spent a judge attempt before the red/confidence\n-- gates had run, so every unusable transcript burned one of the five judge\n-- attempts without a judge ever being called. Linking and lease renewal happen\n-- here (they are facts about the transcript); the status change and the judge\n-- attempt happen in 'Begin judge attempt', after the quality gates.\n--\n-- ATOMIC AGAINST RECOVERY (round-2 blocker). The fence used to be an UNLOCKED\n-- `SELECT 1 FROM call_ingest_jobs WHERE ... claim_token = $token`. That reads a\n-- snapshot and then lets go: the recovery sweep could reclaim the row, and a\n-- newer worker re-claim it, in the window between that read and the upsert\n-- below, and the stale write still committed. The lease CTE now takes a real\n-- row lock with FOR UPDATE, and requires the lease to still be LIVE\n-- (claim_until > now()). Two orderings, both safe:\n--\n--   * recovery gets the lock first -> this statement BLOCKS on it, and when it\n--     is released Postgres re-evaluates the qualification against the NEW row\n--     version (EvalPlanQual). The token is gone, so the CTE yields no row, the\n--     dependent write is empty, and the node returns zero rows.\n--   * this statement gets the lock first -> recovery BLOCKS until we commit,\n--     then re-checks its own `claim_until < now()` predicate against what we\n--     wrote.\n--\n-- Postgres rule that dictates the SHAPE: a data-modifying CTE cannot see the\n-- effects of its sibling CTEs, and sub-statements all run on one snapshot. So\n-- the lock has to be what the write READS FROM, not a check standing beside it\n-- -- every dependent CTE below selects (transitively) from `lease`, and the\n-- final statement joins it. AS MATERIALIZED pins that: the CTE is evaluated\n-- once, first, and cannot be inlined into the readers.\n--\n-- Locking order for the whole workflow is documented in docs/PR1A-leases.md\n-- section 2 (\"Locking order\"). Short version: every statement takes\n-- call_ingest_jobs FIRST and, apart from the claim and the sweep, takes exactly\n-- ONE job row, by primary key; the claim uses SKIP LOCKED so it never waits.\nWITH lease AS MATERIALIZED (\n  SELECT j.uniqueid, j.claim_token\n  FROM call_ingest_jobs j\n  WHERE j.uniqueid    = $3\n    AND j.claim_token = $4::uuid\n    AND j.status IN ('transcribing')\n    AND j.claim_until > now()\n  FOR UPDATE\n),\nr AS (SELECT $1::jsonb AS meta, $2::jsonb AS tr FROM lease),\nins AS (\n  INSERT INTO interactions (\n    external_source, external_id, channel, started_at, duration_seconds,\n    customer_phone_raw, customer_phone_e164, agent_id, handled_by\n  )\n  SELECT 'asterisk_drive', meta->>'uniqueid', 'phone_call'::channel,\n         (meta->>'started_at')::timestamptz,\n         round((tr->>'duration_seconds')::numeric)::int,\n         meta->>'customer_phone_raw', meta->>'customer_phone_e164',\n         -- 'q' recordings carry the QUEUE extension (3009), not a person.\n         -- Attributing them to an agent row makes every scorecard wrong.\n         CASE WHEN meta->>'kind' = 'q' THEN NULL\n              ELSE (SELECT agent_id FROM agents WHERE phone_extension = meta->>'agent_extension') END,\n         'agent'::speaker_role\n  FROM r\n  ON CONFLICT (external_source, external_id) DO UPDATE SET updated_at = now()\n  RETURNING interaction_id\n),\nstored AS (\n  INSERT INTO transcripts (\n    interaction_id, audio_uri, duration_seconds, sample_rate_hz, channels,\n    asr_provider, asr_model_version, asr_confidence, language,\n    full_text, segments, diarization, asr_metrics\n  )\n  SELECT ins.interaction_id, r.meta->>'audio_uri',\n         (r.tr->>'duration_seconds')::numeric,\n         (r.tr->>'sample_rate_hz')::int, (r.tr->>'channels')::int,\n         r.tr->>'provider', r.tr->>'model_version',\n         (r.tr->>'confidence')::numeric, 'ar',\n         r.tr->>'full_text', coalesce(r.tr->'segments', '[]'::jsonb),\n         r.tr->>'diarization', coalesce(r.tr->'asr_metrics', '{}'::jsonb)\n  FROM ins, r\n  -- A re-transcription replaces EVERY value that came out of ASR, not just the\n  -- text. Leaving asr_provider / asr_model_version / duration behind next to\n  -- new segments produces a row that says it was produced by a run that did\n  -- not produce it, which is the version of this bug that survives review.\n  ON CONFLICT (interaction_id) DO UPDATE SET\n    audio_uri         = EXCLUDED.audio_uri,\n    duration_seconds  = EXCLUDED.duration_seconds,\n    sample_rate_hz    = EXCLUDED.sample_rate_hz,\n    channels          = EXCLUDED.channels,\n    asr_provider      = EXCLUDED.asr_provider,\n    asr_model_version = EXCLUDED.asr_model_version,\n    asr_confidence    = EXCLUDED.asr_confidence,\n    language          = EXCLUDED.language,\n    full_text         = EXCLUDED.full_text,\n    segments          = EXCLUDED.segments,\n    diarization       = EXCLUDED.diarization,\n    asr_metrics       = EXCLUDED.asr_metrics,\n    transcribed_at    = now()\n  RETURNING interaction_id\n)\nUPDATE call_ingest_jobs j\nSET interaction_id = stored.interaction_id,\n    claim_until    = now() + ($5 * interval '1 second'),\n    last_error     = NULL,\n    updated_at     = now()\nFROM stored, lease\nWHERE j.uniqueid    = lease.uniqueid\n  AND j.claim_token = lease.claim_token\nRETURNING j.uniqueid, j.interaction_id, j.status, j.judge_attempts;",
         "options": {
-          "queryReplacement": "={{ [ JSON.stringify($('Claim work').item.json.meta), JSON.stringify($('Cohere Arabic ASR').item.json) ] }}"
+          "queryReplacement": "={{ [ JSON.stringify($('Claim work').item.json.meta), JSON.stringify($('Cohere Arabic ASR').item.json), $('Claim work').item.json.uniqueid, $('Claim work').item.json.claim_token, 10800 ] }}"
         }
       },
       "credentials": {
@@ -219,39 +291,17 @@
           "id": "eYWvPxQFAwKs0bOu",
           "name": "railway-pg (api)"
         }
-      }
-    },
-    {
-      "id": "link-job-transcribed",
-      "name": "Link job transcribed",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "position": [
-        1560,
-        180
-      ],
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "UPDATE call_ingest_jobs\nSET status = 'transcribed', interaction_id = $2::uuid, updated_at = now()\nWHERE uniqueid = $1\nRETURNING interaction_id;",
-        "options": {
-          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, $json.interaction_id ] }}"
-        }
       },
-      "credentials": {
-        "postgres": {
-          "id": "eYWvPxQFAwKs0bOu",
-          "name": "railway-pg (api)"
-        }
-      }
+      "notes": "Lease-fenced, and it also links interaction_id onto the job and renews the lease -- one statement, so a transcript can never exist without the job row pointing at it. Returns zero rows when the lease is gone; 'Transcript stored?' is the hard stop for that. The old 'Link job transcribed' node is gone: its status change and judge-attempt increment moved to 'Begin judge attempt', which runs AFTER the quality gates."
     },
     {
-      "id": "asr-quality-red",
-      "name": "ASR quality red?",
+      "id": "transcript-stored",
+      "name": "Transcript stored?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        1670,
-        300
+        1360,
+        360
       ],
       "parameters": {
         "conditions": {
@@ -261,7 +311,7 @@
           },
           "conditions": [
             {
-              "leftValue": "={{ $('Cohere Arabic ASR').item.json.asr_quality_status === 'red' }}",
+              "leftValue": "={{ !!$json.uniqueid && !!$json.interaction_id && $json.status === 'transcribing' }}",
               "rightValue": true,
               "operator": {
                 "type": "boolean",
@@ -273,7 +323,65 @@
           "combinator": "and"
         },
         "options": {}
-      }
+      },
+      "notes": "A zero-row fencing result is a HARD STOP, not a quiet fall-through. 'Store call + transcript' returns nothing when this execution no longer owns the lease; without this gate n8n's {success:true} placeholder would flow into 'Load stored transcript' with an undefined interaction_id and become either a null-transcript route or a uuid cast error. The false output is deliberately a leaf: the row belongs to somebody else now, and the correct action is to touch nothing and let the owner finish."
+    },
+    {
+      "id": "load-stored-transcript",
+      "name": "Load stored transcript",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1580,
+        460
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The ONE renderer. Both paths converge here so that a judge retry scores a\n-- byte-identical transcript to the first run: the transcribe path reads back\n-- what it just wrote instead of rendering the ASR response itself.\n--\n-- It is deliberately equivalent to CallTranscript.as_dialogue()\n-- (services/worker/app/asr/cohere_arabic.py). The three places where the first\n-- version was NOT equivalent, all of which change what the judge reads:\n--\n--   1. Order.  Python iterates the segment LIST. Ordering by (s->>'seq')::int\n--      silently reordered a transcript whose seq was missing (NULL sorts last)\n--      or non-monotonic, and threw on a non-integer seq. WITH ORDINALITY\n--      preserves array order, which is what the reference does.\n--   2. Empty text.  Python skips only FALSEY text (NULL / ''). btrim(...) <> ''\n--      also dropped a whitespace-only segment that the reference keeps -- one\n--      more line of difference between first run and retry.\n--   3. Minutes.  lpad(x, 2, '0') TRUNCATES when x is longer than 2, so a call\n--      at 01:43:07 rendered as [10:07]. Python's {:02d} pads and never\n--      truncates. greatest(2, length(...)) reproduces that.\n--\n-- trunc() rather than floor() matches Python's int(); they differ only for a\n-- negative start_sec, which ASR does not emit (Segment.start_sec is a byte\n-- offset into the audio). Golden cases for all four live in\n-- scripts/sql/acceptance_pr1a.sql, section A10.\nSELECT $1::uuid                                        AS interaction_id,\n       (t.interaction_id IS NOT NULL)                  AS has_transcript,\n       coalesce((\n         SELECT string_agg(\n                  format('[%s:%s]%s %s',\n                         lpad(d.mm::text, greatest(2, length(d.mm::text)), '0'),\n                         lpad(d.ss::text, greatest(2, length(d.ss::text)), '0'),\n                         CASE WHEN d.speaker = 'unknown'\n                              THEN '' ELSE ' ' || upper(d.speaker) || ':' END,\n                         d.txt),\n                  E'\\n' ORDER BY d.ord)\n         FROM (\n           SELECT e.ord,\n                  coalesce(e.seg->>'text', '')                                  AS txt,\n                  coalesce(e.seg->>'speaker', 'unknown')                        AS speaker,\n                  trunc(coalesce((e.seg->>'start_sec')::numeric, 0))::bigint / 60 AS mm,\n                  trunc(coalesce((e.seg->>'start_sec')::numeric, 0))::bigint % 60 AS ss\n           FROM jsonb_array_elements(coalesce(t.segments, '[]'::jsonb))\n                WITH ORDINALITY AS e(seg, ord)\n         ) d\n         WHERE d.txt <> ''\n       ), '')                                          AS dialogue,\n       t.asr_confidence,\n       t.diarization,\n       t.duration_seconds,\n       t.channels,\n       coalesce(t.asr_metrics->>'asr_quality_status', 'green') AS asr_quality_status,\n       coalesce(t.asr_metrics->'quality', '{}'::jsonb)         AS asr_quality\nFROM (SELECT 1) one\nLEFT JOIN transcripts t ON t.interaction_id = $1::uuid;",
+        "options": {
+          "queryReplacement": "={{ [ $json.interaction_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Fed by both branches: the Switch's evaluate output (interaction_id comes from the claim) and 'Transcript stored?' (interaction_id comes from the RETURNING clause of the fenced transcript write). Both name the field interaction_id, so one expression serves both. Everything downstream of here is stage-agnostic and contains no reference to the ASR node."
+    },
+    {
+      "id": "asr-quality-red",
+      "name": "ASR quality red?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1800,
+        460
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.asr_quality_status === 'red' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "Runs BEFORE the confidence gate now, and reads the stored value rather than the ASR node's response, so it also applies on the evaluate path. The old order let a transcript that was both red and low-confidence be classified as a plain ASR failure and retried, instead of being stored for audit and dead-lettered."
     },
     {
       "id": "mark-unscoreable",
@@ -281,14 +389,125 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1890,
-        420
+        2020,
+        700
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- ASR quality gate said red: too much of the audio is unaccounted for\n-- (failed chunks, decoder loops, contamination-dominated text) to score an\n-- agent on what remains. The transcript IS stored for audit; the job goes\n-- straight to dead_letter with the gate detail. No retry: re-transcribing\n-- the same audio reproduces the same acoustics.\nUPDATE call_ingest_jobs\nSET status = 'dead_letter',\n    last_error = left('asr_quality_red: ' || $2, 500),\n    updated_at = now()\nWHERE uniqueid = $1;",
+        "query": "-- fence-exempt: single-statement UPDATE. The fence IS the statement's own\n-- WHERE clause, so the row is locked and the predicate re-evaluated against\n-- the latest committed version by the UPDATE itself (EvalPlanQual). There is\n-- no read-then-write window to widen, and adding FOR UPDATE would only take\n-- the same lock twice.\n-- TWO WAYS IN, ONE MEANING: there is nothing here that can be scored, and\n-- asking again would not change that. Both are terminal dead_letter, and\n-- neither is ever retried.\n--\n--   1. 'ASR quality red?' -- too much of the audio is unaccounted for\n--      (failed chunks, decoder loops, contamination-dominated text) to\n--      score an agent on what remains. The transcript IS stored for audit.\n--      Re-transcribing the same audio reproduces the same acoustics.\n--   2. 'Nothing to evaluate?' -> 'Store unscoreable outcome' -> here. Pass 2\n--      came back with contract_status = 'unscoreable': the worker refused\n--      BEFORE any model call because the transcript held less speech than\n--      the scoring minimum. Re-asking a model that was never asked cannot\n--      help, and routing it to judge_failed (which is what happened before)\n--      burned a judge attempt every 45 minutes until the budget ran out and\n--      the row dead-lettered anyway -- five wasted retries to reach the same\n--      place. The agent_evaluations row IS written, one node upstream, and\n--      only then is the job terminalised here (round-4 review): the outcome\n--      belongs in unscoreable_count whether or not pass 1 ran.\n--\n-- WHY THE REASON IS A PARAMETER. $3 used to be the ASR gate detail with\n-- 'asr_quality_red: ' hard-coded in front of it. With a second entry path\n-- that prefix would be a lie on every unscoreable row, so the caller now\n-- builds the whole string and the SQL only truncates it. The expression\n-- reads ONLY $json and the claim node -- both branches run the claim, and\n-- neither branch may reach into a node the other one ran (the validator's\n-- branch-isolation rule; 'Two AI passes' has no run data on the ASR path).\n-- On the pass-2 path $json is no longer the /evaluate response: it is the row\n-- RETURNed by 'Store unscoreable outcome', which is why that node returns\n-- `notes AS unscoreable_reason` -- the reason has to travel through the write\n-- rather than around it.\n--\n-- Guarded on claim_token: an execution whose lease expired must not be able to\n-- dead-letter a row somebody else has since picked up and may be about to\n-- evaluate successfully. Status IN ('transcribing','evaluating') covers both\n-- entries: the ASR path arrives holding a 'transcribing' lease, the pass-2\n-- path an 'evaluating' one stamped by 'Begin judge attempt'.\nUPDATE call_ingest_jobs\nSET status      = 'dead_letter',\n    last_error  = left($3, 500),\n    claim_token = NULL,\n    claimed_at  = NULL,\n    claim_until = NULL,\n    updated_at  = now()\nWHERE uniqueid = $1\n  AND claim_token = $2::uuid\n  AND status IN ('transcribing', 'evaluating')\nRETURNING uniqueid, status;",
         "options": {
-          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, JSON.stringify(($('Cohere Arabic ASR').item.json.asr_metrics || {}).quality || {}) ] }}"
+          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, $('Claim work').item.json.claim_token, (() => { const j = $json || {}; if (j.asr_quality) return 'asr_quality_red: ' + JSON.stringify(j.asr_quality); if (j.unscoreable_reason) return 'unscoreable: ' + j.unscoreable_reason; if (j.contract_status === 'unscoreable') return 'unscoreable: the stored evaluation row carried no stated reason'; return 'unscoreable: no reason available -- neither an ASR quality verdict nor a stored unscoreable evaluation reached this node'; })() ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      }
+    },
+    {
+      "id": "confidence-usable",
+      "name": "Confidence usable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2020,
+        460
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.has_transcript === true && ($json.dialogue || '').trim().length > 0 && Number($json.asr_confidence || 0) >= 0.7 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "Postgres returns numeric as a STRING, so the comparison is coerced explicitly -- an uncoerced numeric IF fails with \"'0.82' is a string but was expecting a number\". has_transcript covers the evaluate path reaching a job whose transcript row is missing: that has to go back to ASR, not to the judge with an empty conversation."
+    },
+    {
+      "id": "begin-judge-attempt",
+      "name": "Begin judge attempt",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2240,
+        360
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- fence-exempt: single-statement UPDATE. The fence IS the statement's own\n-- WHERE clause, so the row is locked and the predicate re-evaluated against\n-- the latest committed version by the UPDATE itself (EvalPlanQual). There is\n-- no read-then-write window to widen, and adding FOR UPDATE would only take\n-- the same lock twice.\n-- The transcribe->evaluate handoff, moved to AFTER the quality gates.\n--\n-- WHAT THIS FIXES. The old 'Link job transcribed' incremented judge_attempts at\n-- the moment the transcript was stored -- before 'ASR quality red?' and\n-- 'Confidence usable?' had looked at it. Every red or low-confidence transcript\n-- therefore spent one of the five judge attempts without a judge request ever\n-- being made, so five bad recordings' worth of ASR quality could dead-letter a\n-- call the judge had never seen.\n--\n-- ONE STATEMENT SERVES BOTH PATHS, which is why it does not simply say\n-- status = 'transcribing':\n--   * transcribe path -- the row is still 'transcribing'. Move it to\n--     'evaluating' and spend a judge attempt, but only if the budget allows.\n--   * evaluate path   -- 'Claim work' already set 'evaluating' and already\n--     spent the attempt (and already enforced the cap). Do not double-count;\n--     just renew the lease for the judge phase.\n-- Returning a row in BOTH cases is deliberate: the caller's gate treats zero\n-- rows as \"the lease is gone\", and a silent no-op would be indistinguishable.\n--\n-- The cap is re-checked here because an abnormal re-transcription path can\n-- reach a row whose judge_attempts is already at the ceiling. Zero rows then\n-- stops the chain and the lease sweep re-queues the row; see\n-- docs/PR1A-leases.md section 10 for why that is the intended, terminating\n-- behaviour rather than an immediate dead_letter.\nUPDATE call_ingest_jobs\nSET status         = 'evaluating',\n    judge_attempts = judge_attempts\n                     + CASE WHEN status = 'transcribing' THEN 1 ELSE 0 END,\n    claim_until    = now() + ($3 * interval '1 second'),\n    last_error     = NULL,\n    updated_at     = now()\nWHERE uniqueid    = $1\n  AND claim_token = $2::uuid\n  AND status IN ('transcribing', 'evaluating')\n  AND (status = 'evaluating' OR judge_attempts < $4)\nRETURNING uniqueid, interaction_id, status, judge_attempts;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, $('Claim work').item.json.claim_token, 3600, 5 ] }}"
+        }
+      },
+      "notes": "Counts the judge attempt only once evaluation actually begins, renews the lease for the judge phase (6 items x 300 s timeout + margin = 3600 s), and is fenced on claim_token like every other durable write.",
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      }
+    },
+    {
+      "id": "judge-attempt-started",
+      "name": "Judge attempt started?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2460,
+        360
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ !!$json.uniqueid && !!$json.interaction_id && $json.status === 'evaluating' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "Hard stop on a zero-row handoff. Zero rows means either the lease is gone or the judge budget is exhausted; in both cases the correct action is to spend nothing on DeepSeek and let the lease sweep decide what happens to the row. The false output is a leaf on purpose."
+    },
+    {
+      "id": "mark-asr-failed",
+      "name": "Mark ASR failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2240,
+        700
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- fence-exempt: single-statement UPDATE. The fence IS the statement's own\n-- WHERE clause, so the row is locked and the predicate re-evaluated against\n-- the latest committed version by the UPDATE itself (EvalPlanQual). There is\n-- no read-then-write window to widen, and adding FOR UPDATE would only take\n-- the same lock twice.\n-- Retryable ASR failure: nothing usable came back, or what came back is below\n-- the confidence floor. Release the lease, spend the cool-down, and let the\n-- normal claim pick it up again -- unless the per-stage attempt budget is gone,\n-- in which case it is a dead letter and a human problem.\n--\n-- The 45-minute cool-down is not politeness: the free ASR Space throttles under\n-- rapid repeat batches, and without it one temporary throttle burns the retry\n-- budget of the entire backlog inside an hour while fresh work starves.\n--\n-- status IN ('transcribing','evaluating') because this node is reachable from\n-- both stages: a job claimed for evaluation whose stored transcript turns out\n-- to be unusable needs re-transcription, not another judge attempt. Its claim\n-- spent a judge attempt rather than an ASR one, which slightly over-counts the\n-- judge budget for that row -- recorded here rather than papered over.\n--\n-- $1 = uniqueid, $2 = claim token, $3 = max attempts, $4 = error json,\n-- $5 = cooldown minutes.\nUPDATE call_ingest_jobs\nSET status = CASE WHEN asr_attempts >= $3 THEN 'dead_letter' ELSE 'asr_failed' END,\n    retries         = retries + 1,\n    last_error      = left($4, 500),\n    next_attempt_at = now() + ($5 * interval '1 minute'),\n    claim_token     = NULL,\n    claimed_at      = NULL,\n    claim_until     = NULL,\n    updated_at      = now()\nWHERE uniqueid = $1\n  AND claim_token = $2::uuid\n  AND status IN ('transcribing', 'evaluating')\nRETURNING uniqueid, status;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, $('Claim work').item.json.claim_token, 5, JSON.stringify({ error: $json.error || 'empty or low-confidence transcript', confidence: ($json.confidence !== undefined ? $json.confidence : ($json.asr_confidence !== undefined ? $json.asr_confidence : 0)), text_len: ($json.full_text || $json.dialogue || '').length }), 45 ] }}"
         }
       },
       "credentials": {
@@ -304,14 +523,14 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1780,
-        180
+        2680,
+        360
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Everything the judge is allowed to treat as fact about follow-up.\n-- If this returns no rows the worker sends 'unavailable' and Module 4 scores null.\nSELECT coalesce(string_agg(\n  format('  - [%s] %s by %s, %sh after this call',\n         i.started_at, i.channel,\n         coalesce(a.full_name, 'unknown'),\n         round((extract(epoch from (i.started_at - $2::timestamptz))/3600.0)::numeric, 1)),\n  E'\\n' ORDER BY i.started_at), '') AS history\nFROM interactions i\nLEFT JOIN agents a ON a.agent_id = i.agent_id\nWHERE i.customer_phone_e164 = $1\n  AND i.started_at > $2::timestamptz\n  AND i.started_at < $2::timestamptz + interval '14 days';",
+        "query": "-- Everything the judge is allowed to treat as FACT about follow-up, rendered\n-- as a labelled block. Module 4 is 20% of the agent's grade and cannot be\n-- observed inside a single phone call, so it is scored across the customer's\n-- timeline instead -- this query is that timeline.\n--\n-- WHAT WAS WRONG BEFORE. On day 13, four calls had later same-phone\n-- interactions already in the database and still scored Module 4 = null with\n-- \"no follow-up history was supplied\". The block reached the prompt; it was\n-- unreadable when it got there:\n--\n--   1. Every line said \"by unknown\". Store call + transcript deliberately sets\n--      agent_id = NULL for 'q' recordings, because the extension in a queue\n--      filename is the QUEUE, not a person -- and 'q' is nearly every recording\n--      we have. So coalesce(a.full_name, 'unknown') rendered \"unknown\" for\n--      essentially the whole corpus.\n--   2. Nothing stated the DIRECTION of the later contact. A customer calling\n--      back in is not an agent following up, and Module 4 scores only what the\n--      AGENT did. Given \"unknown, direction unstated\", null is the honest\n--      answer, and the model gave it.\n--   3. No header and no message text. The block was a bare list of bullets, so\n--      criterion 3 (follow-up MESSAGE QUALITY, 30 of the module's 100 points)\n--      was unanswerable from it, and the prompt's rule -- \"if the FOLLOW-UP\n--      HISTORY block is absent ... Module 4 = null\" -- had nothing to\n--      recognise it by.\n--\n-- The block now names the direction explicitly, distinguishes \"no individual\n-- agent recorded (queue recording)\" from \"we do not know\", and carries the\n-- agent's first message for channels that have message text.\n--\n-- Keyed on the stored interaction row rather than on the job's filename\n-- metadata: the interaction row is what the rest of the pipeline joins on, and\n-- on the evaluate path (a judge retry) the filename metadata is a stale copy.\n--\n-- Returns exactly one row, always. The literal 'unavailable' means \"we cannot\n-- see\", which the pass-2 prompt reads as \"Module 4 = null\". Note that an empty\n-- timeline still produces the same word -- see docs/PR1A-leases.md, \"the\n-- silent-timeline question\", for why turning that into a scored zero is a\n-- product decision and not a bug fix.\nSELECT coalesce((\n  SELECT 'Subsequent contact with this customer:' || E'\\n'\n         || string_agg(x.line, E'\\n' ORDER BY x.started_at)\n  FROM (\n    SELECT n.started_at,\n           format('  - [%s] %s, %s, %sh after this conversation, handled by %s%s',\n                  to_char(n.started_at, 'YYYY-MM-DD HH24:MI'),\n                  n.channel::text,\n                  CASE\n                    WHEN n.channel = 'phone_call' AND jj.meta->>'kind' = 'q'\n                      THEN 'INBOUND: the customer called in, this is not an agent follow-up'\n                    WHEN n.direction IS NOT NULL\n                      THEN 'direction ' || n.direction::text\n                    ELSE 'direction not recorded'\n                  END,\n                  round((extract(epoch from (n.started_at - me.started_at)) / 3600.0)::numeric, 1),\n                  CASE\n                    WHEN a.full_name IS NOT NULL THEN a.full_name\n                    WHEN n.is_bot_handled        THEN 'the qualification bot, not a human agent'\n                    WHEN jj.meta->>'kind' = 'q'  THEN 'no individual agent recorded (queue recording)'\n                    ELSE 'not recorded'\n                  END,\n                  coalesce(': \"' || left(msg.body, 300) || '\"', '')) AS line\n    FROM interactions me\n    JOIN interactions n\n      ON  n.customer_phone_e164 = me.customer_phone_e164\n      AND n.interaction_id     <> me.interaction_id\n      AND n.started_at          > me.started_at\n      AND n.started_at          < me.started_at + interval '14 days'\n    LEFT JOIN agents a            ON a.agent_id        = n.agent_id\n    LEFT JOIN call_ingest_jobs jj ON jj.interaction_id = n.interaction_id\n    LEFT JOIN LATERAL (\n      SELECT cm.body FROM chat_messages cm\n      WHERE cm.interaction_id = n.interaction_id AND cm.sender = 'agent'\n      ORDER BY cm.seq LIMIT 1\n    ) msg ON true\n    WHERE me.interaction_id = $1::uuid\n      AND me.customer_phone_e164 IS NOT NULL\n  ) x\n), 'unavailable') AS followup_history;",
         "options": {
-          "queryReplacement": "={{ [ $('Claim work').item.json.meta.customer_phone_e164, $('Claim work').item.json.meta.started_at ] }}"
+          "queryReplacement": "={{ [ $json.interaction_id ] }}"
         }
       },
       "credentials": {
@@ -319,6 +538,21 @@
           "id": "eYWvPxQFAwKs0bOu",
           "name": "railway-pg (api)"
         }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "prepare-evaluation-input",
+      "name": "Prepare evaluation input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2900,
+        360
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// One place where the /evaluate request body is assembled, and the only node\n// the HTTP call reads from. Before this existed the body was built out of five\n// separate cross-node references ($('Cohere Arabic ASR') four times plus\n// $json), so a single dropped field still produced a request that SUCCEEDED --\n// which is exactly how the follow-up history went missing without anything\n// failing.\n//\n// It also removes every reference to the ASR node from the evaluation path, so\n// a judge retry (which never runs ASR) cannot reach a node that did not run.\nconst claim = $('Claim work').item.json;\nconst tr    = $('Load stored transcript').item.json;\n\n// Postgres hands numeric and smallint back as STRINGS. An un-coerced value here\n// reaches the model as \"0.82\" instead of 0.82 and quietly changes the metadata\n// block the judge reads.\nconst num = (v) => (v === null || v === undefined || v === '' ? null : Number(v));\n\nconst history = $input.item.json.followup_history || 'unavailable';\n\nreturn {\n  json: {\n    interaction_id:   tr.interaction_id,\n    uniqueid:         claim.uniqueid,\n    claim_token:      claim.claim_token,\n    work_stage:       claim.work_stage,\n    meta:             claim.meta,\n    asr_confidence:   num(tr.asr_confidence),\n    followup_history: history,\n    request: {\n      conversation: tr.dialogue,\n      input_type: 'call_transcript',\n      metadata: {\n        asr_confidence:   num(tr.asr_confidence),\n        diarization:      tr.diarization,\n        duration_seconds: num(tr.duration_seconds),\n        channels:         num(tr.channels),\n      },\n      followup_history: history,\n      run_pass1: true,\n      run_pass2: true,\n    },\n  },\n};"
       }
     },
     {
@@ -327,8 +561,8 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        2000,
-        180
+        3120,
+        360
       ],
       "parameters": {
         "method": "POST",
@@ -344,7 +578,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ conversation: $('Cohere Arabic ASR').item.json.dialogue, input_type: 'call_transcript', metadata: { asr_confidence: $('Cohere Arabic ASR').item.json.confidence, diarization: $('Cohere Arabic ASR').item.json.diarization, duration_seconds: $('Cohere Arabic ASR').item.json.duration_seconds, channels: $('Cohere Arabic ASR').item.json.channels }, followup_history: ($json.history || 'unavailable'), run_pass1: true, run_pass2: true }) }}",
+        "jsonBody": "={{ JSON.stringify($json.request) }}",
         "options": {
           "timeout": 300000
         }
@@ -357,8 +591,8 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        2220,
-        180
+        3340,
+        360
       ],
       "parameters": {
         "conditions": {
@@ -368,7 +602,7 @@
           },
           "conditions": [
             {
-              "leftValue": "={{ !$json.error && !!$json.pass1 && !!$json.pass2 }}",
+              "leftValue": "={{ !$json.error && !!$json.pass1 }}",
               "rightValue": true,
               "operator": {
                 "type": "boolean",
@@ -380,6 +614,117 @@
           "combinator": "and"
         },
         "options": {}
+      },
+      "notes": "Was `!error && !!pass1 && !!pass2`. That stored NOTHING when pass 2 failed -- including a perfectly good pass 1 naming a hot lead with a verified quote. The two passes are independent by design; gating one on the other threw away the half that drives revenue in order to protect the half that drives coaching. Pass 2 is judged separately, downstream. Its FALSE output no longer goes straight to 'Mark judge failed': it goes to 'Nothing to evaluate?' first, which peels off the worker's unscoreable refusal (200, a pass2 block, contract_status 'unscoreable', no pass1), stores it as one evaluation row and dead-letters the job instead of retrying it five times. Everything else -- errors, 422s, a missing pass1 with no explanation -- still goes to 'Mark judge failed' and is still retried. The condition on this node is unchanged."
+    },
+    {
+      "id": "store-customer-analysis",
+      "name": "Store pass1",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3560,
+        240
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Pass 1 is stored on its OWN merit: a good customer extraction naming a hot\n-- lead with a verified quote must survive a pass-2 failure, because it is the\n-- half that drives revenue.\n--\n-- pass1_validation is written by the worker INTO the payload\n-- (judge.py: payload[\"pass1_validation\"] = validation) and also lifted out to\n-- pass1.pass1_validation. The || merge below puts it back inside the stored\n-- payload whichever side a future worker writes it to, because\n-- evaluate_alert_rules() reads it from raw_response.\n--\n-- FENCED. `r` selects FROM lease, so an execution that lost its lease writes\n-- nothing and returns nothing, and 'Pass 1 stored?' stops the chain.\n--\n-- ON CONFLICT UPDATES EVERY VALUE DERIVED FROM THIS RESPONSE. A re-evaluation\n-- used to refresh intent/summary/confidence/raw_response and leave\n-- prompt_version, model, language and uncertain_fields describing the run that\n-- did NOT produce the stored payload -- the exact shape of provenance bug that\n-- makes a prompt A/B unreadable six weeks later.\n--\n-- ATOMIC AGAINST RECOVERY (round-2 blocker). The fence used to be an UNLOCKED\n-- `SELECT 1 FROM call_ingest_jobs WHERE ... claim_token = $token`. That reads a\n-- snapshot and then lets go: the recovery sweep could reclaim the row, and a\n-- newer worker re-claim it, in the window between that read and the upsert\n-- below, and the stale write still committed. The lease CTE now takes a real\n-- row lock with FOR UPDATE, and requires the lease to still be LIVE\n-- (claim_until > now()). Two orderings, both safe:\n--\n--   * recovery gets the lock first -> this statement BLOCKS on it, and when it\n--     is released Postgres re-evaluates the qualification against the NEW row\n--     version (EvalPlanQual). The token is gone, so the CTE yields no row, the\n--     dependent write is empty, and the node returns zero rows.\n--   * this statement gets the lock first -> recovery BLOCKS until we commit,\n--     then re-checks its own `claim_until < now()` predicate against what we\n--     wrote.\n--\n-- Postgres rule that dictates the SHAPE: a data-modifying CTE cannot see the\n-- effects of its sibling CTEs, and sub-statements all run on one snapshot. So\n-- the lock has to be what the write READS FROM, not a check standing beside it\n-- -- every dependent CTE below selects (transitively) from `lease`, and the\n-- final statement joins it. AS MATERIALIZED pins that: the CTE is evaluated\n-- once, first, and cannot be inlined into the readers.\n--\n-- Locking order for the whole workflow is documented in docs/PR1A-leases.md\n-- section 2 (\"Locking order\"). Short version: every statement takes\n-- call_ingest_jobs FIRST and, apart from the claim and the sweep, takes exactly\n-- ONE job row, by primary key; the claim uses SKIP LOCKED so it never waits.\nWITH lease AS MATERIALIZED (\n  SELECT j.uniqueid\n  FROM call_ingest_jobs j\n  WHERE j.uniqueid    = $3\n    AND j.claim_token = $4::uuid\n    AND j.status IN ('evaluating')\n    AND j.claim_until > now()\n  FOR UPDATE\n),\nr AS (SELECT $2::jsonb AS d FROM lease),\np AS (\n  SELECT coalesce(d->'pass1'->'payload', '{}'::jsonb)\n         || jsonb_build_object('pass1_validation',\n              coalesce(d->'pass1'->'payload'->'pass1_validation',\n                       d->'pass1'->'pass1_validation',\n                       '{}'::jsonb)) AS payload,\n         d\n  FROM r\n)\nINSERT INTO interaction_analysis (\n  interaction_id, schema_version, prompt_version, model, input_type,\n  language, intent, summary_ar, confidence, uncertain_fields, raw_response\n)\nSELECT\n  $1::uuid,\n  '1.0',\n  p.d->'pass1'->>'prompt_version',\n  p.d->'pass1'->>'model',\n  'call_transcript'::input_type,\n  left(p.payload->>'language', 2),\n  p.payload->>'intent',\n  p.payload->>'summary_ar',\n  (p.payload->>'confidence')::numeric,\n  coalesce(p.payload->'uncertain_fields', '[]'::jsonb),\n  p.payload\nFROM p\nON CONFLICT (interaction_id) DO UPDATE SET\n  schema_version   = EXCLUDED.schema_version,\n  prompt_version   = EXCLUDED.prompt_version,\n  model            = EXCLUDED.model,\n  input_type       = EXCLUDED.input_type,\n  language         = EXCLUDED.language,\n  intent           = EXCLUDED.intent,\n  summary_ar       = EXCLUDED.summary_ar,\n  confidence       = EXCLUDED.confidence,\n  uncertain_fields = EXCLUDED.uncertain_fields,\n  raw_response     = EXCLUDED.raw_response,\n  updated_at       = now()\nRETURNING interaction_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Prepare evaluation input').item.json.interaction_id, JSON.stringify($('Two AI passes').item.json), $('Claim work').item.json.uniqueid, $('Claim work').item.json.claim_token ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      }
+    },
+    {
+      "id": "pass1-stored",
+      "name": "Pass 1 stored?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3780,
+        240
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ !!$json.interaction_id }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "Zero rows from the fenced pass-1 write means this execution no longer owns the job. Stop: do not store a pass-2 score for a pass-1 payload we did not write, and do not mark anything terminal. The row's real owner will finish it."
+    },
+    {
+      "id": "pass2-usable",
+      "name": "Pass 2 usable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4000,
+        120
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ (() => { const d = $('Two AI passes').item.json; const p2 = d && d.pass2; if (!p2) return false; return ['ok', 'ungradeable', 'unscoreable'].includes(p2.contract_status || 'ok'); })() }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "WHICH WAY EACH STATUS GOES.\n\ntrue -> Store evaluation: 'ok', 'ungradeable', 'unscoreable'. All three are a finished answer about this call, and all three are stored. 'ungradeable' (too little of the rubric survived evidence checking) and 'unscoreable' (there was no speech to grade) are TERMINAL DATA QUALITY, not judge faults -- retrying them re-asks a model that already answered, wastes a judge attempt from a budget of five, and can only end by manufacturing a score. They are stored with final_score null, gradeable false and the status in its own column, so the scorecard counts them as ungradeable/unscoreable instead of averaging them or silently dropping them from a count(*) denominator.\n\nfalse -> Mark judge failed: 'contract_failed', an unknown status, and a missing pass2 object. A response that parses but contradicts the rubric comes back 200 with contract_status = 'contract_failed' and no usable score; storing it would put a number in agent_evaluations that the scoring engine explicitly refused to stand behind, so it counts as a judge failure and is retried. An UNKNOWN status also fails closed: a worker newer than this workflow must not have its new status silently stored as if it meant 'ok' -- 014's CHECK constraint would reject it anyway, and failing here gives a retry and a readable last_error instead of a hard SQL error.\n\nA 422 from the worker (the response was not usable JSON at all) never reaches this node: 'Evaluation ok?' catches it upstream and routes it to the same 'Mark judge failed'.\n\nA MISSING contract_status is treated as 'ok': an older worker simply did not send the field, and 014 gives the column the same default."
+    },
+    {
+      "id": "store-evaluation",
+      "name": "Store evaluation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4220,
+        120
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- FENCED, like every other durable write here: `r` selects FROM lease.\n--\n-- STATUS IS FIRST-CLASS (014). contract_status / gradeable /\n-- ungradeable_modules / evidence_rejected / model_fingerprint are written\n-- as COLUMNS, not left buried in raw_response. Every consumer needs to know\n-- whether this row carries a score before it averages anything, and\n-- reaching into a jsonb blob to find that out is how the old scorecard\n-- ended up counting ungradeable rows in its denominator and skipping them\n-- in its numerator.\n--\n-- WHICH STATUSES REACH THIS NODE. ok, ungradeable and unscoreable -- all\n-- three are stored. Ungradeable and unscoreable are TERMINAL DATA QUALITY,\n-- not judge faults: retrying them re-asks a model that already answered and\n-- can only manufacture a score. contract_failed never gets here; 'Pass 2\n-- usable?' routes it to 'Mark judge failed', which is retryable.\n--\n-- MISSING KEYS ARE THE OLD WORKER, NOT A FAILURE. An older /evaluate that\n-- does not send these fields must keep working, so absent reads as\n-- ok / true / [] / [] / null -- the same defaults 014 gives the columns.\n--\n-- model_fingerprint IS THE LAST FINGERPRINT SEEN. An evaluation is one or two\n-- API calls (the contract re-ask is the second), and the worker records a\n-- disagreement between them as usage.system_fingerprint_all. The column takes\n-- usage.system_fingerprint, which is the last value; the *_all list is not\n-- stored anywhere, because raw_response holds pass2.payload and not\n-- pass2.usage. A score whose two halves came from different backends is\n-- therefore grouped under one of them. See docs/PR2-db-status.md section 5.\n--\n-- gradeable IS AND-ed WITH \"a score arrived\". A response claiming\n-- gradeable = true with a null final_score is self-contradictory, and\n-- storing it that way would put a row in the 'ok, graded, but no number'\n-- state that no view has a bucket for. This keeps the invariant the 014\n-- backfill established: gradeable implies final_score IS NOT NULL.\n--\n-- ON CONFLICT REFRESHES EVERY COLUMN DERIVED FROM THE RESPONSE. The first\n-- version updated final_score, performance_level, weight_applied and\n-- raw_response only, which meant a re-judged call kept the OLD module scores,\n-- breakdown, evidence, stage, behaviour flags, recommendations and\n-- prompt/rubric/model beside the NEW raw_response. Every scorecard, every\n-- coaching export and every prompt comparison then read a row that was half one\n-- run and half another, with nothing to show it.\n--\n-- agent_id and source_quality are refreshed too: agent_id because the agents\n-- table can gain the extension after the first evaluation, source_quality\n-- because a re-transcription changes the confidence the score rests on.\n--\n-- ATOMIC AGAINST RECOVERY (round-2 blocker). The fence used to be an UNLOCKED\n-- `SELECT 1 FROM call_ingest_jobs WHERE ... claim_token = $token`. That reads a\n-- snapshot and then lets go: the recovery sweep could reclaim the row, and a\n-- newer worker re-claim it, in the window between that read and the upsert\n-- below, and the stale write still committed. The lease CTE now takes a real\n-- row lock with FOR UPDATE, and requires the lease to still be LIVE\n-- (claim_until > now()). Two orderings, both safe:\n--\n--   * recovery gets the lock first -> this statement BLOCKS on it, and when it\n--     is released Postgres re-evaluates the qualification against the NEW row\n--     version (EvalPlanQual). The token is gone, so the CTE yields no row, the\n--     dependent write is empty, and the node returns zero rows.\n--   * this statement gets the lock first -> recovery BLOCKS until we commit,\n--     then re-checks its own `claim_until < now()` predicate against what we\n--     wrote.\n--\n-- Postgres rule that dictates the SHAPE: a data-modifying CTE cannot see the\n-- effects of its sibling CTEs, and sub-statements all run on one snapshot. So\n-- the lock has to be what the write READS FROM, not a check standing beside it\n-- -- every dependent CTE below selects (transitively) from `lease`, and the\n-- final statement joins it. AS MATERIALIZED pins that: the CTE is evaluated\n-- once, first, and cannot be inlined into the readers.\n--\n-- Locking order for the whole workflow is documented in docs/PR1A-leases.md\n-- section 2 (\"Locking order\"). Short version: every statement takes\n-- call_ingest_jobs FIRST and, apart from the claim and the sweep, takes exactly\n-- ONE job row, by primary key; the claim uses SKIP LOCKED so it never waits.\nWITH lease AS MATERIALIZED (\n  SELECT j.uniqueid\n  FROM call_ingest_jobs j\n  WHERE j.uniqueid    = $3\n    AND j.claim_token = $4::uuid\n    AND j.status IN ('evaluating')\n    AND j.claim_until > now()\n  FOR UPDATE\n),\nr AS (SELECT $2::jsonb AS d FROM lease)\nINSERT INTO agent_evaluations (\n  interaction_id, agent_id, schema_version, prompt_version, rubric_version, model,\n  input_type, source_quality, final_score, performance_level, weight_applied,\n  m1_reception, m2_offer, m3_objections, m4_followup, m5_closing,\n  breakdown, evidence, stage_reached, behavior_flags,\n  contract_status, gradeable, ungradeable_modules, evidence_rejected,\n  model_fingerprint,\n  top_strength, top_weakness, top_recommendation, notes, raw_response\n)\nSELECT $1::uuid, i.agent_id, '1.0',\n  d->'pass2'->>'prompt_version', d->>'rubric_version', d->'pass2'->>'model',\n  'call_transcript'::input_type,\n  (d->>'asr_confidence')::numeric,\n  (d->'pass2'->>'final_score')::numeric,\n  d->'pass2'->>'performance_level',\n  (d->'pass2'->>'weight_applied')::numeric,\n  (d->'pass2'->'modules'->>'module1_reception')::numeric,\n  (d->'pass2'->'modules'->>'module2_offer')::numeric,\n  (d->'pass2'->'modules'->>'module3_objections')::numeric,\n  (d->'pass2'->'modules'->>'module4_followup')::numeric,\n  (d->'pass2'->'modules'->>'module5_closing')::numeric,\n  coalesce(d->'pass2'->'payload'->'modules', '{}'::jsonb),\n  coalesce(d->'pass2'->'payload'->'evidence', '[]'::jsonb),\n  nullif(d->'pass2'->'payload'->>'stage_reached', '')::conversation_stage,\n  coalesce(d->'pass2'->'payload'->'behavior_flags', '[]'::jsonb),\n  coalesce(nullif(d->'pass2'->>'contract_status', ''), 'ok'),\n  coalesce((d->'pass2'->>'gradeable')::boolean, true)\n    AND (d->'pass2'->>'final_score') IS NOT NULL,\n  CASE WHEN jsonb_typeof(d->'pass2'->'ungradeable_modules') = 'array'\n       THEN d->'pass2'->'ungradeable_modules' ELSE '[]'::jsonb END,\n  CASE WHEN jsonb_typeof(d->'pass2'->'evidence_rejected') = 'array'\n       THEN d->'pass2'->'evidence_rejected' ELSE '[]'::jsonb END,\n  nullif(coalesce(d->'pass2'->'usage'->>'system_fingerprint',\n                  d->'pass2'->>'system_fingerprint',\n                  d->'pass2'->>'model_fingerprint'), ''),\n  d->'pass2'->'payload'->'summary'->>'top_strength',\n  d->'pass2'->'payload'->'summary'->>'top_weakness',\n  d->'pass2'->'payload'->'summary'->>'top_recommendation',\n  d->'pass2'->'payload'->>'notes',\n  d->'pass2'->'payload'\nFROM interactions i, r WHERE i.interaction_id = $1::uuid\nON CONFLICT (interaction_id) DO UPDATE SET\n  agent_id           = EXCLUDED.agent_id,\n  schema_version     = EXCLUDED.schema_version,\n  prompt_version     = EXCLUDED.prompt_version,\n  rubric_version     = EXCLUDED.rubric_version,\n  model              = EXCLUDED.model,\n  input_type         = EXCLUDED.input_type,\n  source_quality     = EXCLUDED.source_quality,\n  final_score        = EXCLUDED.final_score,\n  performance_level  = EXCLUDED.performance_level,\n  weight_applied     = EXCLUDED.weight_applied,\n  m1_reception       = EXCLUDED.m1_reception,\n  m2_offer           = EXCLUDED.m2_offer,\n  m3_objections      = EXCLUDED.m3_objections,\n  m4_followup        = EXCLUDED.m4_followup,\n  m5_closing         = EXCLUDED.m5_closing,\n  breakdown          = EXCLUDED.breakdown,\n  evidence           = EXCLUDED.evidence,\n  stage_reached      = EXCLUDED.stage_reached,\n  behavior_flags     = EXCLUDED.behavior_flags,\n  contract_status    = EXCLUDED.contract_status,\n  gradeable          = EXCLUDED.gradeable,\n  ungradeable_modules = EXCLUDED.ungradeable_modules,\n  evidence_rejected  = EXCLUDED.evidence_rejected,\n  model_fingerprint  = EXCLUDED.model_fingerprint,\n  top_strength       = EXCLUDED.top_strength,\n  top_weakness       = EXCLUDED.top_weakness,\n  top_recommendation = EXCLUDED.top_recommendation,\n  notes              = EXCLUDED.notes,\n  raw_response       = EXCLUDED.raw_response,\n  updated_at         = now()\nRETURNING interaction_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Prepare evaluation input').item.json.interaction_id, JSON.stringify(Object.assign({}, $('Two AI passes').item.json, { asr_confidence: $('Prepare evaluation input').item.json.asr_confidence })), $('Claim work').item.json.uniqueid, $('Claim work').item.json.claim_token ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
       }
     },
     {
@@ -388,60 +733,14 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        2440,
-        380
+        4000,
+        460
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE call_ingest_jobs\nSET status = CASE WHEN retries + 1 >= 5 THEN 'dead_letter' ELSE 'judge_failed' END,\n    retries = retries + 1,\n    last_error = left($2, 500),\n    updated_at = now()\nWHERE uniqueid = $1;",
+        "query": "-- fence-exempt: single-statement UPDATE. The fence IS the statement's own\n-- WHERE clause, so the row is locked and the predicate re-evaluated against\n-- the latest committed version by the UPDATE itself (EvalPlanQual). There is\n-- no read-then-write window to widen, and adding FOR UPDATE would only take\n-- the same lock twice.\n-- Retryable judge failure: a 422 (the response was not usable JSON at all), a\n-- transport error, or a response that broke the rubric contract after the\n-- re-ask. No agent_evaluations row is written -- a score the scoring engine\n-- refused to compute must not appear as a number.\n--\n-- judge_attempts, not the shared retries counter: an ASR problem and a judge\n-- problem now have separate budgets, so a bad prompt version can no longer\n-- dead-letter calls whose audio was fine.\n--\n-- $1 = uniqueid, $2 = claim token, $3 = max attempts, $4 = error json,\n-- $5 = cooldown minutes.\nUPDATE call_ingest_jobs\nSET status = CASE WHEN judge_attempts >= $3 THEN 'dead_letter' ELSE 'judge_failed' END,\n    retries         = retries + 1,\n    last_error      = left($4, 500),\n    next_attempt_at = now() + ($5 * interval '1 minute'),\n    claim_token     = NULL,\n    claimed_at      = NULL,\n    claim_until     = NULL,\n    updated_at      = now()\nWHERE uniqueid = $1\n  AND claim_token = $2::uuid\n  AND status IN ('transcribing', 'evaluating')\nRETURNING uniqueid, status;",
         "options": {
-          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, JSON.stringify($json.error || $json) ] }}"
-        }
-      },
-      "credentials": {
-        "postgres": {
-          "id": "eYWvPxQFAwKs0bOu",
-          "name": "railway-pg (api)"
-        }
-      }
-    },
-    {
-      "id": "store-customer-analysis",
-      "name": "Store customer analysis",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "position": [
-        2440,
-        60
-      ],
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "WITH r AS (SELECT $2::jsonb AS d)\nINSERT INTO interaction_analysis (\n  interaction_id, schema_version, prompt_version, model, input_type,\n  language, intent, summary_ar, confidence, uncertain_fields, raw_response\n)\nSELECT\n  $1::uuid,\n  '1.0',\n  d->'pass1'->>'prompt_version',\n  d->'pass1'->>'model',\n  'call_transcript'::input_type,\n  left(d->'pass1'->'payload'->>'language', 2),\n  d->'pass1'->'payload'->>'intent',\n  d->'pass1'->'payload'->>'summary_ar',\n  (d->'pass1'->'payload'->>'confidence')::numeric,\n  coalesce(d->'pass1'->'payload'->'uncertain_fields', '[]'::jsonb),\n  d->'pass1'->'payload'\nFROM r\nON CONFLICT (interaction_id) DO UPDATE SET\n  summary_ar   = EXCLUDED.summary_ar,\n  confidence   = EXCLUDED.confidence,\n  raw_response = EXCLUDED.raw_response,\n  updated_at   = now()\nRETURNING interaction_id;",
-        "options": {
-          "queryReplacement": "={{ [ $('Link job transcribed').item.json.interaction_id, JSON.stringify($('Two AI passes').item.json) ] }}"
-        }
-      },
-      "credentials": {
-        "postgres": {
-          "id": "eYWvPxQFAwKs0bOu",
-          "name": "railway-pg (api)"
-        }
-      }
-    },
-    {
-      "id": "store-evaluation",
-      "name": "Store evaluation",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "position": [
-        2660,
-        60
-      ],
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "WITH r AS (SELECT $2::jsonb AS d)\nINSERT INTO agent_evaluations (\n  interaction_id, agent_id, schema_version, prompt_version, rubric_version, model,\n  input_type, source_quality, final_score, performance_level, weight_applied,\n  m1_reception, m2_offer, m3_objections, m4_followup, m5_closing,\n  breakdown, evidence, stage_reached, behavior_flags,\n  top_strength, top_weakness, top_recommendation, notes, raw_response\n)\nSELECT $1::uuid, i.agent_id, '1.0',\n  d->'pass2'->>'prompt_version', d->>'rubric_version', d->'pass2'->>'model',\n  'call_transcript'::input_type,\n  (d->>'asr_confidence')::numeric,\n  (d->'pass2'->>'final_score')::numeric,\n  d->'pass2'->>'performance_level',\n  (d->'pass2'->>'weight_applied')::numeric,\n  (d->'pass2'->'modules'->>'module1_reception')::numeric,\n  (d->'pass2'->'modules'->>'module2_offer')::numeric,\n  (d->'pass2'->'modules'->>'module3_objections')::numeric,\n  (d->'pass2'->'modules'->>'module4_followup')::numeric,\n  (d->'pass2'->'modules'->>'module5_closing')::numeric,\n  coalesce(d->'pass2'->'payload'->'modules', '{}'::jsonb),\n  coalesce(d->'pass2'->'payload'->'evidence', '[]'::jsonb),\n  nullif(d->'pass2'->'payload'->>'stage_reached', '')::conversation_stage,\n  coalesce(d->'pass2'->'payload'->'behavior_flags', '[]'::jsonb),\n  d->'pass2'->'payload'->'summary'->>'top_strength',\n  d->'pass2'->'payload'->'summary'->>'top_weakness',\n  d->'pass2'->'payload'->'summary'->>'top_recommendation',\n  d->'pass2'->'payload'->>'notes',\n  d->'pass2'->'payload'\nFROM interactions i, r WHERE i.interaction_id = $1::uuid\nON CONFLICT (interaction_id) DO UPDATE SET\n  final_score       = EXCLUDED.final_score,\n  performance_level = EXCLUDED.performance_level,\n  weight_applied    = EXCLUDED.weight_applied,\n  raw_response      = EXCLUDED.raw_response,\n  updated_at        = now()\nRETURNING interaction_id;",
-        "options": {
-          "queryReplacement": "={{ [ $('Link job transcribed').item.json.interaction_id, JSON.stringify(Object.assign({}, $('Two AI passes').item.json, { asr_confidence: $('Cohere Arabic ASR').item.json.confidence })) ] }}"
+          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, $('Claim work').item.json.claim_token, 5, JSON.stringify((() => { const d = $('Two AI passes').item.json; if (!d || d.error) return { error: (d && d.error) || 'no response' }; if (!d.pass1) return { error: 'pass1 missing' }; const p2 = d.pass2; if (!p2) return { error: 'pass2 missing' }; return { error: 'contract_failed', contract_violations: p2.contract_violations, evidence_rejected: p2.evidence_rejected }; })()), 45 ] }}"
         }
       },
       "credentials": {
@@ -457,14 +756,14 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        2880,
-        60
+        4440,
+        120
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE call_ingest_jobs\nSET status = 'evaluated', updated_at = now()\nWHERE uniqueid = $1;",
+        "query": "-- fence-exempt: single-statement UPDATE. The fence IS the statement's own\n-- WHERE clause, so the row is locked and the predicate re-evaluated against\n-- the latest committed version by the UPDATE itself (EvalPlanQual). There is\n-- no read-then-write window to widen, and adding FOR UPDATE would only take\n-- the same lock twice.\n-- Terminal success. The lease is released and last_error cleared, so a row that\n-- previously failed does not keep a stale reason attached to a good result.\nUPDATE call_ingest_jobs\nSET status          = 'evaluated',\n    last_error      = NULL,\n    next_attempt_at = now(),\n    claim_token     = NULL,\n    claimed_at      = NULL,\n    claim_until     = NULL,\n    updated_at      = now()\nWHERE uniqueid = $1\n  AND claim_token = $2::uuid\n  AND status = 'evaluating'\nRETURNING uniqueid, status;",
         "options": {
-          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid ] }}"
+          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, $('Claim work').item.json.claim_token ] }}"
         }
       },
       "credentials": {
@@ -473,6 +772,201 @@
           "name": "railway-pg (api)"
         }
       }
+    },
+    {
+      "id": "job-finalised",
+      "name": "Job finalised?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4660,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ !!$json.uniqueid && ['evaluated','judge_failed','dead_letter'].includes($json.status) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "Alerting hangs off a POSITIVELY CONFIRMED terminal transition, not off canvas order. The alert branch used to be a sibling of the scoring branch below 'Store pass1', and relied on executionOrder v1 running the topmost branch first -- but a fenced 'Mark evaluated' that updates zero rows does not cancel a sibling branch, so an execution that had already lost its lease could still queue an alert. Both terminal nodes RETURN uniqueid + status; only a real returned row reaches the alert node."
+    },
+    {
+      "id": "evaluate-alert-rules",
+      "name": "Evaluate alert rules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4880,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The follow-up QUEUE, not a notification. Recordings reach us roughly a day\n-- after the call, so there is nothing real-time to alert on and nothing here\n-- POSTs anywhere: evaluate_alert_rules() records what fired into\n-- alert_occurrences, v_alert_queue is the working list and v_alert_digest_daily\n-- is the daily read. Delivery is somebody reading that queue.\n--\n-- NOT BEST EFFORT ANY MORE (round-2 blocker). This node runs AFTER the job is\n-- terminal, and a terminal job is never claimed again and never recovered by\n-- the lease sweep -- so a transient failure here used to lose that call's\n-- occurrences permanently, silently, with the execution reported green because\n-- the node was a leaf with onError: continueRegularOutput. Three changes:\n--\n--   1. The stamp. `alerts_evaluated_at` is set in the SAME statement as the\n--      evaluation, so it can never claim work that did not happen: if the\n--      function raises, the statement aborts and the column stays NULL.\n--   2. The node no longer swallows errors. A failure fails the execution, which\n--      is how you find out about it.\n--   3. Whatever is still missing is reconciled. 'Reconcile alert evaluations'\n--      re-runs the rules for every terminal job with alerts_evaluated_at IS\n--      NULL, on every sweep. Free, because evaluate_alert_rules() deduplicates\n--      on ON CONFLICT (rule, version, interaction, fact hash).\n--\n-- Why not fold this into 'Mark evaluated' instead -- the atomic alternative --\n-- is argued in db/migrations/013_alert_rules.sql, section \"ALERT EVALUATION IS\n-- DURABLE WORK\". Short version: it would make one broken triage rule roll back\n-- every terminalization and re-spend the judge budget on every cycle.\n--\n-- FENCED, three ways over:\n--   1. Structurally -- reachable only from 'Job finalised?', which requires\n--      'Mark evaluated' or 'Mark judge failed' to have actually returned a row.\n--   2. In SQL, with a LOCK -- `job` takes the row FOR UPDATE, so a concurrent\n--      re-claim either loses the race and waits, or wins it and this CTE sees\n--      the new version and yields nothing. The terminal update has already\n--      cleared claim_token, so the predicate is \"still in the terminal state\n--      this execution just wrote ($3), and nobody has re-claimed it\".\n--   3. Every dependent CTE reads FROM `job`, because a data-modifying CTE\n--      cannot see the effects of a sibling. `fired` must stay referenced by the\n--      final SELECT: unlike a data-modifying CTE, a CTE that merely CALLS a\n--      writing function is not guaranteed to run if nothing reads it.\n--\n-- The LEFT JOIN to `fired` is deliberate: a call that trips no rule is the\n-- normal case and must still return its stamp row, so that zero rows from this\n-- node means one thing only -- the fence failed.\n--\n-- delivery_status 'pending' means \"in the follow-up queue\"; the workflow never\n-- changes it. A human (or a nightly digest consumer) moves it to\n-- 'acknowledged'. 'suppressed' is what a rule with is_alert = false records.\nWITH job AS MATERIALIZED (\n  SELECT j.uniqueid, j.interaction_id\n  FROM call_ingest_jobs j\n  WHERE j.uniqueid       = $2\n    AND j.interaction_id = $1::uuid\n    AND j.claim_token IS NULL\n    AND j.status         = $3\n  FOR UPDATE\n),\nfired AS (\n  SELECT o.*\n  FROM job\n  CROSS JOIN LATERAL evaluate_alert_rules(job.interaction_id) o\n),\nstamped AS (\n  UPDATE call_ingest_jobs j\n  SET alerts_evaluated_at = now(),\n      alerts_error        = NULL,\n      updated_at          = now()\n  FROM job\n  WHERE j.uniqueid = job.uniqueid\n  RETURNING j.uniqueid, j.interaction_id, j.status, j.alerts_evaluated_at\n)\nSELECT s.uniqueid,\n       s.status,\n       s.alerts_evaluated_at,\n       o.occurrence_id,\n       o.rule_code,\n       o.rule_version,\n       o.delivery_status,\n       o.fact_snapshot,\n       o.created_at,\n       i.interaction_id,\n       i.started_at,\n       i.customer_phone_e164,\n       coalesce(a.full_name, 'unassigned') AS agent_name\nFROM stamped s\nLEFT JOIN fired o        ON o.interaction_id = s.interaction_id\n                        AND o.delivery_status = 'pending'\nLEFT JOIN interactions i ON i.interaction_id = s.interaction_id\nLEFT JOIN agents a       ON a.agent_id = i.agent_id\nORDER BY o.created_at, o.rule_code;",
+        "options": {
+          "queryReplacement": "={{ [ $('Prepare evaluation input').item.json.interaction_id, $('Claim work').item.json.uniqueid, $json.status ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Leaf. Fills the follow-up queue and stops -- there is no sender, by design: recordings arrive ~a day late, so a 'real-time' alert would be theatre. alwaysOutputData + onError continueRegularOutput: an interaction that trips no rule is the normal case, and a broken alert rule must not fail an execution whose job is already correctly finalised."
+    },
+    {
+      "id": "dead-letter-judge-budget",
+      "name": "Dead-letter judge budget",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2680,
+        700
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- fence-exempt: single-statement UPDATE. The fence IS the statement's own\n-- WHERE clause, so the row is locked and the predicate re-evaluated against\n-- the latest committed version by the UPDATE itself (EvalPlanQual). There is\n-- no read-then-write window to widen, and adding FOR UPDATE would only take\n-- the same lock twice.\n-- The judge budget is gone and no judge will ever be called for this row: say\n-- so, once, instead of parking it for three hours.\n--\n-- WHAT THIS REPLACES. 'Begin judge attempt' returns zero rows when the row is\n-- still 'transcribing' and judge_attempts is already at the cap -- reachable by\n-- the abnormal re-transcription path (a row that hit the cap, then failed the\n-- ASR quality gate, then was re-transcribed). The false output of 'Judge\n-- attempt started?' used to be a bare leaf: the chain stopped, the lease lapsed\n-- three hours later, the sweep re-queued the row as ASR work, and it burned ASR\n-- attempts one at a time until THAT budget was gone too -- re-transcribing\n-- audio for a judge that could never run. Terminating, but expensive and\n-- confusing in the dead-letter list.\n--\n-- WHY IT READS NOTHING FROM THE JUDGE BRANCH. The Two-AI-passes node has not\n-- run on this output, so reaching into it would be exactly the cross-branch\n-- reference the validator exists to catch -- and it is why 'Mark judge failed'\n-- could not be reused here. Everything below comes from the claim, which is\n-- upstream of both outputs.\n--\n-- THE OTHER FALSE CASE IS A STALE TOKEN, and it must stay a no-op: if this\n-- execution lost the lease, somebody else owns the row and dead-lettering it\n-- would be the exact overwrite this PR removes. Both halves of the fence -- the\n-- token AND `judge_attempts >= $3` -- have to hold, so a stale token produces\n-- UPDATE 0 and the node is a leaf, which is the end of it.\n--\n-- $1 = uniqueid, $2 = claim token, $3 = max attempts per stage.\nUPDATE call_ingest_jobs\nSET status          = 'dead_letter',\n    last_error      = 'judge_budget_exhausted_before_handoff',\n    retries         = retries + 1,\n    next_attempt_at = now(),\n    claim_token     = NULL,\n    claimed_at      = NULL,\n    claim_until     = NULL,\n    updated_at      = now()\nWHERE uniqueid       = $1\n  AND claim_token    = $2::uuid\n  AND status         = 'transcribing'\n  AND judge_attempts >= $3\nRETURNING uniqueid, status, asr_attempts, judge_attempts, last_error;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.uniqueid, $('Claim work').item.json.claim_token, 5 ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      },
+      "notes": "The false output of the judge-attempt gate has two causes and they are not the same thing. Exhausted judge budget: no judge will ever run for this row, so dead-letter it now with a named reason instead of leaving the sweep to re-queue it as ASR work and burn that budget too. Stale token: somebody else owns the row, the fence matches nothing, UPDATE 0, and this node is a leaf. One statement distinguishes them because both halves of its WHERE must hold."
+    },
+    {
+      "id": "reconcile-alert-evaluations",
+      "name": "Reconcile alert evaluations",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        240,
+        860
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: reconciliation operates on TERMINAL, UNLEASED job rows -- rows\n-- that by definition nobody holds a lease on and nobody will claim again. There\n-- is no token to carry. It takes its own rows with FOR UPDATE SKIP LOCKED\n-- inside reconcile_alert_evaluations(), so it never waits for, and never\n-- overwrites, work that a live execution is holding.\n-- The other half of \"alert-queue persistence is not best effort\".\n--\n-- 'Evaluate alert rules' stamps call_ingest_jobs.alerts_evaluated_at in the\n-- same statement as the evaluation. Anything that did not get stamped -- a\n-- connection that dropped, a deadlock, a bug in one rule, an execution that was\n-- cancelled between the terminal update and the alert node -- is a terminal job\n-- with alerts_evaluated_at IS NULL, and this node is what finishes it. Running\n-- it repeatedly is free: evaluate_alert_rules() deduplicates on\n-- ON CONFLICT (rule_code, rule_version, interaction_id, occurrence_hash).\n--\n-- It hangs off the trigger, NOT off the claim chain: it must run on a day with\n-- no new recordings and no claimable work, which is exactly the kind of quiet\n-- day the old chained-claim bug hid behind.\n--\n-- Per-row subtransactions inside the function mean one poison interaction\n-- records its own error in alerts_error and is skipped, rather than aborting\n-- the batch forever. See db/migrations/013_alert_rules.sql.\n--\n-- $1 = how many jobs to reconcile per sweep.\nSELECT job_uniqueid,\n       job_interaction_id,\n       occurrences_recorded,\n       error_text\nFROM reconcile_alert_evaluations($1)\nORDER BY error_text NULLS LAST, job_uniqueid;",
+        "options": {
+          "queryReplacement": "={{ [ 200 ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      },
+      "notes": "executeOnce: the trigger emits one item, but if that ever changes this node must not run the sweep once per item. alwaysOutputData: an empty backlog is the healthy case and the run log should say so rather than showing nothing. No onError handler on purpose -- if reconciliation itself is broken, the execution must go red."
+    },
+    {
+      "id": "nothing-to-evaluate",
+      "name": "Nothing to evaluate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3560,
+        620
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ (() => { const d = $json; if (!d || d.error) return false; const p2 = d.pass2; return !!p2 && p2.contract_status === 'unscoreable'; })() }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "Triage on the false output of 'Evaluation ok?'. That gate asks \"is there a pass 1 to store\"; it cannot tell a broken judge from a call with nothing in it, and it used to send both to 'Mark judge failed'.\n\nThe worker's unscoreable refusal returns 200 with a pass2 block, contract_status = 'unscoreable', and NO pass1 -- it short-circuits /evaluate before pass 1 runs, because the transcript held less speech than the scoring minimum. 'Evaluation ok?' therefore takes its false output on a response that is not an error at all, and the row was retried: one judge attempt every 45 minutes until the budget of five was gone, then dead_letter. Five model calls that were never going to be made, to reach the state this branch reaches immediately.\n\ntrue -> 'Store unscoreable outcome' -> 'Unscoreable stored?' -> 'Mark unscoreable'. The evaluation row is written FIRST (contract_status 'unscoreable', gradeable false, final_score null, the worker's reason in notes), and only then is the job dead-lettered with the lease cleared and no retry. Round 4 reversed the earlier decision to write no row: the refusal is a complete, storable pass-2 answer, and dropping it made unscoreable_count unreachable for the commonest way a call becomes unscoreable.\n\nfalse -> Mark judge failed, exactly as before: a transport error, a 422 (the response was not usable JSON at all), a missing pass1 with no explanation, or any other status. All retryable, all still retried.\n\nReads $json only. $json here is the 'Two AI passes' response, passed through 'Evaluation ok?' unchanged."
+    },
+    {
+      "id": "store-unscoreable-outcome",
+      "name": "Store unscoreable outcome",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3780,
+        620
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- THE UNSCOREABLE OUTCOME IS AN OUTCOME, AND IT IS STORED (round-4 review).\n-- The worker refused BEFORE pass 1: the transcript held less speech than the\n-- scoring minimum, so /evaluate short-circuited and returned a 200 with a\n-- complete pass2 refusal block and NO pass1. The previous revision routed that\n-- straight to 'Mark unscoreable' and wrote no evaluation row at all, which\n-- meant `unscoreable_count` was never populated by this workflow and the WORST\n-- input-quality cases -- the ones most worth seeing -- were the only ones\n-- invisible to both reporting views.\n--\n-- The worker deliberately returns a STORABLE refusal: rubric_version,\n-- prompt_version, a named model placeholder, contract_status 'unscoreable',\n-- gradeable false, final_score null and the reason in warnings[0]\n-- (services/worker/app/main.py, _unscoreable()). Storage policy must not depend\n-- on whether pass 1 happened to run, so it is stored here exactly as the\n-- pass-1-succeeded variant would be stored by 'Store evaluation'.\n--\n-- ONE ROW, THEN TERMINAL. This node writes the row; 'Unscoreable stored?' turns\n-- a zero-row fencing result into a hard stop; 'Mark unscoreable' then\n-- dead-letters the job with no retry. The order matters: a job marked terminal\n-- first and crashed before the row was written would be a dead_letter with no\n-- evaluation, which is the state this node exists to remove.\n--\n-- NOTHING SCORE-SHAPED IS WRITTEN. final_score, performance_level and every\n-- module score are explicitly null, breakdown/evidence/behaviour flags are\n-- empty, and gradeable is computed by the SAME expression 'Store evaluation'\n-- uses (what the worker said AND a score actually arrived), which is false here\n-- by construction. That keeps the invariant 014's backfill establishes:\n-- gradeable implies final_score IS NOT NULL.\n--\n-- THE VERSION CO-ORDINATE IS THE RESPONSE'S OWN, never a guess. prompt_version,\n-- rubric_version and model are NOT NULL columns, so a worker that sent none\n-- would abort the statement mid-batch; they fall back to a self-describing\n-- 'unknown (...)' label instead, which cannot be mistaken for a real version\n-- and cannot silently merge this row into a real version group.\n--\n-- ON CONFLICT REFRESHES EVERYTHING DERIVED FROM THIS RESPONSE, including\n-- clearing the score columns. A re-evaluation that comes back unscoreable\n-- against an interaction that previously scored means the stored transcript no\n-- longer holds enough speech to grade; the honest record is the current one,\n-- with the status column saying why there is no number. Leaving the old module\n-- scores beside a null final_score would be the half-one-run-half-another row\n-- that 'Store evaluation' documents at length. This is the one destructive edge\n-- of storing the outcome, and it is recorded in docs/PR2-db-status.md section 5.\n--\n-- FENCED AND LOCKED, like every other durable write here: `r` selects FROM\n-- lease, the lease CTE takes the job row with FOR UPDATE and requires the lease\n-- to still be LIVE (claim_until > now()), and AS MATERIALIZED pins the CTE so\n-- it cannot be inlined into the readers. Two orderings, both safe:\n--\n--   * recovery gets the lock first -> this statement BLOCKS, and on release\n--     Postgres re-evaluates the qualification against the NEW row version\n--     (EvalPlanQual). The token is gone, the CTE yields no row, nothing is\n--     written and the node returns zero rows.\n--   * this statement gets the lock first -> recovery BLOCKS until we commit,\n--     then re-checks its own predicate against what we wrote.\n--\n-- Status is 'evaluating' only: this path is reached exclusively after\n-- 'Begin judge attempt', which is what put the row into that status.\nWITH lease AS MATERIALIZED (\n  SELECT j.uniqueid\n  FROM call_ingest_jobs j\n  WHERE j.uniqueid    = $3\n    AND j.claim_token = $4::uuid\n    AND j.status IN ('evaluating')\n    AND j.claim_until > now()\n  FOR UPDATE\n),\nr AS (SELECT $2::jsonb AS d FROM lease)\nINSERT INTO agent_evaluations (\n  interaction_id, agent_id, schema_version, prompt_version, rubric_version, model,\n  input_type, source_quality, final_score, performance_level, weight_applied,\n  m1_reception, m2_offer, m3_objections, m4_followup, m5_closing,\n  breakdown, evidence, stage_reached, behavior_flags,\n  contract_status, gradeable, ungradeable_modules, evidence_rejected,\n  model_fingerprint,\n  top_strength, top_weakness, top_recommendation, notes, raw_response\n)\nSELECT $1::uuid, i.agent_id, '1.0',\n  coalesce(nullif(d->'pass2'->>'prompt_version', ''), 'unknown (worker sent no prompt_version)'),\n  coalesce(nullif(d->>'rubric_version', ''),         'unknown (worker sent no rubric_version)'),\n  coalesce(nullif(d->'pass2'->>'model', ''),         'none (refused before any model call)'),\n  'call_transcript'::input_type,\n  (d->>'asr_confidence')::numeric,\n  NULL::numeric,                                     -- final_score: there is none\n  NULL::text,                                        -- performance_level: likewise\n  (d->'pass2'->>'weight_applied')::numeric,\n  NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric,\n  '{}'::jsonb, '[]'::jsonb, NULL::conversation_stage, '[]'::jsonb,\n  coalesce(nullif(d->'pass2'->>'contract_status', ''), 'unscoreable'),\n  coalesce((d->'pass2'->>'gradeable')::boolean, true)\n    AND (d->'pass2'->>'final_score') IS NOT NULL,\n  CASE WHEN jsonb_typeof(d->'pass2'->'ungradeable_modules') = 'array'\n       THEN d->'pass2'->'ungradeable_modules' ELSE '[]'::jsonb END,\n  CASE WHEN jsonb_typeof(d->'pass2'->'evidence_rejected') = 'array'\n       THEN d->'pass2'->'evidence_rejected' ELSE '[]'::jsonb END,\n  nullif(coalesce(d->'pass2'->'usage'->>'system_fingerprint',\n                  d->'pass2'->>'system_fingerprint',\n                  d->'pass2'->>'model_fingerprint'), ''),\n  NULL::text, NULL::text, NULL::text,\n  coalesce(nullif(d->'pass2'->'warnings'->>0, ''),\n           'pass 2 returned contract_status unscoreable with no stated reason'),\n  coalesce(d->'pass2'->'payload', '{}'::jsonb)\nFROM interactions i, r WHERE i.interaction_id = $1::uuid\nON CONFLICT (interaction_id) DO UPDATE SET\n  agent_id           = EXCLUDED.agent_id,\n  schema_version     = EXCLUDED.schema_version,\n  prompt_version     = EXCLUDED.prompt_version,\n  rubric_version     = EXCLUDED.rubric_version,\n  model              = EXCLUDED.model,\n  input_type         = EXCLUDED.input_type,\n  source_quality     = EXCLUDED.source_quality,\n  final_score        = EXCLUDED.final_score,\n  performance_level  = EXCLUDED.performance_level,\n  weight_applied     = EXCLUDED.weight_applied,\n  m1_reception       = EXCLUDED.m1_reception,\n  m2_offer           = EXCLUDED.m2_offer,\n  m3_objections      = EXCLUDED.m3_objections,\n  m4_followup        = EXCLUDED.m4_followup,\n  m5_closing         = EXCLUDED.m5_closing,\n  breakdown          = EXCLUDED.breakdown,\n  evidence           = EXCLUDED.evidence,\n  stage_reached      = EXCLUDED.stage_reached,\n  behavior_flags     = EXCLUDED.behavior_flags,\n  contract_status    = EXCLUDED.contract_status,\n  gradeable          = EXCLUDED.gradeable,\n  ungradeable_modules = EXCLUDED.ungradeable_modules,\n  evidence_rejected  = EXCLUDED.evidence_rejected,\n  model_fingerprint  = EXCLUDED.model_fingerprint,\n  top_strength       = EXCLUDED.top_strength,\n  top_weakness       = EXCLUDED.top_weakness,\n  top_recommendation = EXCLUDED.top_recommendation,\n  notes              = EXCLUDED.notes,\n  raw_response       = EXCLUDED.raw_response,\n  updated_at         = now()\nRETURNING interaction_id, contract_status, notes AS unscoreable_reason;",
+        "options": {
+          "queryReplacement": "={{ [ $('Prepare evaluation input').item.json.interaction_id, JSON.stringify(Object.assign({}, $('Two AI passes').item.json, { asr_confidence: $('Prepare evaluation input').item.json.asr_confidence })), $('Claim work').item.json.uniqueid, $('Claim work').item.json.claim_token ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      },
+      "notes": "Round 4 reversed the previous decision to write no row here. The worker returns a COMPLETE, storable pass-2 refusal -- rubric version, prompt version, a named model placeholder, contract_status 'unscoreable', gradeable false, final_score null and the reason in warnings[0] -- and dropping it hid the worst input-quality cases from every report: unscoreable_count was populated by nothing.\n\nOne row per outcome, written BEFORE the job is terminalised. Storage policy does not depend on whether pass 1 happened to run: the same call arriving with a pass 1 beside it is stored by 'Store evaluation' through 'Pass 2 usable?', and both land in unscoreable_count.\n\nReads $('Prepare evaluation input') and $('Two AI passes'), both of which ran on this path. 'Mark unscoreable' downstream cannot read either of them -- it is shared with the ASR-quality path, where 'Two AI passes' never ran -- so the reason it needs is handed to it in this node's RETURNING row instead."
+    },
+    {
+      "id": "unscoreable-stored",
+      "name": "Unscoreable stored?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4000,
+        620
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ !!$json.interaction_id && $json.contract_status === 'unscoreable' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "Zero rows from the fenced write means this execution no longer owns the job: its lease expired, the sweep reclaimed the row and somebody else may already be evaluating it successfully. Stop -- do NOT go on to dead-letter a row we no longer hold. The false output is deliberately a leaf, exactly like 'Pass 1 stored?' and 'Transcript stored?'.\n\nWithout this gate, 'Mark unscoreable' would read n8n's {success:true} placeholder as if it were the returned row and dead-letter the job with an invented reason. Its own lease guard would reject the UPDATE, but the workflow would be relying on a second fence to cover a fall-through the first one already reported.\n\nIt also checks contract_status, because the row it forwards is what supplies the reason text downstream."
     }
   ],
   "connections": {
@@ -481,6 +975,16 @@
         [
           {
             "node": "List recent recordings",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Recover expired leases",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Reconcile alert evaluations",
             "type": "main",
             "index": 0
           }
@@ -509,7 +1013,7 @@
         ]
       ]
     },
-    "Register discoveries": {
+    "Recover expired leases": {
       "main": [
         [
           {
@@ -524,7 +1028,25 @@
       "main": [
         [
           {
+            "node": "Route by work stage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by work stage": {
+      "main": [
+        [
+          {
             "node": "Cohere Arabic ASR",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load stored transcript",
             "type": "main",
             "index": 0
           }
@@ -535,14 +1057,14 @@
       "main": [
         [
           {
-            "node": "Transcript usable?",
+            "node": "Transcript returned?",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Transcript usable?": {
+    "Transcript returned?": {
       "main": [
         [
           {
@@ -564,14 +1086,26 @@
       "main": [
         [
           {
-            "node": "Link job transcribed",
+            "node": "Transcript stored?",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Link job transcribed": {
+    "Transcript stored?": {
+      "main": [
+        [
+          {
+            "node": "Load stored transcript",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Load stored transcript": {
       "main": [
         [
           {
@@ -593,7 +1127,54 @@
         ],
         [
           {
+            "node": "Confidence usable?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confidence usable?": {
+      "main": [
+        [
+          {
+            "node": "Begin judge attempt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark ASR failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Begin judge attempt": {
+      "main": [
+        [
+          {
+            "node": "Judge attempt started?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Judge attempt started?": {
+      "main": [
+        [
+          {
             "node": "Build follow-up history",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dead-letter judge budget",
             "type": "main",
             "index": 0
           }
@@ -601,6 +1182,17 @@
       ]
     },
     "Build follow-up history": {
+      "main": [
+        [
+          {
+            "node": "Prepare evaluation input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare evaluation input": {
       "main": [
         [
           {
@@ -626,7 +1218,48 @@
       "main": [
         [
           {
-            "node": "Store customer analysis",
+            "node": "Store pass1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Nothing to evaluate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store pass1": {
+      "main": [
+        [
+          {
+            "node": "Pass 1 stored?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pass 1 stored?": {
+      "main": [
+        [
+          {
+            "node": "Pass 2 usable?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Pass 2 usable?": {
+      "main": [
+        [
+          {
+            "node": "Store evaluation",
             "type": "main",
             "index": 0
           }
@@ -640,22 +1273,85 @@
         ]
       ]
     },
-    "Store customer analysis": {
+    "Store evaluation": {
       "main": [
         [
           {
-            "node": "Store evaluation",
+            "node": "Mark evaluated",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Store evaluation": {
+    "Mark evaluated": {
       "main": [
         [
           {
-            "node": "Mark evaluated",
+            "node": "Job finalised?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark judge failed": {
+      "main": [
+        [
+          {
+            "node": "Job finalised?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Job finalised?": {
+      "main": [
+        [
+          {
+            "node": "Evaluate alert rules",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Nothing to evaluate?": {
+      "main": [
+        [
+          {
+            "node": "Store unscoreable outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark judge failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store unscoreable outcome": {
+      "main": [
+        [
+          {
+            "node": "Unscoreable stored?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unscoreable stored?": {
+      "main": [
+        [
+          {
+            "node": "Mark unscoreable",
             "type": "main",
             "index": 0
           }
