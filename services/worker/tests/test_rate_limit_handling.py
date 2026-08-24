@@ -66,6 +66,14 @@ def slept(monkeypatch):
     return waits
 
 
+@pytest.fixture(autouse=True)
+def _reset_pacing_clock():
+    """The pacing clock is class-level on purpose; reset it between tests."""
+    judge.DeepSeekClient._last_request = 0.0
+    yield
+    judge.DeepSeekClient._last_request = 0.0
+
+
 def _client(monkeypatch, *responses, env=None):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     for key in ("DEEPSEEK_MODEL", "DEEPSEEK_THINKING", "DEEPSEEK_BASE_URL",
@@ -148,6 +156,22 @@ def test_pacing_spaces_consecutive_requests_when_configured(monkeypatch, slept):
     # The first request goes out immediately; the second waits out the interval.
     assert len(slept) == 1
     assert 0 < slept[0] <= 8
+
+
+def test_pacing_is_shared_across_instances(monkeypatch, slept):
+    """The regression that let a 429 through 18 minutes after pacing shipped.
+
+    `/evaluate` builds a fresh DeepSeekClient per request, so a per-instance
+    clock paces one evaluation against itself and never against the concurrent
+    evaluations that cause the burst. Two separate clients must pace against
+    each other or the setting is decorative.
+    """
+    a = _client(monkeypatch, _Resp(), env={"JUDGE_MIN_REQUEST_INTERVAL": "9"})
+    b = _client(monkeypatch, _Resp(), env={"JUDGE_MIN_REQUEST_INTERVAL": "9"})
+    a.complete_json("first")
+    b.complete_json("second")
+    assert len(slept) == 1, "the second client ignored the first client's request"
+    assert 0 < slept[0] <= 9
 
 
 def test_pacing_and_a_429_compose(monkeypatch, slept):

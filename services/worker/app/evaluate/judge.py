@@ -179,6 +179,10 @@ def _hash_input(*parts: str) -> str:
 
 
 class DeepSeekClient:
+    # Shared by every instance in the process: see _pace().
+    _pace_lock = threading.Lock()
+    _last_request = 0.0
+
     def __init__(self, api_key: str | None = None, model: str | None = None,
                  base_url: str | None = None, timeout: float = 180.0,
                  thinking: str | None = None):
@@ -207,16 +211,11 @@ class DeepSeekClient:
         # makes the score-comparability coordinate unrecoverable from the row.
         self._endpoint_host = (base_url.split("://", 1)[-1].split("/", 1)[0]
                                if base_url else "")
-        # Self-pacing, same shape as CohereAPIBackend: a per-minute rate limit
+        # Self-pacing, same intent as CohereAPIBackend: a per-minute rate limit
         # is defeated by spacing requests out, not by retrying into a window
         # that has not reopened. Default 0 = off, so the DeepSeek path is
-        # unchanged; set JUDGE_MIN_REQUEST_INTERVAL for a rate-limited
-        # endpoint. FastAPI runs sync handlers on a thread pool, so the
-        # check-and-set must be atomic or two concurrent evaluations both read
-        # a stale timestamp and burst anyway.
+        # unchanged; set JUDGE_MIN_REQUEST_INTERVAL for a rate-limited endpoint.
         self._min_interval = float(os.getenv("JUDGE_MIN_REQUEST_INTERVAL", "0"))
-        self._last_request = 0.0
-        self._pace_lock = threading.Lock()
         self._client = httpx.Client(
             base_url=base_url,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -224,14 +223,26 @@ class DeepSeekClient:
         )
 
     def _pace(self) -> None:
-        """Hold the next request back until `_min_interval` has passed."""
+        """Hold the next request back until `_min_interval` has passed.
+
+        The clock is CLASS-level, not per-instance, and that is the whole
+        point. `/evaluate` builds a fresh client per request, so per-instance
+        state paces a single evaluation against itself and does nothing
+        between the concurrent evaluations that actually cause the burst —
+        measured 2026-08-24: a 429 arrived 18 minutes AFTER per-instance
+        pacing went live, because the six requests racing each other each held
+        their own untouched clock.
+
+        FastAPI runs sync handlers on a thread pool, so the check-and-set must
+        be atomic or two threads both read a stale timestamp and burst anyway.
+        """
         if self._min_interval <= 0:
             return
-        with self._pace_lock:
-            wait = self._min_interval - (time.monotonic() - self._last_request)
+        with DeepSeekClient._pace_lock:
+            wait = self._min_interval - (time.monotonic() - DeepSeekClient._last_request)
             if wait > 0:
                 time.sleep(wait)
-            self._last_request = time.monotonic()
+            DeepSeekClient._last_request = time.monotonic()
 
     def complete_json(self, prompt: str, temperature: float = 0.0,
                       max_tokens: int = 8000, retries: int = 3) -> tuple[dict, dict]:
