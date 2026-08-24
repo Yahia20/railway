@@ -155,13 +155,27 @@ def _hash_input(*parts: str) -> str:
 
 class DeepSeekClient:
     def __init__(self, api_key: str | None = None, model: str | None = None,
-                 base_url: str = DEEPSEEK_BASE_URL, timeout: float = 180.0,
+                 base_url: str | None = None, timeout: float = 180.0,
                  thinking: str | None = None):
         key = api_key or os.getenv("DEEPSEEK_API_KEY")
         if not key:
             raise JudgeError("DEEPSEEK_API_KEY is not set")
         self.model = model or os.getenv("DEEPSEEK_MODEL") or DEFAULT_MODEL
+        # DEEPSEEK_BASE_URL lets the SAME judge code point at another
+        # OpenAI-compatible endpoint (e.g. OpenRouter) without touching the
+        # call sites. When unset, the DeepSeek default holds.
+        # DEEPSEEK_THINKING=omit drops the DeepSeek-specific `thinking` field
+        # entirely — required for endpoints that reject unknown parameters.
+        # DEEPSEEK_REASONING_EFFORT sends OpenRouter's unified reasoning
+        # control ({"reasoning": {"effort": ...}}). Not optional decoration for
+        # a reasoning model like stealth/ox-alpha: without it the model burned
+        # the WHOLE 8000-token budget on 26k characters of hidden reasoning and
+        # returned content=null on every real pass-2 prompt (measured
+        # 2026-08-24); with effort=low the same prompt answered valid JSON in
+        # 14s. Leave unset for DeepSeek, whose API rejects unknown fields.
+        base_url = base_url or os.getenv("DEEPSEEK_BASE_URL") or DEEPSEEK_BASE_URL
         self.thinking = thinking or os.getenv("DEEPSEEK_THINKING") or DEFAULT_THINKING
+        self.reasoning_effort = os.getenv("DEEPSEEK_REASONING_EFFORT") or None
         self._client = httpx.Client(
             base_url=base_url,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -188,6 +202,12 @@ class DeepSeekClient:
             "response_format": {"type": "json_object"},
             "thinking": {"type": self.thinking},
         }
+        if self.thinking == "omit":
+            # Non-DeepSeek endpoint: the field is DeepSeek-specific and some
+            # providers 400 on parameters they do not know.
+            del body["thinking"]
+        if self.reasoning_effort:
+            body["reasoning"] = {"effort": self.reasoning_effort}
         last: Exception | None = None
         for attempt in range(retries):
             try:
@@ -210,6 +230,17 @@ class DeepSeekClient:
                 usage["model"] = data.get("model")
                 usage["model_requested"] = self.model
                 usage["thinking"] = self.thinking
+                if self.reasoning_effort:
+                    usage["reasoning_effort"] = self.reasoning_effort
+                if content is None:
+                    # A reasoning model that burned the whole token budget
+                    # thinking returns content=null with finish_reason=length.
+                    # Surface it as a retryable JudgeError instead of an
+                    # AttributeError inside _extract_json.
+                    raise JudgeError(
+                        "model returned no content (finish_reason="
+                        f"{data['choices'][0].get('finish_reason')!r}; likely the "
+                        "whole max_tokens budget went to hidden reasoning)")
                 return _extract_json(content), usage
             except (httpx.HTTPError, KeyError, JudgeError) as exc:
                 last = exc
@@ -368,7 +399,8 @@ criterion key, not just the parts you changed.
 
 # Identity, not arithmetic: summing these would be nonsense and overwriting
 # them loses the only evidence that an evaluation straddled a backend change.
-_USAGE_IDENTITY_FIELDS = ("system_fingerprint", "model", "model_requested", "thinking")
+_USAGE_IDENTITY_FIELDS = ("system_fingerprint", "model", "model_requested", "thinking",
+                          "reasoning_effort")
 
 
 def _merge_usage(*usages: dict[str, Any]) -> dict[str, Any]:
