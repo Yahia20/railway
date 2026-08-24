@@ -176,6 +176,12 @@ class DeepSeekClient:
         base_url = base_url or os.getenv("DEEPSEEK_BASE_URL") or DEEPSEEK_BASE_URL
         self.thinking = thinking or os.getenv("DEEPSEEK_THINKING") or DEFAULT_THINKING
         self.reasoning_effort = os.getenv("DEEPSEEK_REASONING_EFFORT") or None
+        # Kept for the synthetic fingerprint below: when a non-DeepSeek
+        # endpoint returns no system_fingerprint, the endpoint host + routed
+        # provider + reasoning effort ARE the backend identity, and losing them
+        # makes the score-comparability coordinate unrecoverable from the row.
+        self._endpoint_host = (base_url.split("://", 1)[-1].split("/", 1)[0]
+                               if base_url else "")
         self._client = httpx.Client(
             base_url=base_url,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -227,6 +233,16 @@ class DeepSeekClient:
                 # is measuring the vendor's release schedule.
                 usage = dict(data.get("usage") or {})
                 usage["system_fingerprint"] = data.get("system_fingerprint")
+                if not usage["system_fingerprint"] and (
+                        self.reasoning_effort or os.getenv("DEEPSEEK_BASE_URL")):
+                    # OpenRouter-style endpoints return no system_fingerprint,
+                    # but the routed provider and the reasoning effort change
+                    # the judge's behaviour exactly the way a fingerprint flip
+                    # does. Compose one so model_fingerprint stays a real
+                    # comparability key instead of NULL (Sol, 2026-08-24).
+                    usage["system_fingerprint"] = (
+                        f"{self._endpoint_host}:{data.get('provider') or 'unknown'}"
+                        f":effort={self.reasoning_effort or 'default'}")
                 usage["model"] = data.get("model")
                 usage["model_requested"] = self.model
                 usage["thinking"] = self.thinking
@@ -585,7 +601,31 @@ def run_pass2(conversation: str, input_type: Literal["chat", "call_transcript"],
         for module in ungroundable
     ]
 
-    result = scoring.compute(modules, ungradeable_modules=ungroundable)
+    # JUDGE_M4_QUARANTINE: strike Module 4 whenever a follow-up history block
+    # was actually sent. Measured 2026-08-24 on the D6 fixtures: the ox-alpha
+    # judge scored the customer's OWN inbound callback as a failed agent
+    # follow-up (M4=0) three runs out of three, and missed the real outbound
+    # follow-up two out of three — with the rule already stated in the prompt.
+    # A judge that punishes agents for customers calling back cannot grade this
+    # module, so the module is null (out of numerator AND denominator, weight
+    # recomputed by scoring.compute), not zero and not trusted. Off by default;
+    # set the env only for models with a demonstrated M4 failure.
+    quarantine = set()
+    if os.getenv("JUDGE_M4_QUARANTINE"):
+        history = (followup_history or "").strip()
+        if history and history != "unavailable" and "module4_followup" not in ungroundable:
+            quarantine = {"module4_followup"}
+            ungradeable_modules.append({
+                "module": "module4_followup",
+                "reason": "m4_model_quarantine",
+                "discarded_criteria": [],
+            })
+            warnings.append(
+                "module4_followup: m4_model_quarantine — a follow-up history was "
+                "sent and this judge model mis-scores M4 (D6 0/6); module nulled, "
+                "weight recomputed")
+
+    result = scoring.compute(modules, ungradeable_modules=set(ungroundable) | quarantine)
 
     warnings += result.warnings
     warnings += scoring.validate_evidence(payload, conversation)

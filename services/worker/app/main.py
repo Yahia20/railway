@@ -109,6 +109,14 @@ def ready() -> dict:
         # scheduled for removal on 2026-07-24.
         "judge_model": settings.deepseek_model or judge.DEFAULT_MODEL,
         "judge_thinking": settings.deepseek_thinking or judge.DEFAULT_THINKING,
+        # The rest of the judge's effective backend configuration. On an
+        # OpenRouter-routed reasoning model a missing DEEPSEEK_REASONING_EFFORT
+        # is the difference between 14-second answers and content=null on every
+        # real prompt — a worker in that state must not look ready-and-normal
+        # here (Sol review, 2026-08-24).
+        "judge_base_url": os.getenv("DEEPSEEK_BASE_URL") or judge.DEEPSEEK_BASE_URL,
+        "judge_reasoning_effort": os.getenv("DEEPSEEK_REASONING_EFFORT"),
+        "judge_m4_quarantine": bool(os.getenv("JUDGE_M4_QUARANTINE")),
         "default_phone_region": settings.default_phone_region,
     }
 
