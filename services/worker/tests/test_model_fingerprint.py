@@ -48,6 +48,13 @@ class _Recorder:
 
 
 class _Response:
+    # `status_code` and `headers` are part of the httpx.Response surface the
+    # client reads (it branches on 429 and reads Retry-After before touching
+    # the body), so the double carries them too — a stub that omits them makes
+    # these tests pass against a client that could not run in production.
+    status_code = 200
+    headers: dict[str, str] = {}
+
     def __init__(self, data):
         self._data = data
 

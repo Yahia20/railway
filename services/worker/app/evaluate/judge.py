@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import re
 import time
 from dataclasses import dataclass, field
@@ -79,6 +80,30 @@ DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_THINKING = "disabled"
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+# Rate-limit handling. DeepSeek's paid endpoint has never returned 429 to this
+# worker; OpenRouter's free models do, per minute, and a burst of six calls
+# (the workflow's claim batch) is enough to trip it. These bound the wait so a
+# single /evaluate cannot outlive n8n's 300-second node timeout: worst case is
+# two waits of MAX_RATE_LIMIT_WAIT plus the model's own latency.
+RATE_LIMIT_BACKOFF = 20.0
+MAX_RATE_LIMIT_WAIT = 65.0
+
+
+def _retry_after_seconds(response) -> float | None:
+    """The server's own answer to "when may I try again", in seconds.
+
+    Accepts the numeric form only. The HTTP-date form is legal but no endpoint
+    we talk to sends it, and guessing a clock skew is worse than falling back
+    to our own backoff.
+    """
+    raw = (response.headers.get("Retry-After") or "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return None
 
 
 class JudgeError(RuntimeError):
@@ -182,11 +207,31 @@ class DeepSeekClient:
         # makes the score-comparability coordinate unrecoverable from the row.
         self._endpoint_host = (base_url.split("://", 1)[-1].split("/", 1)[0]
                                if base_url else "")
+        # Self-pacing, same shape as CohereAPIBackend: a per-minute rate limit
+        # is defeated by spacing requests out, not by retrying into a window
+        # that has not reopened. Default 0 = off, so the DeepSeek path is
+        # unchanged; set JUDGE_MIN_REQUEST_INTERVAL for a rate-limited
+        # endpoint. FastAPI runs sync handlers on a thread pool, so the
+        # check-and-set must be atomic or two concurrent evaluations both read
+        # a stale timestamp and burst anyway.
+        self._min_interval = float(os.getenv("JUDGE_MIN_REQUEST_INTERVAL", "0"))
+        self._last_request = 0.0
+        self._pace_lock = threading.Lock()
         self._client = httpx.Client(
             base_url=base_url,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             timeout=timeout,
         )
+
+    def _pace(self) -> None:
+        """Hold the next request back until `_min_interval` has passed."""
+        if self._min_interval <= 0:
+            return
+        with self._pace_lock:
+            wait = self._min_interval - (time.monotonic() - self._last_request)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request = time.monotonic()
 
     def complete_json(self, prompt: str, temperature: float = 0.0,
                       max_tokens: int = 8000, retries: int = 3) -> tuple[dict, dict]:
@@ -217,7 +262,23 @@ class DeepSeekClient:
         last: Exception | None = None
         for attempt in range(retries):
             try:
+                self._pace()
                 r = self._client.post("/chat/completions", json=body)
+                if r.status_code == 429:
+                    # A rate limit is not a transport blip: the generic
+                    # 1/2/4-second backoff below expires long before a
+                    # per-minute window resets, so all three attempts burn
+                    # inside the same closed window and the caller sees a hard
+                    # failure. Measured on OpenRouter 2026-08-24: six 429s in
+                    # a row, one evaluation lost per burst of six calls.
+                    # Honour Retry-After when the server sends one, cap the
+                    # wait so a single call cannot outlive n8n's 300 s node
+                    # timeout, and only then fall through to the retry.
+                    wait = _retry_after_seconds(r) or min(RATE_LIMIT_BACKOFF * (attempt + 1),
+                                                          MAX_RATE_LIMIT_WAIT)
+                    if attempt < retries - 1:
+                        time.sleep(min(wait, MAX_RATE_LIMIT_WAIT))
+                        continue
                 r.raise_for_status()
                 data = r.json()
                 content = data["choices"][0]["message"]["content"]

@@ -450,7 +450,19 @@ def evaluate(req: EvaluateRequest) -> dict:
     }
 
     if req.run_pass1:
-        p1 = judge.run_pass1(req.conversation, client=client)
+        # Same contract as pass 2 below: a judge that could not be reached or
+        # answered unusably is a 422, never a 500. Measured 2026-08-24 — an
+        # OpenRouter rate limit during pass 1 escaped as an unhandled
+        # JudgeError, and n8n recorded `500 - "Internal Server Error"`, which
+        # names no cause and reads like a worker fault rather than a throttled
+        # upstream.
+        try:
+            p1 = judge.run_pass1(req.conversation, client=client)
+        except judge.JudgeError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"pass 1 could not be produced: {exc}",
+            ) from exc
         out["pass1"] = {
             "payload": p1.payload, "prompt_version": p1.prompt_version,
             "model": p1.model, "usage": p1.usage, "input_hash": p1.input_hash,
