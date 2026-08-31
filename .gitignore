@@ -77,3 +77,9 @@ chunks/
 
 # local Claude Code settings (contain secrets)
 .claude/settings.local.json
+
+# Bitrix CRM exports — real customer names, phone numbers and deal values.
+# This repo is public (CLAUDE.md rule 7). The one-off phone backfill reads
+# these from disk; they are never committed.
+DEAL_*.csv
+CONTACT_*.csv

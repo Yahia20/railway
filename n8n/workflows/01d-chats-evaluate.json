@@ -1,0 +1,673 @@
+{
+  "name": "01d · Chats — evaluate stored threads",
+  "nodes": [
+    {
+      "id": "every-30-min",
+      "name": "Every 30 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/30 * * * *"
+            }
+          ]
+        }
+      },
+      "notes": "The idle window is 2 days; the tick only decides how soon after that a thread is picked up."
+    },
+    {
+      "id": "register-due",
+      "name": "Register due threads",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Register every thread the idle rule says is finished.\n--\n-- THE RULE IS NOT HERE. `v_chat_eval_due` (015) owns \"silent for 2 days, has\n-- both sides, at least 2 messages\". A copy of that predicate in this node\n-- would be a second definition to keep in step with the backfill's.\n--\n-- ALREADY-ANALYSED THREADS ARE REGISTERED AS 'evaluated', not skipped. A\n-- thread scored through workflow 01 has no job row; inserting it as done\n-- records that, and means the ON CONFLICT below can still reopen it if it\n-- grows. Skipping it instead would leave it invisible to this workflow\n-- forever and it would be re-judged from scratch the day it gained a message.\n--\n-- REOPENING. A thread that gains a message after being judged is judged again,\n-- against the fuller thread -- a score computed over half a conversation is\n-- worse than a late one. Only 'evaluated' and 'unscoreable' reopen:\n-- 'dead_letter' is a decision a human made and must not be undone by traffic,\n-- and 'evaluating' / 'judge_failed' / 'pending' are already in flight.\nINSERT INTO chat_eval_jobs (interaction_id, idle_through, status)\nSELECT d.interaction_id,\n       d.last_message_at,\n       CASE WHEN a.interaction_id IS NOT NULL THEN 'evaluated' ELSE 'pending' END\nFROM v_chat_eval_due d\nLEFT JOIN interaction_analysis a ON a.interaction_id = d.interaction_id\nON CONFLICT (interaction_id) DO UPDATE SET\n  status = CASE\n    WHEN EXCLUDED.idle_through > chat_eval_jobs.idle_through\n         AND chat_eval_jobs.status IN ('evaluated', 'unscoreable')\n      THEN 'pending'\n    ELSE chat_eval_jobs.status\n  END,\n  -- Attempts belong to the version of the thread they were spent on. A\n  -- reopened thread is a new piece of work and starts with a full budget.\n  judge_attempts = CASE\n    WHEN EXCLUDED.idle_through > chat_eval_jobs.idle_through\n         AND chat_eval_jobs.status IN ('evaluated', 'unscoreable')\n      THEN 0 ELSE chat_eval_jobs.judge_attempts\n  END,\n  next_attempt_at = CASE\n    WHEN EXCLUDED.idle_through > chat_eval_jobs.idle_through\n         AND chat_eval_jobs.status IN ('evaluated', 'unscoreable')\n      THEN now() ELSE chat_eval_jobs.next_attempt_at\n  END,\n  idle_through = GREATEST(chat_eval_jobs.idle_through, EXCLUDED.idle_through),\n  updated_at = now()\nRETURNING interaction_id, status;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "recover-leases",
+      "name": "Recover expired leases",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- A worker that died mid-judge leaves a job 'evaluating' with a lease nobody\n-- will ever release. Reclaim it once the lease is provably dead.\n--\n-- ATTEMPTS WERE ALREADY SPENT at claim time, so a crash loop cannot run\n-- forever: three expiries and the job is dead-lettered and visible, rather\n-- than retried silently until the judge budget is gone.\nUPDATE chat_eval_jobs\n   SET status = CASE WHEN judge_attempts >= 3 THEN 'dead_letter' ELSE 'judge_failed' END,\n       claim_token     = NULL,\n       claim_until     = NULL,\n       claimed_at      = NULL,\n       -- Back off further each time. A judge that is down stays down for\n       -- minutes, and hammering it is how a rate limit becomes a ban.\n       next_attempt_at = now() + (interval '5 minutes' * GREATEST(judge_attempts, 1)),\n       last_error      = 'lease expired after ' || judge_attempts\n                         || ' attempt(s): worker vanished mid-judge',\n       updated_at      = now()\n WHERE status = 'evaluating'\n   AND claim_until < now()\nRETURNING interaction_id, status;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "claim-work",
+      "name": "Claim work",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Take exactly one job, and make the taking visible to every other runner.\n--\n-- SKIP LOCKED, not a plain FOR UPDATE: two overlapping ticks must take\n-- different rows, never queue behind the same one. LIMIT 1 keeps a slow judge\n-- from holding a batch of leases it cannot finish inside them.\n--\n-- ATTEMPTS ARE INCREMENTED AT CLAIM TIME, not on failure. A worker that dies\n-- before it can record anything has still spent an attempt, and that is the\n-- only version of this counter that a crash cannot reset.\n--\n-- OLDEST IDLE FIRST: the thread that has been waiting longest is the one whose\n-- coaching is most overdue.\nWITH pick AS (\n  SELECT j.interaction_id\n  FROM chat_eval_jobs j\n  WHERE j.status IN ('pending', 'judge_failed')\n    AND j.next_attempt_at <= now()\n  ORDER BY j.idle_through\n  LIMIT 1\n  FOR UPDATE SKIP LOCKED\n)\nUPDATE chat_eval_jobs j\n   SET status         = 'evaluating',\n       claim_token    = gen_random_uuid(),\n       claimed_at     = now(),\n       -- Longer than the judge's own 300 s timeout plus both passes, so a slow\n       -- but healthy run is never reclaimed underneath itself.\n       claim_until    = now() + interval '15 minutes',\n       judge_attempts = j.judge_attempts + 1,\n       last_error     = NULL,\n       updated_at     = now()\n  FROM pick\n WHERE j.interaction_id = pick.interaction_id\nRETURNING j.interaction_id::text AS interaction_id,\n          j.claim_token::text    AS claim_token,\n          j.judge_attempts;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "notes": "Returns nothing when there is no work, which ends the execution here. That is the intended idle path -- no IF node required."
+    },
+    {
+      "id": "load-thread",
+      "name": "Load thread",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The thread as the judge must read it: every message, in the order it was\n-- sent.\n--\n-- ORDERED BY sent_at, NOT seq. 01c renumbers seq after every batch, and a\n-- thread read mid-renumber must still come out in the order the messages were\n-- actually sent. seq is the tie-break only.\n--\n-- TIMESTAMPS RENDERED EXPLICITLY IN UTC WITH THE OFFSET SPELLED OUT.\n-- to_jsonb() on a timestamptz renders it in the session TimeZone, which n8n\n-- does not set, so the same row could be handed to the worker as +03 today and\n-- +00 tomorrow. after_hours converts before comparing (gotcha 11), which it\n-- can only do if the offset actually arrives.\nSELECT i.interaction_id::text AS interaction_id,\n       i.external_id,\n       i.channel::text        AS channel,\n       coalesce(jsonb_agg(\n         jsonb_build_object(\n           'seq',     m.seq,\n           'sender',  m.sender::text,\n           'body',    m.body,\n           'sent_at', to_char(m.sent_at AT TIME ZONE 'UTC',\n                              'YYYY-MM-DD\"T\"HH24:MI:SS') || '+00:00'\n         ) ORDER BY m.sent_at, m.seq\n       ) FILTER (WHERE m.message_id IS NOT NULL), '[]'::jsonb) AS messages\nFROM interactions i\nLEFT JOIN chat_messages m ON m.interaction_id = i.interaction_id\nWHERE i.interaction_id = $1::uuid\nGROUP BY i.interaction_id, i.external_id, i.channel;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
+    },
+    {
+      "id": "prepare-input",
+      "name": "Prepare chat input",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORKER_URL }}/chats/prepare",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ external_id: $('Load thread').item.json.external_id, channel: $('Load thread').item.json.channel, messages: $('Load thread').item.json.messages }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Renders the transcript and computes the metrics. Both in the worker, never here: response gaps and after-hours are rules that live in evaluate/metrics.py, and a second copy in a workflow is a second copy to keep in step."
+    },
+    {
+      "id": "scoreable",
+      "name": "Scoreable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1320,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "scoreable-c",
+              "leftValue": "={{ $('Prepare chat input').item.json.should_evaluate === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "looseTypeValidation": true
+        }
+      },
+      "notes": "False for a bot-only thread, a thread with no customer turn, or a failed /chats/prepare. None of them is worth a judge call."
+    },
+    {
+      "id": "two-ai-passes",
+      "name": "Two AI passes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        180
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORKER_URL }}/evaluate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ conversation: $('Prepare chat input').item.json.transcript_text, input_type: 'chat', metadata: $('Prepare chat input').item.json.metrics, run_pass1: true, run_pass2: true }) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Two separate model calls behind one endpoint. Neither sees the other's output -- merging them lets an angry customer drag down the agent's score and a strong agent inflate the forecast."
+    },
+    {
+      "id": "evaluation-ok",
+      "name": "Evaluation ok?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1760,
+        180
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "evaluation-ok-c",
+              "leftValue": "={{ $('Two AI passes').item.json.pass1 !== undefined && $('Two AI passes').item.json.pass2 !== undefined && $('Two AI passes').item.json.pass2.contract_status !== 'unscoreable' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "looseTypeValidation": true
+        }
+      },
+      "notes": "pass1 is ABSENT on the unscoreable refusal, and interaction_analysis.prompt_version is NOT NULL -- so this must be tested before Store pass1, not after it fails."
+    },
+    {
+      "id": "store-pass1",
+      "name": "Store pass1",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1980,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n-- Pass 1 is stored on its own merit: a good customer extraction naming a hot\n-- lead survives a pass-2 failure, because it is the half that drives revenue.\n--\n-- FENCED. `r` selects FROM lease, so an execution whose lease was reclaimed\n-- writes nothing and returns nothing, and 'Pass 1 stored?' stops the chain.\n-- The lease is a real row lock (FOR UPDATE) on a LIVE claim, not an unlocked\n-- existence check: an unlocked check reads a snapshot and then lets go, and\n-- the recovery sweep can reclaim the row inside that window while this write\n-- still commits.\n--\n-- input_type IS 'chat'. It is what makes a chat score comparable only with\n-- other chat scores -- v_quality_by_input groups on it, and a chat averaged\n-- together with call transcripts compares typed text against 0.6-confidence\n-- ASR output.\n--\n-- ON CONFLICT REFRESHES EVERY VALUE DERIVED FROM THIS RESPONSE, including\n-- prompt_version and model. A re-judged thread whose provenance still names\n-- the previous run is what makes a prompt A/B unreadable six weeks later.\n\nWITH lease AS MATERIALIZED (\n  SELECT j.interaction_id\n  FROM chat_eval_jobs j\n  WHERE j.interaction_id = $3::uuid\n    AND j.claim_token    = $4::uuid\n    AND j.status         = 'evaluating'\n    AND j.claim_until    > now()\n  FOR UPDATE\n),\nr AS (SELECT $2::jsonb AS d FROM lease),\np AS (\n  SELECT coalesce(d->'pass1'->'payload', '{}'::jsonb)\n         || jsonb_build_object('pass1_validation',\n              coalesce(d->'pass1'->'payload'->'pass1_validation',\n                       d->'pass1'->'pass1_validation',\n                       '{}'::jsonb)) AS payload,\n         d\n  FROM r\n)\nINSERT INTO interaction_analysis (\n  interaction_id, schema_version, prompt_version, model, input_type,\n  source_quality, language, intent, summary_ar, confidence,\n  uncertain_fields, raw_response\n)\nSELECT\n  $1::uuid,\n  '1.0',\n  p.d->'pass1'->>'prompt_version',\n  p.d->'pass1'->>'model',\n  'chat'::input_type,\n  -- 1.00, and not by default: a chat is the customer's own typed words, with\n  -- no transcription step to lose or invent a digit. The column exists to let\n  -- a forecast weight a budget read off a 0.60-confidence transcript below one\n  -- the customer typed, and this is the case it is measuring against.\n  1.00,\n  left(p.payload->>'language', 2),\n  p.payload->>'intent',\n  p.payload->>'summary_ar',\n  (p.payload->>'confidence')::numeric,\n  coalesce(p.payload->'uncertain_fields', '[]'::jsonb),\n  p.payload\nFROM p\nON CONFLICT (interaction_id) DO UPDATE SET\n  schema_version   = EXCLUDED.schema_version,\n  prompt_version   = EXCLUDED.prompt_version,\n  model            = EXCLUDED.model,\n  input_type       = EXCLUDED.input_type,\n  source_quality   = EXCLUDED.source_quality,\n  language         = EXCLUDED.language,\n  intent           = EXCLUDED.intent,\n  summary_ar       = EXCLUDED.summary_ar,\n  confidence       = EXCLUDED.confidence,\n  uncertain_fields = EXCLUDED.uncertain_fields,\n  raw_response     = EXCLUDED.raw_response,\n  updated_at       = now()\nRETURNING interaction_id::text AS interaction_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, JSON.stringify($('Two AI passes').item.json), $('Claim work').item.json.interaction_id, $('Claim work').item.json.claim_token ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
+    },
+    {
+      "id": "pass1-stored",
+      "name": "Pass 1 stored?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2200,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "pass1-stored-c",
+              "leftValue": "={{ $('Store pass1').all().length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "looseTypeValidation": true
+        }
+      },
+      "notes": "Zero rows means the lease was reclaimed mid-judge. Stop: every write after this one would be a stale worker's."
+    },
+    {
+      "id": "store-eval",
+      "name": "Store evaluation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2420,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n-- Pass 2, with status as first-class columns (014).\n--\n-- FENCED, like every durable write here.\n--\n-- WHICH STATUSES REACH THIS NODE: 'ok' and 'ungradeable'. Both are stored --\n-- ungradeable is terminal data quality, and a row recording why there is no\n-- number is what keeps it out of a denominator instead of hidden from every\n-- report. 'unscoreable' never gets here (it is refused before pass 1 and has\n-- its own node), and 'contract_failed' is routed to 'Mark judge failed',\n-- which retries.\n--\n-- gradeable IS AND-ed WITH \"a score arrived\". A response claiming gradeable\n-- with a null score is self-contradictory, and storing it that way creates a\n-- state no view has a bucket for.\n\nWITH lease AS MATERIALIZED (\n  SELECT j.interaction_id\n  FROM chat_eval_jobs j\n  WHERE j.interaction_id = $3::uuid\n    AND j.claim_token    = $4::uuid\n    AND j.status         = 'evaluating'\n    AND j.claim_until    > now()\n  FOR UPDATE\n),\nr AS (SELECT $2::jsonb AS d FROM lease)\nINSERT INTO agent_evaluations (\n  interaction_id, agent_id, schema_version, prompt_version, rubric_version, model,\n  input_type, source_quality, final_score, performance_level, weight_applied,\n  m1_reception, m2_offer, m3_objections, m4_followup, m5_closing,\n  breakdown, evidence, stage_reached, behavior_flags,\n  contract_status, gradeable, ungradeable_modules, evidence_rejected,\n  model_fingerprint, top_strength, top_weakness, top_recommendation, notes,\n  raw_response\n)\nSELECT $1::uuid, i.agent_id, '1.0',\n  d->'pass2'->>'prompt_version', d->>'rubric_version', d->'pass2'->>'model',\n  'chat'::input_type,\n  1.00,\n  (d->'pass2'->>'final_score')::numeric,\n  d->'pass2'->>'performance_level',\n  (d->'pass2'->>'weight_applied')::numeric,\n  (d->'pass2'->'modules'->>'module1_reception')::numeric,\n  (d->'pass2'->'modules'->>'module2_offer')::numeric,\n  (d->'pass2'->'modules'->>'module3_objections')::numeric,\n  (d->'pass2'->'modules'->>'module4_followup')::numeric,\n  (d->'pass2'->'modules'->>'module5_closing')::numeric,\n  coalesce(d->'pass2'->'payload'->'modules', '{}'::jsonb),\n  coalesce(d->'pass2'->'payload'->'evidence', '[]'::jsonb),\n  nullif(d->'pass2'->'payload'->>'stage_reached', '')::conversation_stage,\n  coalesce(d->'pass2'->'payload'->'behavior_flags', '[]'::jsonb),\n  coalesce(nullif(d->'pass2'->>'contract_status', ''), 'ok'),\n  coalesce((d->'pass2'->>'gradeable')::boolean, true)\n    AND (d->'pass2'->>'final_score') IS NOT NULL,\n  CASE WHEN jsonb_typeof(d->'pass2'->'ungradeable_modules') = 'array'\n       THEN d->'pass2'->'ungradeable_modules' ELSE '[]'::jsonb END,\n  CASE WHEN jsonb_typeof(d->'pass2'->'evidence_rejected') = 'array'\n       THEN d->'pass2'->'evidence_rejected' ELSE '[]'::jsonb END,\n  nullif(coalesce(d->'pass2'->'usage'->>'system_fingerprint',\n                  d->'pass2'->>'system_fingerprint',\n                  d->'pass2'->>'model_fingerprint'), ''),\n  d->'pass2'->'payload'->'summary'->>'top_strength',\n  d->'pass2'->'payload'->'summary'->>'top_weakness',\n  d->'pass2'->'payload'->'summary'->>'top_recommendation',\n  d->'pass2'->'payload'->>'notes',\n  d->'pass2'->'payload'\nFROM interactions i, r\nWHERE i.interaction_id = $1::uuid\nON CONFLICT (interaction_id) DO UPDATE SET\n  agent_id            = EXCLUDED.agent_id,\n  schema_version      = EXCLUDED.schema_version,\n  prompt_version      = EXCLUDED.prompt_version,\n  rubric_version      = EXCLUDED.rubric_version,\n  model               = EXCLUDED.model,\n  input_type          = EXCLUDED.input_type,\n  source_quality      = EXCLUDED.source_quality,\n  final_score         = EXCLUDED.final_score,\n  performance_level   = EXCLUDED.performance_level,\n  weight_applied      = EXCLUDED.weight_applied,\n  m1_reception        = EXCLUDED.m1_reception,\n  m2_offer            = EXCLUDED.m2_offer,\n  m3_objections       = EXCLUDED.m3_objections,\n  m4_followup         = EXCLUDED.m4_followup,\n  m5_closing          = EXCLUDED.m5_closing,\n  breakdown           = EXCLUDED.breakdown,\n  evidence            = EXCLUDED.evidence,\n  stage_reached       = EXCLUDED.stage_reached,\n  behavior_flags      = EXCLUDED.behavior_flags,\n  contract_status     = EXCLUDED.contract_status,\n  gradeable           = EXCLUDED.gradeable,\n  ungradeable_modules = EXCLUDED.ungradeable_modules,\n  evidence_rejected   = EXCLUDED.evidence_rejected,\n  model_fingerprint   = EXCLUDED.model_fingerprint,\n  top_strength        = EXCLUDED.top_strength,\n  top_weakness        = EXCLUDED.top_weakness,\n  top_recommendation  = EXCLUDED.top_recommendation,\n  notes               = EXCLUDED.notes,\n  raw_response        = EXCLUDED.raw_response,\n  updated_at          = now()\nRETURNING interaction_id::text AS interaction_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, JSON.stringify($('Two AI passes').item.json), $('Claim work').item.json.interaction_id, $('Claim work').item.json.claim_token ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
+    },
+    {
+      "id": "assess-deal",
+      "name": "Assess deal",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2640,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n-- Assess the DEAL from the conversation that was just analysed.\n--\n-- WHY THIS EXISTS. The CRM stage is set by hand by the agent who owns the\n-- deal, and the agent who forgets to move a deal to 'lost' is the same agent\n-- whose conversations we are grading. So the outcome is read from what the\n-- customer actually said instead. stage_id and amount are NOT touched: the\n-- two disagreeing is the finding, and overwriting the CRM's answer with ours\n-- would destroy the comparison this whole column family exists to make.\n--\n-- THE MODEL DOES NOT DECIDE THE OUTCOME. deal_outcome_from_analysis() (015)\n-- maps the two things pass 1 can observe -- is_real_inquiry and buying_stage --\n-- onto won/lost/in_progress/no_opportunity/unknown by a fixed rule. Asking a\n-- model \"did this deal close\" gets a confident answer from a conversation that\n-- does not support one.\n--\n-- CREATING THE ROW IS NOT THE STUB THE INGEST RULE FORBIDS. Ingest must never\n-- invent a deal, because a deal with no stage, no amount and no owner pollutes\n-- every funnel report. This row is different in the two ways that matter: the\n-- id is the real Bitrix deal id the API sent, and origin = 'ai_derived' says\n-- exactly where it came from, so no report can mistake it for a CRM record.\n--\n-- LATEST CONVERSATION WINS. A deal can have many conversations, and only the\n-- most recent one's outcome is current. The guard compares CONVERSATION time\n-- (ai_conversation_at), not assessment time: re-judging an old thread today\n-- must not overwrite the outcome read from a newer one last week.\n\nWITH lease AS MATERIALIZED (\n  SELECT j.interaction_id\n  FROM chat_eval_jobs j\n  WHERE j.interaction_id = $3::uuid\n    AND j.claim_token    = $4::uuid\n    AND j.status         = 'evaluating'\n    AND j.claim_until    > now()\n  FOR UPDATE\n),\nsrc AS (\n  SELECT i.external_deal_id                              AS bitrix_deal_id,\n         i.interaction_id,\n         coalesce(i.ended_at, i.started_at)              AS conversation_at,\n         a.raw_response,\n         a.prompt_version,\n         a.model,\n         a.confidence\n  FROM lease\n  JOIN interactions i          ON i.interaction_id = lease.interaction_id\n  JOIN interaction_analysis a  ON a.interaction_id = i.interaction_id\n  WHERE i.external_deal_id IS NOT NULL\n    AND i.external_deal_id <> ''\n)\nINSERT INTO deals (\n  bitrix_deal_id, origin, service, lead_temp,\n  ai_outcome, ai_outcome_reason, ai_stage_reached, ai_service, ai_lead_temp,\n  ai_budget_amount, ai_currency, ai_confidence,\n  ai_assessed_at, ai_conversation_at, ai_assessed_from,\n  ai_prompt_version, ai_model\n)\nSELECT\n  src.bitrix_deal_id,\n  'ai_derived',\n  -- The non-ai columns are seeded once on INSERT so a brand-new row is not\n  -- entirely null, and never touched again by this workflow: if the CRM import\n  -- later fills them, that is the authoritative answer and this must not\n  -- overwrite it.\n  coalesce(nullif(src.raw_response->'trip'->>'service', ''), 'unknown')::service_type,\n  coalesce(nullif(src.raw_response->'commercial'->>'lead_temperature', ''), 'unknown')::lead_temperature,\n  deal_outcome_from_analysis(src.raw_response),\n  left(coalesce(src.raw_response->>'summary_ar', ''), 500),\n  src.raw_response->'commercial'->>'buying_stage',\n  coalesce(nullif(src.raw_response->'trip'->>'service', ''), 'unknown')::service_type,\n  coalesce(nullif(src.raw_response->'commercial'->>'lead_temperature', ''), 'unknown')::lead_temperature,\n  (src.raw_response->'commercial'->>'budget_amount')::numeric,\n  left(nullif(src.raw_response->'commercial'->>'budget_currency', ''), 3),\n  src.confidence,\n  now(),\n  src.conversation_at,\n  src.interaction_id,\n  src.prompt_version,\n  src.model\nFROM src\nON CONFLICT (bitrix_deal_id) DO UPDATE SET\n  ai_outcome         = EXCLUDED.ai_outcome,\n  ai_outcome_reason  = EXCLUDED.ai_outcome_reason,\n  ai_stage_reached   = EXCLUDED.ai_stage_reached,\n  ai_service         = EXCLUDED.ai_service,\n  ai_lead_temp       = EXCLUDED.ai_lead_temp,\n  ai_budget_amount   = EXCLUDED.ai_budget_amount,\n  ai_currency        = EXCLUDED.ai_currency,\n  ai_confidence      = EXCLUDED.ai_confidence,\n  ai_assessed_at     = EXCLUDED.ai_assessed_at,\n  ai_conversation_at = EXCLUDED.ai_conversation_at,\n  ai_assessed_from   = EXCLUDED.ai_assessed_from,\n  ai_prompt_version  = EXCLUDED.ai_prompt_version,\n  ai_model           = EXCLUDED.ai_model,\n  updated_at         = now()\nWHERE deals.ai_conversation_at IS NULL\n   OR EXCLUDED.ai_conversation_at >= deals.ai_conversation_at\nRETURNING bitrix_deal_id, ai_outcome, origin;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, '{}', $('Claim work').item.json.interaction_id, $('Claim work').item.json.claim_token ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "notes": "Reads the pass-1 row just written rather than the HTTP response, so the assessment can only ever describe an analysis that is actually stored. Outputs nothing when the thread carries no deal id, which is not a failure.",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "mark-evaluated",
+      "name": "Mark evaluated",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2860,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Terminal, and the happy path. Fenced: a job whose lease was reclaimed while\n-- the judge was running must not be marked done by the execution that lost it.\nUPDATE chat_eval_jobs\n   SET status      = 'evaluated',\n       claim_token = NULL,\n       claim_until = NULL,\n       claimed_at  = NULL,\n       last_error  = NULL,\n       updated_at  = now()\n WHERE interaction_id = $1::uuid\n   AND claim_token    = $2::uuid\n   AND status         = 'evaluating'\nRETURNING interaction_id::text AS interaction_id, status, judge_attempts;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, $('Claim work').item.json.claim_token ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "mark-unscoreable",
+      "name": "Mark unscoreable",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1760,
+        440
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Terminal, and NOT a failure. Three different kinds of nothing arrive here:\n-- a bot-only thread with no agent to grade, a thread where every turn is\n-- labelled as the agent (a source labelling fault, not a conversation), and a\n-- thread holding less text than the scoring minimum.\n--\n-- Retrying any of them re-asks a model that already answered, or asks one\n-- about a conversation that is not there, and can only manufacture a score. So\n-- the reason is written down and the job stops.\n--\n-- NO agent_evaluations ROW IS WRITTEN. Workflow 02 does write one for an\n-- unscoreable call, because a call that was recorded and could not be\n-- transcribed is a quality signal about the ASR. These are different: there is\n-- no agent turn to grade at all, and a row under an agent's name for a thread\n-- they never joined is worse than no row.\nUPDATE chat_eval_jobs\n   SET status      = 'unscoreable',\n       claim_token = NULL,\n       claim_until = NULL,\n       claimed_at  = NULL,\n       last_error  = left($3::text, 500),\n       updated_at  = now()\n WHERE interaction_id = $1::uuid\n   AND claim_token    = $2::uuid\n   AND status         = 'evaluating'\nRETURNING interaction_id::text AS interaction_id, status, last_error;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, $('Claim work').item.json.claim_token, ($('Prepare chat input').item.json.has_no_customer_turn ? 'every turn is labelled as the agent: a source labelling fault, not a conversation' : ($('Prepare chat input').item.json.is_bot_only ? 'bot-only thread: no human agent ever joined' : ('nothing to score: ' + JSON.stringify($('Prepare chat input').item.json).slice(0, 300)))) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "mark-unscoreable-model",
+      "name": "Mark unscoreable (refused)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2200,
+        320
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Terminal, and NOT a failure. Three different kinds of nothing arrive here:\n-- a bot-only thread with no agent to grade, a thread where every turn is\n-- labelled as the agent (a source labelling fault, not a conversation), and a\n-- thread holding less text than the scoring minimum.\n--\n-- Retrying any of them re-asks a model that already answered, or asks one\n-- about a conversation that is not there, and can only manufacture a score. So\n-- the reason is written down and the job stops.\n--\n-- NO agent_evaluations ROW IS WRITTEN. Workflow 02 does write one for an\n-- unscoreable call, because a call that was recorded and could not be\n-- transcribed is a quality signal about the ASR. These are different: there is\n-- no agent turn to grade at all, and a row under an agent's name for a thread\n-- they never joined is worse than no row.\nUPDATE chat_eval_jobs\n   SET status      = 'unscoreable',\n       claim_token = NULL,\n       claim_until = NULL,\n       claimed_at  = NULL,\n       last_error  = left($3::text, 500),\n       updated_at  = now()\n WHERE interaction_id = $1::uuid\n   AND claim_token    = $2::uuid\n   AND status         = 'evaluating'\nRETURNING interaction_id::text AS interaction_id, status, last_error;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, $('Claim work').item.json.claim_token, ('judge refused: ' + JSON.stringify(($('Two AI passes').item.json.pass2 || {}).warnings || [])) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "notes": "The transcript held less speech than the scoring minimum, so no model was called at all. Terminal, like the other refusals.",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "model-refused",
+      "name": "Refused as unscoreable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1980,
+        320
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "model-refused-c",
+              "leftValue": "={{ ($('Two AI passes').item.json.pass2 || {}).contract_status === 'unscoreable' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "looseTypeValidation": true
+        }
+      },
+      "notes": "Splits the two ways 'Evaluation ok?' can be false: a refusal that is terminal, and a judge failure that is retryable."
+    },
+    {
+      "id": "mark-failed",
+      "name": "Mark judge failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2200,
+        520
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Retryable. The judge was unreachable, rate limited, or still contradicted\n-- the rubric after its one correction.\n--\n-- Backed off by attempt number: a judge that is down stays down for minutes,\n-- and retrying immediately turns a rate limit into a ban.\nUPDATE chat_eval_jobs\n   SET status = CASE WHEN judge_attempts >= 3 THEN 'dead_letter' ELSE 'judge_failed' END,\n       claim_token     = NULL,\n       claim_until     = NULL,\n       claimed_at      = NULL,\n       next_attempt_at = now() + (interval '5 minutes' * GREATEST(judge_attempts, 1)),\n       last_error      = left($3::text, 500),\n       updated_at      = now()\n WHERE interaction_id = $1::uuid\n   AND claim_token    = $2::uuid\n   AND status         = 'evaluating'\nRETURNING interaction_id::text AS interaction_id, status, judge_attempts, last_error;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, $('Claim work').item.json.claim_token, ('judge failed: ' + JSON.stringify($('Two AI passes').item.json).slice(0, 400)) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true
+    }
+  ],
+  "connections": {
+    "Every 30 min": {
+      "main": [
+        [
+          {
+            "node": "Register due threads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Register due threads": {
+      "main": [
+        [
+          {
+            "node": "Recover expired leases",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recover expired leases": {
+      "main": [
+        [
+          {
+            "node": "Claim work",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim work": {
+      "main": [
+        [
+          {
+            "node": "Load thread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load thread": {
+      "main": [
+        [
+          {
+            "node": "Prepare chat input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare chat input": {
+      "main": [
+        [
+          {
+            "node": "Scoreable?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scoreable?": {
+      "main": [
+        [
+          {
+            "node": "Two AI passes",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark unscoreable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Two AI passes": {
+      "main": [
+        [
+          {
+            "node": "Evaluation ok?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluation ok?": {
+      "main": [
+        [
+          {
+            "node": "Store pass1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Refused as unscoreable?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store pass1": {
+      "main": [
+        [
+          {
+            "node": "Pass 1 stored?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pass 1 stored?": {
+      "main": [
+        [
+          {
+            "node": "Store evaluation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Store evaluation": {
+      "main": [
+        [
+          {
+            "node": "Assess deal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assess deal": {
+      "main": [
+        [
+          {
+            "node": "Mark evaluated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Refused as unscoreable?": {
+      "main": [
+        [
+          {
+            "node": "Mark unscoreable (refused)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark judge failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  }
+}

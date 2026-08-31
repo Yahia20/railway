@@ -22,6 +22,7 @@ from .config import settings
 from .evaluate import judge, metrics, scoring
 from .normalize.phone import try_normalize
 from .sources import CallRecording, get_call_source
+from .sources.base import Conversation, Message
 from .sources.bitrix_chats import BitrixWebhookSource
 from .sources.drive_calls import RecordingNameError, parse_recording_name
 
@@ -47,6 +48,29 @@ def require_api_key(x_api_key: str = Header(default="")) -> None:
 
 class ParseChatRequest(BaseModel):
     payload: dict[str, Any]
+
+
+class StoredMessage(BaseModel):
+    """One `chat_messages` row, as the database holds it."""
+
+    seq: int
+    sender: str
+    body: str
+    sent_at: str = Field(description="ISO-8601 with offset, straight from timestamptz")
+
+
+class PrepareChatRequest(BaseModel):
+    """A thread already stored by workflow 01c, on its way to the judge.
+
+    Workflow 01c stores and stops, so the conversation the judge must read is
+    spread over `chat_messages` rows rather than sitting in a webhook payload.
+    This is the same job `/chats/parse` does for a live Bitrix webhook, from
+    the other direction.
+    """
+
+    external_id: str
+    channel: str = "other"
+    messages: list[StoredMessage]
 
 
 class TranscribeRequest(BaseModel):
@@ -186,6 +210,82 @@ def parse_chat(req: ParseChatRequest) -> dict:
             {"seq": m.seq, "sender": m.sender, "body": m.body, "sent_at": m.sent_at.isoformat()}
             for m in conv.messages
         ],
+        "transcript_text": conv.transcript_text(),
+        "metrics": computed.as_dict(),
+    }
+
+
+@app.post("/chats/prepare", dependencies=[Depends(require_api_key)])
+def prepare_chat(req: PrepareChatRequest) -> dict:
+    """Turn stored `chat_messages` rows into what `/evaluate` needs.
+
+    Exists because storing and scoring are different pipelines. Workflow 01c
+    lands the production chat API's messages and stops; the thread the judge
+    reads therefore has to be rebuilt from rows, and the rebuild has to produce
+    EXACTLY what `/chats/parse` produces from a live webhook — same transcript
+    rendering, same metrics, same refusal rules — or a chat scored through one
+    path is not comparable with the same chat scored through the other.
+
+    So it builds the same `Conversation` and calls the same
+    `metrics.compute_chat_metrics`. Nothing here re-derives a response gap or
+    an after-hours rule; both live in `evaluate/metrics.py` and a second copy
+    in this function would be a second copy to keep in step.
+
+    `should_evaluate` is the caller's gate, and it is false for two different
+    kinds of nothing:
+
+    - `is_bot_only` — no human agent ever joined, so there is no agent to
+      grade. Scoring it produces a number about a bot and files it under a
+      person.
+    - `has_no_customer_turn` — every turn is labelled as the agent, which is a
+      labelling fault at the source rather than a conversation. Pass 1 would
+      read the customer's words as the agent's and pass 2 would grade the agent
+      on sentences the customer wrote, both confidently.
+    """
+    if not req.messages:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "no messages")
+
+    parsed: list[Message] = []
+    for m in req.messages:
+        try:
+            sent_at = datetime.fromisoformat(m.sent_at)
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"message seq {m.seq} has an unparseable sent_at {m.sent_at!r}",
+            ) from exc
+        # chat_messages.sent_at is timestamptz, so an offset is always present
+        # in practice. A naive value would silently be read as portal-local by
+        # is_after_hours, which is the bug gotcha 11 exists to prevent.
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=timezone.utc)
+        sender = m.sender if m.sender in ("customer", "agent", "bot", "system") else "unknown"
+        parsed.append(Message(seq=m.seq, sender=sender, body=m.body, sent_at=sent_at))
+
+    # Ordered by time, not by the caller's ordering or by seq: seq is renumbered
+    # by 01c after every batch, and a thread mid-renumber must still render in
+    # the order the messages were actually sent.
+    parsed.sort(key=lambda m: (m.sent_at, m.seq))
+
+    conv = Conversation(
+        external_id=req.external_id,
+        external_source="bitrix_chat_api",
+        channel=req.channel,
+        started_at=parsed[0].sent_at,
+        ended_at=parsed[-1].sent_at,
+        messages=parsed,
+    )
+    computed = metrics.compute_chat_metrics(conv)
+
+    return {
+        "external_id": conv.external_id,
+        "message_count": len(parsed),
+        "is_bot_only": conv.is_bot_only,
+        "has_no_customer_turn": conv.has_no_customer_turn,
+        "should_evaluate": (
+            (not conv.is_bot_only or settings.score_bot_only_conversations)
+            and not conv.has_no_customer_turn
+        ),
         "transcript_text": conv.transcript_text(),
         "metrics": computed.as_dict(),
     }
