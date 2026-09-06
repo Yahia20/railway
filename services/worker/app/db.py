@@ -37,6 +37,10 @@ log = logging.getLogger("worker.db")
 # The whole dashboard is counts over tables with the right indexes.
 STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "10000"))
 
+# How long to wait for a connection out of the pool before giving up. See the
+# `timeout=` note in _build_pool: this bounds the whole report, not one query.
+CONNECT_TIMEOUT_S = float(os.getenv("DB_CONNECT_TIMEOUT_S", "10"))
+
 _pool: Any = None
 _lock = threading.Lock()
 
@@ -55,6 +59,25 @@ def _build_pool() -> Any:
         raise DatabaseUnavailable(f"psycopg not installed: {exc}") from exc
 
     def configure(conn: Any) -> None:
+        """Session settings for every pooled connection.
+
+        AUTOCOMMIT FIRST, AND NOT AS A STYLE CHOICE. psycopg_pool requires a
+        configure function to hand the connection back idle. A plain
+        `conn.execute("SET ...")` opens an implicit transaction and leaves it
+        open, so the pool rejects the connection with
+
+            connection left in status INTRANS by configure function: discarded
+
+        and retries forever — every request then blocks for the pool timeout
+        and the endpoint hangs rather than failing. Setting autocommit first
+        makes each SET its own transaction and leaves nothing open. (Caught in
+        production, not in review: the pool is lazy, so nothing touches this
+        path until the first real report request.)
+
+        Both settings are SESSION scope, so they outlive the statement that set
+        them and cover every query this connection later runs.
+        """
+        conn.autocommit = True
         # Belt and braces: the role may already be read-only, but this endpoint
         # must be read-only regardless of how the database is provisioned.
         conn.execute("SET default_transaction_read_only = on")
@@ -66,6 +89,12 @@ def _build_pool() -> Any:
         max_size=settings.db_pool_max,
         kwargs={"row_factory": dict_row},
         configure=configure,
+        # Fail fast. The default is 30 seconds, and the report runs sixteen
+        # queries: a pool that cannot hand out connections would otherwise hold
+        # a single request for eight minutes before answering. Ten seconds is
+        # long enough for a cold connection over Railway's private network and
+        # short enough that a broken pool reports itself immediately.
+        timeout=CONNECT_TIMEOUT_S,
         # Do not connect at construction time. A database that is briefly down
         # must not stop the worker from starting and serving /health.
         open=False,
@@ -86,11 +115,30 @@ def get_pool() -> Any:
 
 @contextmanager
 def cursor() -> Iterator[Any]:
-    """A read-only cursor returning dict rows."""
+    """A read-only cursor returning dict rows.
+
+    A pool that cannot produce a connection is a database problem, not a query
+    problem, so it surfaces as DatabaseUnavailable — which `report._panel` lets
+    through to become one 503 instead of sixteen identical panel errors behind
+    a 200.
+    """
+    try:
+        from psycopg_pool import PoolTimeout
+    except ImportError:  # pragma: no cover - psycopg is a hard dependency
+        PoolTimeout = ()  # type: ignore[assignment]
+
     pool = get_pool()
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            yield cur
+    try:
+        conn_ctx = pool.connection()
+    except PoolTimeout as exc:  # pragma: no cover - needs a broken database
+        raise DatabaseUnavailable(f"no database connection: {exc}") from exc
+
+    try:
+        with conn_ctx as conn:
+            with conn.cursor() as cur:
+                yield cur
+    except PoolTimeout as exc:
+        raise DatabaseUnavailable(f"no database connection: {exc}") from exc
 
 
 def rows(sql: str, params: Any = None) -> list[dict]:

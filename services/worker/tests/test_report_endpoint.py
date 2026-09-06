@@ -193,3 +193,88 @@ def test_non_numeric_days_is_rejected_not_coerced(client):
     """FastAPI types the parameter, so this is a 422 and never reaches SQL."""
     res = client.get("/report/data?days=1;DROP", headers={"X-API-Key": KEY})
     assert res.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# The pool's configure contract
+#
+# This section exists because of a production incident. `configure` ran two
+# plain SETs, each of which opens an implicit transaction, so every connection
+# went back to the pool INTRANS. psycopg_pool discards such a connection and
+# reconnects, forever — /report/data hung for the full pool timeout on every
+# request while the log filled with
+#
+#     connection left in status INTRANS by configure function: discarded
+#
+# Nothing caught it before deploy: the pool is lazy, so no test and no import
+# ever reached this code path. These tests reach it without a database.
+# ---------------------------------------------------------------------------
+
+class FakeConn:
+    """Records what configure() does, in order."""
+
+    def __init__(self) -> None:
+        self.autocommit = False
+        self.statements: list[str] = []
+        self.autocommit_set_after: int | None = None
+
+    def __setattr__(self, name, value):
+        if name == "autocommit" and getattr(self, "statements", None) is not None:
+            object.__setattr__(self, "autocommit_set_after", len(self.statements))
+        object.__setattr__(self, name, value)
+
+    def execute(self, sql: str):
+        self.statements.append(sql)
+        return self
+
+
+def _capture_configure(monkeypatch):
+    """Build the pool against a stubbed ConnectionPool and return the real
+    `configure` callable the module passed in."""
+    captured: dict = {}
+
+    class StubPool:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def open(self):
+            pass
+
+    import psycopg_pool
+    monkeypatch.setattr(psycopg_pool, "ConnectionPool", StubPool)
+    monkeypatch.setattr(settings, "database_url", "postgresql://stub/db", raising=False)
+    monkeypatch.setattr(db, "_pool", None, raising=False)
+    db.get_pool()
+    return captured
+
+
+def test_configure_sets_autocommit_before_any_statement(monkeypatch):
+    """The whole incident in one assertion: autocommit must be on BEFORE the
+    SETs, or each SET leaves the connection in a transaction."""
+    captured = _capture_configure(monkeypatch)
+    conn = FakeConn()
+    captured["configure"](conn)
+
+    assert conn.autocommit is True, "configure must put the connection in autocommit"
+    assert conn.autocommit_set_after == 0, (
+        "autocommit was set after %d statement(s); it must come first, or those "
+        "statements open a transaction the pool then discards"
+        % conn.autocommit_set_after)
+
+
+def test_configure_applies_both_session_settings(monkeypatch):
+    captured = _capture_configure(monkeypatch)
+    conn = FakeConn()
+    captured["configure"](conn)
+
+    joined = " ".join(conn.statements).lower()
+    assert "default_transaction_read_only = on" in joined
+    assert "statement_timeout" in joined
+
+
+def test_pool_waits_a_bounded_time_for_a_connection(monkeypatch):
+    """The report runs sixteen queries. At psycopg's 30-second default, a pool
+    that cannot connect holds one request for eight minutes."""
+    captured = _capture_configure(monkeypatch)
+    assert captured["timeout"] <= 15, "pool timeout must be short enough to fail fast"
+    assert captured["open"] is False, "the pool must not connect at import time"
