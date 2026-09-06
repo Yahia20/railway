@@ -61,43 +61,61 @@ Its rows were migrated from `external_source = 'bitrix'` to `'bitrix_chat_api'`
 so threads would not split across the two namespaces. The 16 older rows still
 under `'bitrix'` belong to workflow 01 and were deliberately left alone.
 
-### What is still open — measured 2026-09-06, not assumed
+### What is still open — measured 2026-09-06 against the live n8n and database
 
 Read `/report` first; these are the things it cannot fix by itself.
 
-1. **The live 01d is older than this repo.** 30 chats were judged on 2026-09-06
-   and wrote **zero** `model_calls` and **zero** `interaction_requests`. The
-   repo's 01d wires `Record model cost` and `Store requests` correctly (checked
-   the graph — both have edges in and out), so the running copy predates 017.
-   That breaks rule 11 twice over: no bill, and no `UNIQUE` guard against paying
-   for the same judgement again. Fix: `python scripts/n8n_deploy.py 01d 02 03
-   --activate`, which also ships the timezone fix. Needs `N8N_API_KEY`.
-2. **Bitrix has never been called.** The n8n service has 35 variables and none
-   of them is `BITRIX_PORTAL_DOMAIN`, `BITRIX_WEBHOOK_TOKEN` or
-   `BITRIX_WEBHOOK_USER_ID`, so workflow 04 builds
-   `https:///rest/1//crm.deal.list.json` and fails — which is why `customers` is
-   0 and only 13 of 921 chat threads are linked to a deal. The worker holds
-   `BITRIX_WEBHOOK_SECRET`, but that is the *inbound* webhook secret; the
-   outbound REST token does not exist anywhere. `python -m
-   app.sources.bitrix_chats --probe` reports what the portal exposes.
-3. **Modal is not deployed.** Needs `travelgate-db`, `travelgate-drive` and
-   `travelgate-hf` secrets, plus accepting the model licence on Hugging Face.
-   Note the README in `Yahia20/model-hosting` is an older draft (monthly batch,
-   one `asr-secrets`, tables that were renamed) — `modal/transcribe_job.py`
-   here supersedes it. Nothing is stranded today (`/report` says 0), but 017
-   moved transcription out of workflow 02, so the first NEW recording Drive
-   gains has no owner at all.
-4. **RTFx is unmeasured.** Every Modal cost figure assumes 120. The first real
+**A correction, because this file carried the wrong version for a few hours.**
+`model_calls` and `interaction_requests` are 0, and the first explanation
+written down was "the live 01d predates 017". That was wrong — the n8n API says
+live 01d has all 20 nodes and matches the repo exactly. The real reason is
+simpler: **every workflow was redeployed at 14:19–14:26 UTC on 2026-09-06 and
+none of them has run since.** Their crons are night-only, so the first run of
+the current code is tonight. The 30 chats judged at 14:16 were the *previous*
+deployment, whose 02 had a node called "Every 15 min". Diff the live copy
+before explaining a number; the n8n API returns it.
+
+1. **Bitrix has a webhook now, and it has no permissions.**
+   `https://travelgate.bitrix24.ae/rest/128/<token>` answers `profile` (user
+   128, `ADMIN: true`) but `scope` comes back **empty**, so `crm.deal.list`,
+   `crm.contact.list`, `crm.deal.fields` and `user.get` all return
+   `insufficient_scope`. Workflow 04 writes nothing until CRM is ticked under
+   "Assign permissions" on that webhook. Check with
+   `python scripts/bitrix_probe.py` — the older
+   `app.sources.bitrix_chats --probe` tests the chat-pull methods, which
+   workflow 04 does not use.
+   **Note the domain.** This repo and `.env.example` say
+   `cultiv.bitrix24.com`; the working webhook is on `travelgate.bitrix24.ae`.
+   Confirm which portal actually holds the deals before trusting either.
+   The three variables are still **not set on the n8n service** — setting them
+   restarts n8n, so do it once, after the scope is fixed:
+   ```
+   railway variables --service n8n      --set BITRIX_PORTAL_DOMAIN=travelgate.bitrix24.ae      --set BITRIX_WEBHOOK_USER_ID=128 --set BITRIX_WEBHOOK_TOKEN=...
+   ```
+2. **Modal needs only its own token.** The Hugging Face side is done —
+   verified `hf_…` reads `CohereLabs/cohere-transcribe-arabic-07-2026` and
+   `config.json` returns 200, so the gated licence **is** accepted. What is
+   left is `modal setup` (needs a browser, or `MODAL_TOKEN_ID` /
+   `MODAL_TOKEN_SECRET`) and the three secrets. The README in
+   `Yahia20/model-hosting` is an older draft (monthly batch, one
+   `asr-secrets`, renamed tables) — `modal/transcribe_job.py` here supersedes
+   it. Nothing is stranded today (`/report` says 0), but 017 moved
+   transcription out of workflow 02, so the first NEW recording Drive gains
+   has no owner at all.
+3. **RTFx is unmeasured.** Every Modal cost figure assumes 120. The first real
    run writes the truth into `asr_runs.rtfx`; `benchmark-runpod/` in
    `Yahia20/model-hosting` settles it for about $1.
-5. **503 chat threads are due and 11 are stuck** in `evaluating` since
-   2026-08-31 with expired leases; 222 have sat `pending` since the same day.
-   The recovery sweep reopens expired leases, so this clears itself once 01d
-   runs on a schedule that fires.
-6. **DPA / PDPL** before customer audio leaves for any processor.
-7. **Drive's own retention** — `purge_raw_content` blanks call text after a
+4. **503 chat threads are due**, 11 stuck in `evaluating` since 2026-08-31 with
+   expired leases, 222 `pending` since the same day. The recovery sweep reopens
+   expired leases, so tonight's first 01d run should start draining this.
+5. **DPA / PDPL** before customer audio leaves for any processor.
+6. **Drive's own retention** — `purge_raw_content` blanks call text after a
    year. If Drive deletes the WAV sooner, that conversation is gone from the
    world. Confirm, or widen the window (call text is only ~0.14 GB/year).
+
+**Done 2026-09-06, live:** every scheduled workflow now carries
+`settings.timezone: Asia/Riyadh` (verified through the n8n API), and the worker
+serves `/report`.
 
 ---
 
