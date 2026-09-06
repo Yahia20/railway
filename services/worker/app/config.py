@@ -60,6 +60,10 @@ class Settings:
     bitrix_portal_domain: str | None = field(default_factory=lambda: _env("BITRIX_PORTAL_DOMAIN"))
     bitrix_webhook_token: str | None = field(default_factory=lambda: _env("BITRIX_WEBHOOK_TOKEN"))
     bitrix_webhook_secret: str | None = field(default_factory=lambda: _env("BITRIX_WEBHOOK_SECRET"))
+    # The inbound webhook is created under a specific portal user, and the id is
+    # part of the REST path. Bitrix's own examples use 1, which is why that was
+    # the old default; the working webhook here belongs to user 128.
+    bitrix_webhook_user_id: str = field(default_factory=lambda: _env("BITRIX_WEBHOOK_USER_ID", "1"))
 
     drive_folder_id: str | None = field(default_factory=lambda: _env("DRIVE_CALLS_FOLDER_ID"))
     drive_credentials_json: str | None = field(default_factory=lambda: _env("GOOGLE_SERVICE_ACCOUNT_JSON"))

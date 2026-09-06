@@ -756,3 +756,104 @@ def report_data(days: int = 30, limit: int = report.SAMPLE_LIMIT) -> dict:
         return report.build(days=days, limit=limit)
     except db.DatabaseUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Bitrix CRM pulls
+#
+# WHY THESE ARE HERE AND NOT IN n8n. Workflow 04 called crm.deal.list directly
+# with `start: 0` and never followed `next`. Bitrix pages every list method at
+# 50 rows, so 04 imported 50 of the 676 deals modified in the last week, every
+# night, and reported success — the missing 626 were invisible because a short
+# page and a small result set look identical.
+#
+# Paging is a loop with a stop condition, which is the kind of thing this split
+# puts in Python: n8n schedules and branches, the worker does the work.
+# ---------------------------------------------------------------------------
+
+DEAL_SELECT = [
+    "ID", "TITLE", "STAGE_ID", "STAGE_SEMANTIC_ID", "CATEGORY_ID",
+    "OPPORTUNITY", "CURRENCY_ID", "CONTACT_ID", "ASSIGNED_BY_ID",
+    "SOURCE_ID", "DATE_CREATE", "DATE_MODIFY", "BEGINDATE", "CLOSEDATE",
+]
+
+
+class BitrixDealsRequest(BaseModel):
+    days: int = Field(default=7, ge=1, le=365,
+                      description="Look back this many days on DATE_MODIFY.")
+    max_rows: int = Field(default=5000, ge=1, le=20000)
+
+
+class BitrixContactsRequest(BaseModel):
+    contact_ids: list[str] = Field(default_factory=list)
+    max_rows: int = Field(default=5000, ge=1, le=20000)
+
+
+def _bitrix_rest() -> "BitrixRestSource":
+    settings.validate_for("chats")
+    from .sources.bitrix_chats import BitrixRestSource
+    return BitrixRestSource(
+        portal_domain=settings.bitrix_portal_domain,
+        webhook_token=settings.bitrix_webhook_token,
+        user_id=settings.bitrix_webhook_user_id,
+    )
+
+
+@app.post("/bitrix/deals", dependencies=[Depends(require_api_key)])
+def bitrix_deals(req: BitrixDealsRequest) -> dict:
+    """Every deal modified in the last `days`, all pages.
+
+    The shape is Bitrix's own — `{"result": [...]}` — so the SQL in workflow 04
+    that reads `$json.result` did not have to change when paging moved here.
+
+    ONLY THE ALLOWLISTED FIELDS (rule 8). The raw deal carries
+    UF_CRM_1781281581, which holds prose addressed to a bot, and a dozen fields
+    holding another system's AI verdicts on the very things this project derives
+    from the conversation with evidence. `select` is the allowlist.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=req.days)).date().isoformat()
+    src = _bitrix_rest()
+    try:
+        rows, total, requests = src.list_all(
+            "crm.deal.list", select=DEAL_SELECT,
+            filter={">DATE_MODIFY": since}, max_rows=req.max_rows)
+    except Exception as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"bitrix: {exc}") from exc
+
+    return {
+        "result": rows,
+        # `total` is what Bitrix says matched. When it exceeds len(result) the
+        # pull was truncated by max_rows, and the caller can see that rather
+        # than inferring completeness from a successful response.
+        "total": total,
+        "fetched": len(rows),
+        "truncated": len(rows) < total,
+        "requests": requests,
+        "since": since,
+    }
+
+
+@app.post("/bitrix/contacts", dependencies=[Depends(require_api_key)])
+def bitrix_contacts(req: BitrixContactsRequest) -> dict:
+    """Phones for a specific list of contact ids, all pages.
+
+    Bitrix caps a `filter: {ID: [...]}` result at 50 like everything else, so
+    asking for 500 ids and reading one page returned the first 50 and silently
+    dropped the rest — the same bug as the deals pull, one node later.
+    """
+    ids = [str(i).strip() for i in req.contact_ids if str(i).strip()]
+    if not ids:
+        return {"result": [], "total": 0, "fetched": 0,
+                "truncated": False, "requests": 0}
+
+    src = _bitrix_rest()
+    try:
+        rows, total, requests = src.list_all(
+            "crm.contact.list", select=["ID", "PHONE"],
+            filter={"ID": ids}, max_rows=req.max_rows)
+    except Exception as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"bitrix: {exc}") from exc
+
+    return {"result": rows, "total": total, "fetched": len(rows),
+            "truncated": len(rows) < total, "requests": requests,
+            "requested_ids": len(ids)}

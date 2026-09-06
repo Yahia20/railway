@@ -204,11 +204,23 @@ def test_retention_reads_its_window_from_the_function_not_the_node():
 
 def test_bitrix_pull_asks_only_for_allowlisted_fields():
     """UF_CRM_1781281581 contains prose addressed to a bot, and a dozen fields
-    hold another system's AI verdicts on the same questions we answer."""
-    body = nodes(load(HOUSE))["Fetch Bitrix deals"]["parameters"]["jsonBody"]
-    assert "UF_CRM" not in body
+    hold another system's AI verdicts on the same questions we answer.
+
+    The allowlist moved into the worker when paging did — workflow 04 read one
+    page of 50 and dropped the other 626 deals — so this now checks the worker
+    constant, plus the fact that the workflow can no longer reach Bitrix and
+    bypass it."""
+    from app.main import DEAL_SELECT
+
+    assert not [f for f in DEAL_SELECT if f.startswith("UF_")]
     for field in ("ID", "STAGE_ID", "OPPORTUNITY", "CONTACT_ID", "DATE_MODIFY"):
-        assert f"'{field}'" in body
+        assert field in DEAL_SELECT
+
+    for node in load(HOUSE)["nodes"]:
+        url = node.get("parameters", {}).get("url", "")
+        assert "bitrix24" not in url and "crm." not in url, (
+            f"{node['name']} calls Bitrix directly, bypassing both the paging "
+            f"loop and DEAL_SELECT")
 
 
 # ---------------------------------------------------------------------------

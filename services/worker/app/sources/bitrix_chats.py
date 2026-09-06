@@ -266,6 +266,83 @@ class BitrixRestSource:
             raise RuntimeError(f"bitrix {method}: {data.get('error_description', data['error'])}")
         return data
 
+    # Bitrix pages every *.list method at 50 rows and will not return more,
+    # whatever you ask for. The response carries `next` (the offset of the row
+    # after the last one sent) and `total`; when `next` is absent you have
+    # everything. A caller that sends `start: 0` once and stops therefore reads
+    # exactly 50 rows and has no way to tell that from "there were only 50" —
+    # which is what workflow 04 did, importing 50 of 676 modified deals a night
+    # while every log line said success.
+    PAGE = 50
+
+    # Bitrix answers a burst of page requests with a 5xx or QUERY_LIMIT_EXCEEDED
+    # often enough to see it in a handful of runs. Without a retry that is a
+    # whole night skipped: workflow 04 runs once at 03:20, and a page that
+    # fails takes the rest of the pull with it. Backoff is short because the
+    # limit is a leaky bucket, not a ban.
+    RETRIES = 4
+    RETRY_BACKOFF_S = 1.5
+    TRANSIENT = ("query_limit_exceeded", "operation_time_limit",
+                 "internal_server_error", "overloaded", "timeout")
+
+    def _call_with_retry(self, method: str, params: dict) -> dict:
+        import time
+
+        last: Exception | None = None
+        for attempt in range(self.RETRIES):
+            try:
+                return self.call(method, **params)
+            except httpx.HTTPStatusError as exc:
+                last = exc
+                if exc.response.status_code < 500 and exc.response.status_code != 429:
+                    raise
+            except httpx.TransportError as exc:
+                last = exc
+            except RuntimeError as exc:
+                last = exc
+                if not any(t in str(exc).lower() for t in self.TRANSIENT):
+                    raise
+            if attempt < self.RETRIES - 1:
+                time.sleep(self.RETRY_BACKOFF_S * (attempt + 1))
+        raise last  # type: ignore[misc]
+
+    def list_all(self, method: str, *, select: list[str] | None = None,
+                 filter: dict | None = None, order: dict | None = None,
+                 max_rows: int = 5000) -> tuple[list[dict], int, int]:
+        """Follow `next` to the end of a Bitrix list method.
+
+        Returns (rows, total_reported_by_bitrix, requests_made). `max_rows` is a
+        stop, not a page size: a filter that accidentally matches the whole CRM
+        should cost a bounded number of requests, not 470 of them, and the
+        caller can see it was truncated by comparing len(rows) with total.
+        """
+        rows: list[dict] = []
+        start = 0
+        requests = 0
+        total = 0
+
+        while True:
+            params: dict = {"start": start}
+            if select:
+                params["select"] = select
+            if filter:
+                params["filter"] = filter
+            if order:
+                params["order"] = order
+
+            data = self._call_with_retry(method, params)
+            requests += 1
+            batch = data.get("result") or []
+            total = int(data.get("total") or len(batch))
+            rows.extend(batch)
+
+            nxt = data.get("next")
+            if nxt is None or not batch or len(rows) >= max_rows:
+                break
+            start = int(nxt)
+
+        return rows[:max_rows], total, requests
+
     def probe(self) -> dict[str, str]:
         """Which of the methods we need does this portal actually expose?"""
         wanted = [

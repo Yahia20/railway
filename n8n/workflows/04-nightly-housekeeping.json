@@ -25,12 +25,21 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "=https://{{ $env.BITRIX_PORTAL_DOMAIN }}/rest/{{ $env.BITRIX_WEBHOOK_USER_ID || 1 }}/{{ $env.BITRIX_WEBHOOK_TOKEN }}/crm.deal.list.json",
+        "url": "={{ $env.WORKER_URL }}/bitrix/deals",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ select: ['ID','TITLE','STAGE_ID','STAGE_SEMANTIC_ID','CATEGORY_ID','OPPORTUNITY','CURRENCY_ID','CONTACT_ID','ASSIGNED_BY_ID','SOURCE_ID','DATE_CREATE','DATE_MODIFY','BEGINDATE','CLOSEDATE'], filter: { '>DATE_MODIFY': new Date(Date.now() - 7*24*3600*1000).toISOString().slice(0,10) }, start: 0 }) }}",
+        "jsonBody": "={{ JSON.stringify({ days: 7 }) }}",
         "options": {
-          "timeout": 120000
+          "timeout": 180000
         }
       },
       "type": "n8n-nodes-base.httpRequest",
@@ -42,7 +51,7 @@
       "id": "fetch-bitrix-deals",
       "name": "Fetch Bitrix deals",
       "onError": "continueRegularOutput",
-      "notes": "DEAL_FIELD_ALLOWLIST, verbatim from sources/bitrix_chats.py. Only deals modified in the last 7 days: the CRM holds 2,496 and re-reading all of them nightly buys nothing.\n\nUNVERIFIED AGAINST THE PORTAL. bitrix_chats.py says so in writing for the imopenlines methods; crm.deal.list is the best documented of the set but has still never been called against cultiv.bitrix24.com. Run the probe before trusting a run."
+      "notes": "Was a direct crm.deal.list with start:0 and no paging, so it imported 50 of the 676 deals modified in a week -- every night, reporting success. Bitrix pages every list method at 50 and a short page is indistinguishable from a small result set. Paging is a loop with a stop condition, so it lives in the worker; this is one call. The response keeps Bitrix's own {result: [...]} shape, which is why the SQL below did not change."
     },
     {
       "parameters": {
@@ -156,12 +165,21 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "=https://{{ $env.BITRIX_PORTAL_DOMAIN }}/rest/{{ $env.BITRIX_WEBHOOK_USER_ID || 1 }}/{{ $env.BITRIX_WEBHOOK_TOKEN }}/crm.contact.list.json",
+        "url": "={{ $env.WORKER_URL }}/bitrix/contacts",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ select: ['ID','PHONE'], filter: { ID: $json.contact_ids || [] } }) }}",
+        "jsonBody": "={{ JSON.stringify({ contact_ids: $json.contact_ids || [] }) }}",
         "options": {
-          "timeout": 120000
+          "timeout": 180000
         }
       },
       "type": "n8n-nodes-base.httpRequest",
@@ -173,7 +191,7 @@
       "id": "fetch-bitrix-contacts",
       "name": "Fetch Bitrix contacts",
       "onError": "continueRegularOutput",
-      "notes": "ID and PHONE only. A contact record also carries name, email and assorted UF_ fields; none of them is needed to link a conversation to a person, and every one of them would be personal data stored for no stated purpose."
+      "notes": "Same paging bug one node later: filter {ID: [...500 ids]} is capped at 50 rows like everything else, so 450 contacts were dropped silently and their conversations kept a null phone -- which is exactly what stops workflow 03 creating a customer."
     },
     {
       "parameters": {
