@@ -61,61 +61,69 @@ Its rows were migrated from `external_source = 'bitrix'` to `'bitrix_chat_api'`
 so threads would not split across the two namespaces. The 16 older rows still
 under `'bitrix'` belong to workflow 01 and were deliberately left alone.
 
-### What is still open — measured 2026-09-06 against the live n8n and database
+### Where things stand — 2026-09-07, measured, not assumed
 
-Read `/report` first; these are the things it cannot fix by itself.
+Open `/report` first (below). Everything here was checked against the live n8n
+API, the live database and the live Bitrix portal on the night of 06→07 Sept.
 
-**A correction, because this file carried the wrong version for a few hours.**
-`model_calls` and `interaction_requests` are 0, and the first explanation
-written down was "the live 01d predates 017". That was wrong — the n8n API says
-live 01d has all 20 nodes and matches the repo exactly. The real reason is
-simpler: **every workflow was redeployed at 14:19–14:26 UTC on 2026-09-06 and
-none of them has run since.** Their crons are night-only, so the first run of
-the current code is tonight. The 30 chats judged at 14:16 were the *previous*
-deployment, whose 02 had a node called "Every 15 min". Diff the live copy
-before explaining a number; the n8n API returns it.
+**The pipeline ran end to end for the first time.** 01d judged at 00:15 Riyadh,
+inside the window, `priced_at_peak = 0`, and wrote the first ever rows to
+`model_calls` and `interaction_requests`. One conversation costs **$0.008**
+(pass1 $0.0029 + pass2 $0.0051), and DeepSeek's prefix cache served 10,624 of
+10,732 prompt tokens — the static prompt is essentially free after the first
+call.
 
-1. **Bitrix has a webhook now, and it has no permissions.**
-   `https://travelgate.bitrix24.ae/rest/128/<token>` answers `profile` (user
-   128, `ADMIN: true`) but `scope` comes back **empty**, so `crm.deal.list`,
-   `crm.contact.list`, `crm.deal.fields` and `user.get` all return
-   `insufficient_scope`. Workflow 04 writes nothing until CRM is ticked under
-   "Assign permissions" on that webhook. Check with
-   `python scripts/bitrix_probe.py` — the older
-   `app.sources.bitrix_chats --probe` tests the chat-pull methods, which
-   workflow 04 does not use.
-   **Note the domain.** This repo and `.env.example` say
-   `cultiv.bitrix24.com`; the working webhook is on `travelgate.bitrix24.ae`.
-   Confirm which portal actually holds the deals before trusting either.
-   The three variables are still **not set on the n8n service** — setting them
-   restarts n8n, so do it once, after the scope is fixed:
-   ```
-   railway variables --service n8n      --set BITRIX_PORTAL_DOMAIN=travelgate.bitrix24.ae      --set BITRIX_WEBHOOK_USER_ID=128 --set BITRIX_WEBHOOK_TOKEN=...
-   ```
-2. **Modal needs only its own token.** The Hugging Face side is done —
-   verified `hf_…` reads `CohereLabs/cohere-transcribe-arabic-07-2026` and
-   `config.json` returns 200, so the gated licence **is** accepted. What is
-   left is `modal setup` (needs a browser, or `MODAL_TOKEN_ID` /
-   `MODAL_TOKEN_SECRET`) and the three secrets. The README in
-   `Yahia20/model-hosting` is an older draft (monthly batch, one
-   `asr-secrets`, renamed tables) — `modal/transcribe_job.py` here supersedes
-   it. Nothing is stranded today (`/report` says 0), but 017 moved
-   transcription out of workflow 02, so the first NEW recording Drive gains
-   has no owner at all.
-3. **RTFx is unmeasured.** Every Modal cost figure assumes 120. The first real
-   run writes the truth into `asr_runs.rtfx`; `benchmark-runpod/` in
-   `Yahia20/model-hosting` settles it for about $1.
-4. **503 chat threads are due**, 11 stuck in `evaluating` since 2026-08-31 with
-   expired leases, 222 `pending` since the same day. The recovery sweep reopens
-   expired leases, so tonight's first 01d run should start draining this.
-5. **DPA / PDPL** before customer audio leaves for any processor.
-6. **Drive's own retention** — `purge_raw_content` blanks call text after a
+**Fixed and live this session**
+
+| | what was wrong |
+|---|---|
+| timezone | `GENERIC_TIMEZONE` is not set on the n8n service and only 04 declared a zone, so 01d/02/03 resolved `23:00` in n8n's own default. Every scheduled workflow now pins `settings.timezone: Asia/Riyadh`. |
+| Bitrix paging | 04 sent `start: 0` once. Bitrix pages at 50, so it imported **50 of 709** deals a night and logged success. Paging moved to the worker (`POST /bitrix/deals`, `/bitrix/contacts`). |
+| `deals` never filled | The upsert violated `is_closed NOT NULL` (CLOSED was in no select list), then `stage_semantic` CHECK, then `deals_origin_ck` — three constraints, all silent because the node is `onError: continueRegularOutput`. |
+| health check | `job_runs.status` is an enum; an unqualified CASE yields text. The node that reports whether anything got judged was the only one that could not run. |
+| timeouts became verdicts | `Prepare chat input` is `continueRegularOutput`, so a timeout left `should_evaluate` undefined and `Scoreable?` routed to **terminal** `unscoreable`. 20 threads written off permanently by a slow HTTP call. Gated; the 20 were revived (5 genuine ones left alone). |
+
+**Still open**
+
+1. **The judge is timing out, and that is now the biggest problem.** Of the
+   first night: 28 `judge_failed` and 8 `dead_letter` on `timeout of 300000ms`,
+   18 `dead_letter` on `socket hang up`, 27 `dead_letter` on "pass 1 could not
+   be produced". 68 threads are dead-lettered and 389 still pending. The
+   classification is now correct — these are retryable and backed off — but the
+   root cause is not fixed. Look at `DEEPSEEK_MODEL=deepseek-v4-flash`, the
+   `batchSize: 2 / batchInterval: 1500` on `Two AI passes`, and whether 10 jobs
+   a tick is simply more than the worker can hold open at once.
+2. **Modal cannot reach the database.** All three secrets exist and
+   `modal run … --dry-run` gets as far as `psycopg.connect`, then fails with
+   `Name or service not known`: `DATABASE_URL` points at
+   `postgres.railway.internal`, which is Railway's **private** network, and
+   Modal is outside it. `DATABASE_PUBLIC_URL` exists but its host and port are
+   empty — public networking is off, as this file has always said it must be.
+   Two ways out, and it is a decision, not a bug:
+   * **Worker-mediated (keeps the rule).** Modal calls the worker over HTTPS
+     with the API key instead of touching Postgres: three endpoints — claim,
+     store transcript, mark failed. The lease boundary of gotcha 13 then lives
+     in the worker rather than in `CLAIM_SQL`. More work; nothing new is
+     exposed.
+   * **Enable Railway's TCP proxy.** One toggle, and the database password is
+     then on the public internet. That is the thing "public networking is OFF
+     and must stay off" exists to prevent.
+3. **RTFx is still unmeasured.** Every Modal cost figure assumes 120.
+4. **`customers` is 0 and `follow_ups` is 0.** 04 has never completed a real
+   write and 03 depends on the phones 04 backfills. Both should change on the
+   03:20/03:40 run — that is the first thing to check.
+5. **`user.get` is not in the webhook's scope** (only `crm` is). Nothing uses
+   it today; agent names would.
+6. **DPA / PDPL** before customer audio leaves for any processor.
+7. **Drive's own retention** — `purge_raw_content` blanks call text after a
    year. If Drive deletes the WAV sooner, that conversation is gone from the
-   world. Confirm, or widen the window (call text is only ~0.14 GB/year).
+   world.
 
-**Done 2026-09-06, live:** every scheduled workflow now carries
-`settings.timezone: Asia/Riyadh` (verified through the n8n API), and the worker
-serves `/report`.
+**Bitrix, as it actually is.** Portal `travelgate.bitrix24.ae`, webhook user
+128 (`ADMIN: true`), scope `crm` only. 17,651 deals and 23,754 contacts;
+709 modified in the last 7 days. `.env.example` still says
+`cultiv.bitrix24.com` — that is stale. `python scripts/bitrix_probe.py` tests
+exactly what workflow 04 calls.
 
 ---
 
@@ -237,9 +245,20 @@ python scripts/n8n_deploy.py --list          # what is live, and its id
 python scripts/n8n_deploy.py 01d 04          # deploy, leave switched off
 python scripts/n8n_deploy.py 01d --activate
 
-# the Modal transcription batch (NOT deployed yet — needs the three secrets)
+# the Modal transcription batch. The three secrets EXIST (travelgate-db,
+# travelgate-drive, travelgate-hf) and the HF licence is accepted. It still
+# cannot run: DATABASE_URL points at postgres.railway.internal, which Modal
+# cannot resolve. See "Still open" above before touching this.
+modal profile activate dstravelgate
 modal run modal/transcribe_job.py::main --limit 5 --dry-run   # claims + releases
 modal deploy modal/transcribe_job.py                          # installs the cron
+
+# does the Bitrix webhook let workflow 04 do its job? (the older
+# `app.sources.bitrix_chats --probe` tests the chat-pull methods, which 04
+# does not use — this one tests crm.deal.list and crm.contact.list)
+export BITRIX_PORTAL_DOMAIN=travelgate.bitrix24.ae BITRIX_WEBHOOK_USER_ID=128
+export BITRIX_WEBHOOK_TOKEN=...
+python scripts/bitrix_probe.py
 
 # rewrite + activate the n8n chats workflow (edits in place, no clicking)
 export N8N_API_KEY=... PGPASSWORD=... WORKER_API_KEY=...
@@ -397,6 +416,26 @@ default; the histogram on `/report` is the only place the mistake is visible
 after the fact, because it plots `model_calls` by Riyadh hour against
 `priced_at_peak`.
 
+
+**15 · `onError: continueRegularOutput` turns a failed call into DATA, and the
+next node reads it as an answer.** Three separate bugs on the first live night,
+all of this shape. `Prepare chat input` timed out, so `should_evaluate` was
+undefined, so `Scoreable?` read "not true" and wrote the **terminal** state
+`unscoreable` — a slow HTTP call became "this conversation has nothing worth
+grading, permanently". `Upsert deals` violated three constraints in a row and
+the workflow carried on to the next node looking healthy. The setting is right
+for a nightly job that must not abort halfway; what is missing each time is a
+gate that asks *did this node actually answer* before anything reads its
+output. Check the TYPE, not truthiness: `typeof x === 'boolean'` passes a real
+`false` through and an error item does not.
+
+**16 · A field the API was never asked for arrives NULL, not as an error.**
+`Upsert deals` read `d->>'CLOSED'` and CLOSED was in no select list, so
+`is_closed` — `NOT NULL DEFAULT false` — got an explicit NULL, which overrides a
+DEFAULT rather than falling back to it. Every row of every batch failed, and
+`deals` had never held a single row from the nightly pull.
+`test_deal_select_covers_every_field_the_sql_reads` parses `d->>'FIELD'` out of
+the SQL and fails if it is not in `DEAL_SELECT`.
 ---
 
 ## Working style for this project

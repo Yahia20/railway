@@ -640,3 +640,170 @@ stale code — check that `/openapi.json` lists `/phones/normalize`.
    one-year window, that conversation is gone from the world.
 6. Calls and chats still share one judging prompt. `channel_rules_call_v1.md`
    is the seam; the 43 KB pass-2 prompt above it is common to both.
+
+---
+
+## 13 · 2026-09-07 — the first night that actually ran, and the six bugs it found
+
+Section 12 said the pipeline went live on 2026-09-06. It was deployed, not
+running. Everything below was measured against the live n8n API, the live
+database and the live Bitrix portal — not read off the repo.
+
+### The correction that matters most
+
+`model_calls` and `interaction_requests` were 0 and the first explanation
+written down was "the live 01d predates 017". **That was wrong.** The n8n API
+says live 01d had all 20 nodes and matched the repo exactly. The real reason was
+simpler: every workflow had been redeployed at 14:19–14:26 UTC that day and
+their crons are night-only, so none of them had run yet. The 30 chats judged at
+14:16 belonged to the *previous* deployment, whose 02 carried a node called
+"Every 15 min" that no longer exists.
+
+**Diff the live copy before explaining a number.** Three calls settle it:
+
+    GET {n8n}/api/v1/workflows/{id}                      # nodes, settings, updatedAt
+    GET {n8n}/api/v1/executions?workflowId={id}&limit=8  # has it ever run?
+    GET {n8n}/api/v1/executions/{n}?includeData=true     # which nodes, what errors
+
+An execution carries a **snapshot** of the workflow as it was then. That is how
+the deleted "Every 15 min" node was found.
+
+### 1 · A cron with no timezone is not a time
+
+`GENERIC_TIMEZONE` is not set on the n8n service — it has 35 variables and none
+of them is that — and only workflow 04 declared `settings.timezone`. So 01d, 02
+and 03 resolved `23:00` in n8n's own default, hours from where it was written
+and mostly inside DeepSeek's peak, where every rate doubles.
+
+`test_workflow_017_changes.py` passed the entire time, because it reads the cron
+expression and *assumes* local is Riyadh. Every scheduled workflow now pins
+`settings.timezone`, and a test globs for `scheduleTrigger` so a new workflow is
+covered the day it is added.
+
+**It worked:** 01d judged at 00:15 Riyadh with `priced_at_peak = 0`.
+
+### 2 · Workflow 04 had never stored a single Bitrix deal
+
+Four separate faults in one node, and every one of them silent because the node
+is `onError: continueRegularOutput`:
+
+* **Paging.** `crm.deal.list` was called with `start: 0` and the response read
+  once. Bitrix pages every `*.list` method at 50 rows, so 04 imported 50 of the
+  709 matching deals — a short page and a small result set are the same
+  response. The same mistake sat one node later on `crm.contact.list`, dropping
+  450 of 500 contacts and leaving their conversations without the phone
+  workflow 03 matches on.
+* **`is_closed NOT NULL`.** The SQL read `d->>'CLOSED'` and CLOSED was in no
+  select list, so it was always NULL — and an explicit NULL in an INSERT column
+  list overrides a DEFAULT rather than falling back to it.
+* **`stage_semantic` CHECK.** `left('', 1)` is the empty string, which is not
+  P, S or F.
+* **`deals_origin_ck`.** The node wrote `'bitrix_rest'`; the constraint allows
+  `'bitrix'` and `'ai_derived'`.
+
+Paging moved into the worker (`POST /bitrix/deals`, `POST /bitrix/contacts`),
+because a loop with a stop condition is what the n8n/worker split puts in
+Python. The responses keep Bitrix's own `{result: [...]}` shape, so none of the
+SQL downstream changed.
+
+Proved against production data inside a transaction that was rolled back: the
+real 709-deal payload upserts cleanly, `deals` 36 → 739, and
+`Link conversations to deals` attaches **617** conversations against 36 today.
+
+### 3 · A 60-second timeout was recorded as a permanent verdict
+
+`Prepare chat input` is `onError: continueRegularOutput`, so a timeout produces
+an error item rather than stopping the run. `should_evaluate` is then undefined,
+and `Scoreable?` read that as "not true" and routed to `Mark unscoreable` —
+**terminal, never retried**. Twenty threads were written off as "nothing worth
+scoring" because an HTTP call did not come back.
+
+A gate now passes only when `should_evaluate` is an actual boolean —
+`typeof`, not truthiness, because truthiness would send a real `false` down the
+retry branch and re-ask forever. Everything else goes to `Mark prepare failed`.
+
+That is a **separate node** rather than a second edge into `Mark judge failed`,
+because that node's `queryReplacement` reads `$('Two AI passes')`, which never
+runs when prepare is what failed. `check_workflow_json.py` caught it in the
+first version of the change — gotcha 5, found by the repo's own validator.
+
+The 20 threads were revived by an UPDATE keyed on the exact signature: status
+`unscoreable`, `last_error` beginning "nothing to score:" and containing an HTTP
+timeout, which is never something the worker itself says. Five genuine
+`unscoreable` rows were left alone. This is the opposite case to the 284
+dead-lettered CALLS, which must stay dead: those are empty recordings a judge
+would score 0, these are threads nobody ever looked at.
+
+### 4 · The health check could not run
+
+`job_runs.status` is the `job_status` enum and an unqualified CASE yields text.
+Postgres casts a bare literal for you and refuses to cast a CASE. The one node
+whose job is to report whether anything got judged was the only node in the
+workflow that always failed.
+
+### 5 · The report endpoint
+
+`GET /report` (page, asks for `WORKER_API_KEY`) and `GET /report/data` (JSON,
+key in `X-API-Key`). It replaces `build_dashboard_data.py` and
+`build_crm_pages_data.py`, which a person ran against an SSH tunnel to write a
+JSON file next to a static page — last built 2026-09-01, in a gitignored
+directory.
+
+`app/db.py` is the worker's first database access and never writes:
+`default_transaction_read_only` on every connection, `statement_timeout`, and a
+test asserting every `SQL_*` constant starts with SELECT. n8n still owns every
+write.
+
+**One trap, learned in production.** A `psycopg_pool` `configure` function must
+hand the connection back **idle**. A plain `conn.execute("SET ...")` opens an
+implicit transaction, so the pool logged `connection left in status INTRANS by
+configure function: discarded` and reconnected forever — the endpoint hung for
+the pool timeout on every request. Set `conn.autocommit = True` **before** the
+SETs. The pool is lazy, so no import and no test reached that path; it appeared
+on the first real request after deploy.
+
+The **judge-hour histogram** plots `model_calls` by Riyadh hour against
+`priced_at_peak`. It is the only place a timezone mistake is visible after the
+fact.
+
+### 6 · Modal is configured and still cannot run
+
+All three secrets exist (`travelgate-db`, `travelgate-drive`, `travelgate-hf`),
+the profile is `dstravelgate`, and the Hugging Face licence **is** accepted —
+verified: the read token fetches `config.json` from the gated model.
+
+`modal run … --dry-run` gets as far as `psycopg.connect` and fails with
+`[Errno -2] Name or service not known`. `DATABASE_URL` points at
+`postgres.railway.internal`, Railway's **private** network; Modal is outside it.
+`DATABASE_PUBLIC_URL` exists on the Postgres service with an **empty host and
+port** — public networking is off, exactly as this project has always required.
+
+Nobody wrote down how Modal was supposed to reach the database. It is a
+decision, not a bug:
+
+* **Worker-mediated.** Modal calls the worker over HTTPS with the API key:
+  claim, store transcript, mark failed. The lease boundary of gotcha 13 moves
+  from `CLAIM_SQL` into the worker. Nothing new is exposed. This is the option
+  consistent with everything else in the system.
+* **Railway TCP proxy.** One toggle, and the database password is on the public
+  internet. That is the thing the rule exists to prevent.
+
+### What the numbers were at the end of the night
+
+    interactions 1790   chat_messages 22408   transcripts 830 (confidence 1.00)
+    analysed 812        evaluations 825       model_calls 2   requests 1
+    deals 36            customers 0           follow_ups 0    stranded calls 0
+    chat_eval_jobs: pending 389  dead_letter 68  judge_failed 39
+                    evaluated 31  unscoreable 5
+    cost/conversation $0.008 (pass1 $0.0029 + pass2 $0.0051;
+                              10,624 of 10,732 prompt tokens served from cache)
+
+### The one thing to fix next
+
+**The judge is timing out.** 28 `judge_failed` and 8 `dead_letter` on
+`timeout of 300000ms`, 18 `dead_letter` on `socket hang up`, 27 on "pass 1 could
+not be produced". The *classification* is now right — these are retryable and
+backed off — but the root cause is untouched. Start with
+`DEEPSEEK_MODEL=deepseek-v4-flash`, the `batchSize: 2 / batchInterval: 1500` on
+`Two AI passes`, and whether ten claimed jobs a tick is more than the worker can
+hold open at once. 68 threads are dead-lettered and 389 are still pending.
