@@ -11,12 +11,16 @@ import logging
 import os
 import shutil
 import tempfile
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+from . import db, report
 from .asr import cohere_arabic
 from .config import settings
 from .evaluate import judge, metrics, scoring
@@ -29,7 +33,16 @@ from .sources.drive_calls import RecordingNameError, parse_recording_name
 log = logging.getLogger("worker")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-app = FastAPI(title="Customer 360 worker", version="1.0.0")
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    """Nothing to open — the database pool is lazy and the judge is stateless.
+    The shutdown half matters: Railway replaces containers on every deploy, and
+    a pool that is not closed leaves its server-side connections to time out."""
+    yield
+    db.close()
+
+
+app = FastAPI(title="Customer 360 worker", version="1.0.0", lifespan=_lifespan)
 
 
 def require_api_key(x_api_key: str = Header(default="")) -> None:
@@ -692,3 +705,54 @@ def recompute(modules: dict[str, Any]) -> dict:
         "gradeable": result.gradeable,
         "warnings": result.warnings,
     }
+
+
+# ---------------------------------------------------------------------------
+# Report
+#
+# The page is served WITHOUT the API key and contains no data; the data
+# endpoint behind it requires the key like every other endpoint here. That
+# split exists because a browser cannot set an X-API-Key header on a normal
+# navigation, and the alternative — putting the key in the query string —
+# writes a shared secret into browser history, proxy logs and every Referer
+# header the page emits.
+# ---------------------------------------------------------------------------
+
+REPORT_PAGE = Path(__file__).resolve().parent / "static" / "report.html"
+
+
+@app.get("/report", response_class=HTMLResponse, include_in_schema=False)
+def report_page() -> HTMLResponse:
+    """The operational report, as a page. Holds no customer data: it asks for
+    WORKER_API_KEY and fetches /report/data itself."""
+    try:
+        html = REPORT_PAGE.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            f"report page missing: {exc}") from exc
+    return HTMLResponse(
+        html,
+        headers={
+            # Never let a shared cache hold the shell, and never let this page
+            # be framed by anything.
+            "Cache-Control": "no-store",
+            "X-Frame-Options": "DENY",
+            "Referrer-Policy": "no-referrer",
+        },
+    )
+
+
+@app.get("/report/data", dependencies=[Depends(require_api_key)])
+def report_data(days: int = 30, limit: int = report.SAMPLE_LIMIT) -> dict:
+    """Every number the report shows, in one response.
+
+    `days` bounds the cost panels only; counts and the reconciliation verdict
+    are over all of history, because "a request nobody logged" does not stop
+    being one after thirty days.
+    """
+    days = max(1, min(int(days), 365))
+    limit = max(1, min(int(limit), 500))
+    try:
+        return report.build(days=days, limit=limit)
+    except db.DatabaseUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc

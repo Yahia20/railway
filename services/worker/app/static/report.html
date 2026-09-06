@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Customer 360 — التقرير التشغيلي</title>
+<style>
+/* An operations console, not a document. It is scanned, so state reads as
+   shape and colour before it reads as a number. System fonts only: this page
+   is served by the worker and must render with no external request. */
+:root{
+  --bg:#EDF0F3; --panel:#FFFFFF; --panel-2:#F5F7F9;
+  --ink:#141A20; --ink-2:#3F4954; --muted:#6B7681;
+  --line:#D3DAE1; --line-soft:#E5EAEF;
+  --accent:#175E7C; --accent-soft:#DCEAF1;
+  --ok:#2A6B50; --ok-soft:#DBEBE2;
+  --warn:#8A570A; --warn-soft:#F5EAD5;
+  --bad:#9B342A; --bad-soft:#F6E1DE;
+  --mono:ui-monospace,"Cascadia Mono","SF Mono",Consolas,"Courier New",monospace;
+  --ui:"Segoe UI",system-ui,-apple-system,"Noto Sans Arabic","Helvetica Neue",sans-serif;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0F1317; --panel:#171D23; --panel-2:#1D242B;
+  --ink:#E6EBF0; --ink-2:#B7C1CB; --muted:#84909C;
+  --line:#2B343D; --line-soft:#222A32;
+  --accent:#69AECC; --accent-soft:#17303C;
+  --ok:#6DBC94; --ok-soft:#152C22;
+  --warn:#D5A155; --warn-soft:#30260F;
+  --bad:#DE887C; --bad-soft:#371F1C;
+}}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink);font-family:var(--ui);font-size:14px;line-height:1.6}
+.wrap{max-width:1240px;margin:0 auto;padding:20px 16px 64px;display:flex;flex-direction:column;gap:20px}
+
+/* header */
+header{display:flex;flex-wrap:wrap;align-items:center;gap:12px;justify-content:space-between;
+  padding-bottom:14px;border-bottom:2px solid var(--ink)}
+header h1{font-size:19px;margin:0;font-weight:650;letter-spacing:-.01em}
+header .meta{font-family:var(--mono);font-size:11.5px;color:var(--muted);direction:ltr}
+.ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button,select,input{font-family:inherit;font-size:13px;padding:5px 11px;border-radius:5px;
+  border:1px solid var(--line);background:var(--panel);color:var(--ink)}
+button{cursor:pointer;font-weight:500}
+button:hover{border-color:var(--accent);color:var(--accent)}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+input[type=password]{font-family:var(--mono);direction:ltr;min-width:230px}
+
+/* gate */
+#gate{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:22px;
+  display:flex;flex-direction:column;gap:12px;max-width:520px;margin:40px auto}
+#gate h2{margin:0;font-size:16px}
+#gate p{margin:0;color:var(--muted);font-size:13px}
+#gate .err{color:var(--bad);font-size:13px;min-height:19px}
+
+/* panels */
+section{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+section > h2{margin:0;padding:10px 15px;font-size:14px;font-weight:650;background:var(--panel-2);
+  border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+section > h2 .hint{font-weight:400;font-size:12px;color:var(--muted)}
+.body{padding:14px 15px;display:flex;flex-direction:column;gap:12px}
+
+/* headline finding */
+.finding{border-color:var(--accent)}
+.finding > h2{background:var(--accent-soft);color:var(--accent);border-bottom-color:var(--accent)}
+.big{display:flex;flex-wrap:wrap;gap:26px;align-items:flex-end}
+.big .n{font-family:var(--mono);font-size:40px;font-weight:600;line-height:1;letter-spacing:-.02em;
+  font-variant-numeric:tabular-nums}
+.big .n.hot{color:var(--bad)}
+.big .lbl{font-size:12.5px;color:var(--muted);display:block;margin-top:5px}
+
+/* stat strip */
+.strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(122px,1fr));gap:1px;background:var(--line-soft)}
+.strip .s{background:var(--panel);padding:10px 12px}
+.strip .s b{display:block;font-family:var(--mono);font-size:19px;font-weight:600;
+  font-variant-numeric:tabular-nums;line-height:1.25}
+.strip .s span{font-size:11.5px;color:var(--muted)}
+.strip .s.zero b{color:var(--muted)}
+.strip .s.alarm b{color:var(--bad)}
+
+/* tables */
+.tw{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:right;padding:7px 11px;border-bottom:1px solid var(--line-soft);white-space:nowrap}
+th{font-family:var(--mono);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--muted);font-weight:500;background:var(--panel-2);position:sticky;top:0}
+td.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+td.q{white-space:normal;min-width:260px;max-width:440px;color:var(--ink-2);font-size:12.5px}
+td.id{font-family:var(--mono);font-size:11.5px;direction:ltr;text-align:right}
+tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--panel-2)}
+
+/* chips */
+.c{display:inline-block;font-family:var(--mono);font-size:10.5px;padding:1px 7px;border-radius:3px;
+  border:1px solid;white-space:nowrap}
+.c.ok{background:var(--ok-soft);color:var(--ok);border-color:var(--ok)}
+.c.warn{background:var(--warn-soft);color:var(--warn);border-color:var(--warn)}
+.c.bad{background:var(--bad-soft);color:var(--bad);border-color:var(--bad)}
+.c.mute{background:transparent;color:var(--muted);border-color:var(--line)}
+.c.cool{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
+
+/* hour histogram */
+.hist{display:grid;grid-template-columns:repeat(24,1fr);gap:2px;direction:ltr;align-items:end;
+  min-height:96px;padding-top:4px}
+.hist .h{display:flex;flex-direction:column;justify-content:flex-end;gap:3px;height:96px}
+.hist .h i{display:block;background:var(--accent);border-radius:2px 2px 0 0;min-height:2px}
+.hist .h.peak i{background:var(--bad)}
+.hist .h.empty i{background:var(--line);min-height:2px}
+.hist .h em{font-family:var(--mono);font-size:9px;font-style:normal;color:var(--muted);text-align:center}
+.hist .h.peak em{color:var(--bad);font-weight:600}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);align-items:center}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;margin-inline-end:5px}
+
+.note{font-size:12.5px;color:var(--muted);margin:0}
+.empty{padding:16px;color:var(--muted);font-size:13px;text-align:center}
+.errbox{background:var(--bad-soft);border:1px solid var(--bad);color:var(--bad);border-radius:6px;
+  padding:10px 13px;font-family:var(--mono);font-size:12px;direction:ltr;text-align:left;
+  overflow-x:auto;white-space:pre-wrap}
+[hidden]{display:none!important}
+@media (prefers-reduced-motion:no-preference){.hist .h i{transition:height .25s ease}}
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <h2>مفتاح الوصول</h2>
+  <p>الصفحة دي بتقرا داتا عملاء حقيقية. الرقم السري هو <code>WORKER_API_KEY</code> — بيتخزن في الـsession بس ومش بيتبعت لأي حد غير الـworker.</p>
+  <input type="password" id="key" placeholder="WORKER_API_KEY" autocomplete="off" spellcheck="false">
+  <div class="err" id="gateErr"></div>
+  <button id="enter">ادخل</button>
+</div>
+
+<div class="wrap" id="app" hidden>
+  <header>
+    <div>
+      <h1>Customer 360 — التقرير التشغيلي</h1>
+      <div class="meta" id="stamp">—</div>
+    </div>
+    <div class="ctl">
+      <select id="days">
+        <option value="7">آخر ٧ أيام</option>
+        <option value="30" selected>آخر ٣٠ يوم</option>
+        <option value="90">آخر ٩٠ يوم</option>
+      </select>
+      <button id="refresh">تحديث</button>
+      <button id="forget">نسيان المفتاح</button>
+    </div>
+  </header>
+
+  <div id="errors"></div>
+
+  <!-- الفجوة ٣: الفيندنج -->
+  <section class="finding">
+    <h2>طلبات محدش فتحلها صفقة <span class="hint">crm_missing_deals — طلب بكلام العميل نفسه، ومفيش ديل مقابله في بيتركس</span></h2>
+    <div class="body">
+      <div class="big" id="findingBig"></div>
+      <p class="note">الطلبات اللي الموديل اخترعها ومطابقتش كلام حقيقي (<code>evidence_valid = false</code>) مستبعدة من العدّ — طلب متخيّل بيبعت مندوب ورا عميل مطلبش حاجة.</p>
+    </div>
+    <div class="tw" id="verdicts"></div>
+  </section>
+
+  <section>
+    <h2>الطلبات غير المسجّلة <span class="hint">بكلام العميل الحرفي · مرتّبة بالميزانية</span></h2>
+    <div class="tw" id="unlogged"></div>
+  </section>
+
+  <section>
+    <h2>المحادثات اللي فيها الفجوة</h2>
+    <div class="tw" id="missing"></div>
+  </section>
+
+  <!-- الحالة -->
+  <section>
+    <h2>حالة المسار <span class="hint">هل الأرقام فوق محدّثة أصلاً</span></h2>
+    <div class="strip" id="totals"></div>
+    <div class="body">
+      <div id="stranded"></div>
+      <div class="tw" id="ingest"></div>
+      <div class="tw" id="identity"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>الطوابير</h2>
+    <div class="body">
+      <div class="tw" id="chatJobs"></div>
+      <div class="tw" id="callJobs"></div>
+    </div>
+  </section>
+
+  <!-- التكلفة -->
+  <section>
+    <h2>الفاتورة <span class="hint">model_calls — المقياس الوحيد لتكلفة النظام</span></h2>
+    <div class="body">
+      <div class="tw" id="cost"></div>
+      <p class="note" id="peakNote"></p>
+      <div class="hist" id="hours"></div>
+      <div class="legend">
+        <span><i style="background:var(--accent)"></i>خارج الذروة</span>
+        <span><i style="background:var(--bad)"></i>داخل ذروة DeepSeek (السعر مضاعف)</span>
+        <span>المحور = ساعة الرياض اللي اتنفذ فيها النداء</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- الجودة -->
+  <section>
+    <h2>تقييم الموظفين</h2>
+    <div class="tw" id="scorecard"></div>
+  </section>
+
+  <section>
+    <h2>null مش صفر <span class="hint">القاعدة رقم ٢ — الموديول بياخد null لما الموقف ماحصلش، وصفر لما حصل واتعامل معاه وحش</span></h2>
+    <div class="tw" id="nullZero"></div>
+  </section>
+
+  <section>
+    <h2>جودة المدخل <span class="hint">الموديل بيدّي المكالمات درجات أقل، ولا التفريغ نفسه وحش؟</span></h2>
+    <div class="tw" id="quality"></div>
+  </section>
+</div>
+
+<script>
+"use strict";
+const KEY_STORE = "c360_worker_key";
+const $ = (id) => document.getElementById(id);
+
+/* ---------- helpers ---------- */
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+function num(v, digits) {
+  if (v === null || v === undefined || v === "") return "—";
+  const n = Number(v);
+  if (!isFinite(n)) return esc(v);
+  return n.toLocaleString("en-US", {
+    minimumFractionDigits: digits ?? 0, maximumFractionDigits: digits ?? 0 });
+}
+function money(v) {
+  if (v === null || v === undefined || v === "") return "—";
+  return "$" + Number(v).toLocaleString("en-US",
+    { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function when(v) {
+  if (!v) return "—";
+  const d = new Date(v);
+  return isNaN(d) ? esc(v) : d.toLocaleString("en-GB",
+    { timeZone: "Asia/Riyadh", year: "2-digit", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit" });
+}
+function ago(v) {
+  if (!v) return "";
+  const h = (Date.now() - new Date(v)) / 36e5;
+  if (!isFinite(h)) return "";
+  if (h < 1) return "من " + Math.round(h * 60) + " دقيقة";
+  if (h < 48) return "من " + Math.round(h) + " ساعة";
+  return "من " + Math.round(h / 24) + " يوم";
+}
+
+/* Render a table, or an explicit empty state. An empty panel and a broken
+   panel look different on purpose — only one of them needs fixing. */
+function table(el, rows, cols, emptyMsg) {
+  if (!rows || !rows.length) {
+    el.innerHTML = '<div class="empty">' + esc(emptyMsg || "مفيش صفوف") + "</div>";
+    return;
+  }
+  const head = cols.map((c) => "<th>" + esc(c.h) + "</th>").join("");
+  const body = rows.map((r) => "<tr>" + cols.map((c) => {
+    const out = c.f ? c.f(r) : esc(r[c.k]);
+    return '<td class="' + (c.cls || "") + '">' + (out === "" ? "—" : out) + "</td>";
+  }).join("") + "</tr>").join("");
+  el.innerHTML = "<table><thead><tr>" + head + "</tr></thead><tbody>" + body + "</tbody></table>";
+}
+
+/* ---------- auth ---------- */
+function apiKey() { try { return sessionStorage.getItem(KEY_STORE) || ""; } catch { return ""; } }
+function setKey(v) { try { v ? sessionStorage.setItem(KEY_STORE, v) : sessionStorage.removeItem(KEY_STORE); } catch {} }
+
+async function fetchReport(days) {
+  const res = await fetch("report/data?days=" + encodeURIComponent(days), {
+    headers: { "X-API-Key": apiKey() }, cache: "no-store" });
+  if (res.status === 401) throw new Error("المفتاح غلط");
+  if (!res.ok) throw new Error("الـworker رجّع " + res.status + " — " + (await res.text()).slice(0, 200));
+  return res.json();
+}
+
+/* ---------- render ---------- */
+function render(rep) {
+  const d = rep.data || {};
+  $("stamp").textContent =
+    "generated " + when(rep.generated_at) + " Riyadh · window " + rep.window_days + "d";
+
+  /* panel errors, named */
+  const errs = Object.entries(rep.errors || {});
+  $("errors").innerHTML = errs.length
+    ? '<div class="errbox">' + errs.map(([k, v]) => esc(k) + ": " + esc(v)).join("\n") + "</div>"
+    : "";
+
+  /* --- the finding --- */
+  const verdicts = d.verdicts || [];
+  const miss = verdicts.find((v) => v.verdict === "crm_missing_deals") || {};
+  const analysed = verdicts.filter((v) => v.verdict !== "not_analysed")
+    .reduce((a, v) => a + Number(v.conversations || 0), 0);
+  const missConvs = Number(miss.conversations || 0);
+  $("findingBig").innerHTML = [
+    ['<span class="n hot">' + num(miss.unlogged_requests) + "</span>", "طلب مفتحلوش صفقة"],
+    ['<span class="n">' + num(missConvs) + "</span>",
+      "محادثة فيها الفجوة" + (analysed ? " من " + num(analysed) + " اتحللت" : "")],
+    ['<span class="n">' + money(miss.unlogged_budget) + "</span>", "ميزانية العملاء دي"],
+  ].map(([n, l]) => "<div>" + n + '<span class="lbl">' + esc(l) + "</span></div>").join("");
+
+  table($("verdicts"), verdicts, [
+    { h: "الحكم", f: (r) => {
+        const cls = { crm_missing_deals: "bad", crm_has_extra: "warn",
+                      agreed: "ok", not_analysed: "mute" }[r.verdict] || "mute";
+        return '<span class="c ' + cls + '">' + esc(r.verdict) + "</span>"; } },
+    { h: "محادثات", k: "conversations", cls: "num", f: (r) => num(r.conversations) },
+    { h: "طلبات الموديل", cls: "num", f: (r) => num(r.ai_requests) },
+    { h: "صفقات بيتركس", cls: "num", f: (r) => num(r.bitrix_deals) },
+    { h: "غير مسجّل", cls: "num", f: (r) => num(r.unlogged_requests) },
+    { h: "ميزانية", cls: "num", f: (r) => money(r.unlogged_budget) },
+  ], "مفيش محادثات اتحللت لسه");
+
+  table($("unlogged"), d.unlogged_requests, [
+    { h: "المحادثة", k: "external_id", cls: "id" },
+    { h: "#", k: "seq", cls: "num" },
+    { h: "الخدمة", f: (r) => esc(r.service || r.service_raw) },
+    { h: "الوجهة", k: "destination" },
+    { h: "الميزانية", cls: "num",
+      f: (r) => r.budget_amount == null ? "—"
+        : num(r.budget_amount, 0) + " " + esc(r.budget_currency || "") },
+    { h: "النتيجة", f: (r) => r.outcome ? '<span class="c mute">' + esc(r.outcome) + "</span>" : "—" },
+    { h: "كلام العميل", k: "quote", cls: "q" },
+  ], "مفيش طلبات غير مسجّلة — يا إما كله متسجّل، يا إما 017 لسه ماشتغلتش");
+
+  table($("missing"), d.missing_deals, [
+    { h: "المحادثة", k: "external_id", cls: "id" },
+    { h: "القناة", f: (r) => '<span class="c mute">' + esc(r.channel) + "</span>" },
+    { h: "بدأت", f: (r) => when(r.started_at), cls: "num" },
+    { h: "ديل أساسي", k: "primary_bitrix_deal", cls: "id" },
+    { h: "صفقات", cls: "num", f: (r) => num(r.bitrix_deal_count) },
+    { h: "طلبات", cls: "num", f: (r) => num(r.ai_request_count) },
+    { h: "الفجوة", cls: "num",
+      f: (r) => '<span class="c bad">+' + num(r.unlogged_request_count) + "</span>" },
+    { h: "ميزانية", cls: "num", f: (r) => money(r.unlogged_budget) },
+  ], "مفيش محادثة فيها فجوة");
+
+  /* --- pipeline --- */
+  const t = d.totals || {};
+  $("totals").innerHTML = [
+    ["محادثات", t.interactions], ["رسايل", t.chat_messages], ["تفريغات", t.transcripts],
+    ["اتحللت", t.analysed], ["طلبات", t.requests], ["تقييمات", t.evaluations],
+    ["نداءات موديل", t.model_calls], ["عملاء", t.customers], ["صفقات", t.deals],
+    ["متابعات", t.follow_ups],
+    ["ثقة التفريغ", t.avg_asr_confidence], ["تليفون مش متطبّع", t.phones_unnormalised],
+  ].map(([l, v]) => {
+    const zero = !Number(v);
+    const alarm = l === "تليفون مش متطبّع" && Number(v) > 0;
+    return '<div class="s ' + (alarm ? "alarm" : zero ? "zero" : "") + '"><b>' +
+      (v == null ? "—" : num(v, l === "ثقة التفريغ" ? 2 : 0)) +
+      "</b><span>" + esc(l) + "</span></div>";
+  }).join("");
+
+  const s = d.stranded_calls || {};
+  const stranded = Number(s.stranded || 0);
+  $("stranded").innerHTML = stranded
+    ? '<div class="errbox">' + stranded + " مكالمة واقفة في discovered/asr_failed — " +
+      "محدش شايلها. أقدم واحدة " + esc(when(s.oldest)) + " (" + esc(ago(s.oldest)) + "). " +
+      "دي بتاعة Modal، ولو Modal مش مترفعة يبقى مفيش حاجة هتفرّغها.</div>"
+    : '<p class="note"><span class="c ok">مفيش مكالمات واقفة</span> كل تسجيل متكشّف اتفرّغ.</p>';
+
+  table($("ingest"), d.ingest, [
+    { h: "المصدر", k: "external_source", cls: "id" },
+    { h: "محادثات", cls: "num", f: (r) => num(r.interactions) },
+    { h: "اتحللت", cls: "num", f: (r) => num(r.analysed) },
+    { h: "أحدث محادثة", cls: "num",
+      f: (r) => when(r.newest_conversation) + " · " + ago(r.newest_conversation) },
+  ], "مفيش محادثات");
+
+  table($("identity"), d.identity, [
+    { h: "المصدر", k: "external_source", cls: "id" },
+    { h: "محادثات", cls: "num", f: (r) => num(r.interactions) },
+    { h: "بتليفون", cls: "num", f: (r) => {
+        const n = Number(r.with_phone || 0);
+        return '<span class="c ' + (n ? "ok" : "bad") + '">' + num(n) + "</span>"; } },
+    { h: "مربوطة بعميل", cls: "num", f: (r) => num(r.linked_to_customer) },
+    { h: "شايلة ديل id", cls: "num", f: (r) => num(r.carries_deal_id) },
+    { h: "مربوطة بصفقة", cls: "num", f: (r) => num(r.linked_to_deal) },
+  ], "—");
+
+  const jobCols = (label) => [
+    { h: label, f: (r) => {
+        const cls = { evaluated: "ok", transcribed: "cool", pending: "cool",
+                      dead_letter: "bad", asr_failed: "bad", judge_failed: "warn",
+                      unscoreable: "mute", discovered: "warn" }[r.status] || "mute";
+        return '<span class="c ' + cls + '">' + esc(r.status) + "</span>"; } },
+    { h: "عدد", cls: "num", f: (r) => num(r.n) },
+    { h: "بخطأ", cls: "num", f: (r) => num(r.with_error) },
+    { h: "آخر حركة", cls: "num", f: (r) => when(r.last_moved) + " · " + ago(r.last_moved) },
+  ];
+  table($("chatJobs"), d.chat_jobs, jobCols("طابور الشاتات"), "الطابور فاضي");
+  table($("callJobs"), d.call_jobs, jobCols("طابور المكالمات"), "الطابور فاضي");
+
+  /* --- cost --- */
+  table($("cost"), d.cost, [
+    { h: "الغرض", k: "purpose", cls: "id" },
+    { h: "نداءات", cls: "num", f: (r) => num(r.calls) },
+    { h: "فشل", cls: "num", f: (r) => num(r.failed) },
+    { h: "توكن دخل", cls: "num", f: (r) => num(r.prompt_tokens) },
+    { h: "منها كاش", cls: "num", f: (r) => num(r.cached_tokens) },
+    { h: "توكن خرج", cls: "num", f: (r) => num(r.output_tokens) },
+    { h: "التكلفة", cls: "num", f: (r) => money(r.cost_usd) },
+    { h: "في الذروة", cls: "num", f: (r) => {
+        const n = Number(r.at_peak || 0);
+        return n ? '<span class="c bad">' + num(n) + "</span>" : '<span class="c ok">0</span>'; } },
+    { h: "تكلفة الذروة", cls: "num", f: (r) => money(r.cost_at_peak) },
+    { h: "زمن (ms)", cls: "num", f: (r) => num(r.avg_latency_ms) },
+  ], "model_calls فاضي — يا إما مفيش تقييم اشتغل، يا إما مسار بيقيّم من غير ما يسجّل الفاتورة");
+
+  const hours = d.judge_hours || [];
+  const byHour = {}; hours.forEach((h) => (byHour[h.riyadh_hour] = h));
+  const peakCalls = hours.reduce((a, h) => a + Number(h.at_peak || 0), 0);
+  const allCalls = hours.reduce((a, h) => a + Number(h.calls || 0), 0);
+  $("peakNote").innerHTML = allCalls
+    ? (peakCalls
+        ? '<span class="c bad">' + Math.round((peakCalls / allCalls) * 100) + "% من النداءات في الذروة</span> " +
+          "— نفس الشغل بضعف السعر. الجدول المفروض يخلّص قبل 04:00 بتوقيت الرياض."
+        : '<span class="c ok">مفيش نداء في الذروة</span> الجدول مظبوط.')
+    : "مفيش نداءات في الفترة دي.";
+  const max = Math.max(1, ...hours.map((h) => Number(h.calls || 0)));
+  $("hours").innerHTML = Array.from({ length: 24 }, (_, h) => {
+    const row = byHour[h];
+    const n = Number(row?.calls || 0);
+    const isPeak = Number(row?.at_peak || 0) > 0;
+    const pct = n ? Math.max(4, Math.round((n / max) * 100)) : 0;
+    return '<div class="h ' + (isPeak ? "peak" : n ? "" : "empty") + '" title="' +
+      h + ":00 — " + n + ' call(s)"><i style="height:' + pct + '%"></i><em>' +
+      String(h).padStart(2, "0") + "</em></div>";
+  }).join("");
+
+  /* --- quality --- */
+  table($("scorecard"), d.scorecard, [
+    { h: "الموظف", k: "full_name" },
+    { h: "الفريق", k: "team" },
+    { h: "محادثات", cls: "num", f: (r) => num(r.evaluated_interactions) },
+    { h: "مكالمات", cls: "num", f: (r) => num(r.calls) },
+    { h: "شاتات", cls: "num", f: (r) => num(r.chats) },
+    { h: "المتوسط", cls: "num", f: (r) => {
+        if (r.avg_score == null) return "—";
+        const v = Number(r.avg_score);
+        const cls = v >= 80 ? "ok" : v >= 60 ? "warn" : "bad";
+        return '<span class="c ' + cls + '">' + num(v, 1) + "</span>"; } },
+    { h: "استقبال", cls: "num", f: (r) => num(r.avg_reception, 1) },
+    { h: "عرض", cls: "num", f: (r) => num(r.avg_offer, 1) },
+    { h: "اعتراضات", cls: "num", f: (r) => num(r.avg_objections, 1) },
+    { h: "متابعة", cls: "num", f: (r) => num(r.avg_followup, 1) },
+    { h: "إغلاق", cls: "num", f: (r) => num(r.avg_closing, 1) },
+    { h: "n إغلاق", cls: "num", f: (r) => num(r.n_closing_scored) },
+    { h: "أول رد (ث)", cls: "num", f: (r) => num(r.avg_first_response_sec) },
+    { h: "ملاحظات", cls: "num", f: (r) => num(r.flagged_conversations) },
+  ], "مفيش تقييمات — v_agent_scorecard بيستبعد البوت، وبيحتاج agents مربوطين");
+
+  table($("nullZero"), d.null_vs_zero, [
+    { h: "الموديول", k: "module", cls: "id" },
+    { h: "الموقف ماحصلش (null)", cls: "num", f: (r) => num(r.not_applicable) },
+    { h: "حصل واتعامل وحش (0)", cls: "num", f: (r) => {
+        const n = Number(r.scored_zero || 0);
+        return n ? '<span class="c warn">' + num(n) + "</span>" : "0"; } },
+    { h: "فوق الصفر", cls: "num", f: (r) => num(r.scored_above_zero) },
+    { h: "المتوسط لما يحصل", cls: "num", f: (r) => num(r.avg_when_applicable, 1) },
+  ], "مفيش تقييمات");
+
+  table($("quality"), d.quality_by_input, [
+    { h: "نوع المدخل", k: "input_type", cls: "id" },
+    { h: "فصل المتكلمين", f: (r) => '<span class="c mute">' + esc(r.diarization || "none") + "</span>" },
+    { h: "شريحة الثقة", k: "confidence_bucket", cls: "num" },
+    { h: "n", cls: "num", f: (r) => num(r.n) },
+    { h: "المتوسط", cls: "num", f: (r) => num(r.avg_score, 1) },
+    { h: "التشتت", cls: "num", f: (r) => num(r.score_spread, 1) },
+  ], "مفيش تقييمات");
+}
+
+/* ---------- wiring ---------- */
+let busy = false;
+async function load() {
+  if (busy) return;
+  busy = true;
+  $("refresh").disabled = true;
+  $("refresh").textContent = "بيحمّل…";
+  try {
+    render(await fetchReport($("days").value));
+    $("gate").hidden = true;
+    $("app").hidden = false;
+  } catch (e) {
+    if (String(e.message).includes("المفتاح")) {
+      setKey("");
+      $("app").hidden = true;
+      $("gate").hidden = false;
+      $("gateErr").textContent = e.message;
+    } else {
+      $("errors").innerHTML = '<div class="errbox">' + esc(e.message) + "</div>";
+    }
+  } finally {
+    busy = false;
+    $("refresh").disabled = false;
+    $("refresh").textContent = "تحديث";
+  }
+}
+
+$("enter").addEventListener("click", () => {
+  const v = $("key").value.trim();
+  if (!v) { $("gateErr").textContent = "اكتب المفتاح"; return; }
+  setKey(v); $("key").value = ""; $("gateErr").textContent = ""; load();
+});
+$("key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("enter").click(); });
+$("refresh").addEventListener("click", load);
+$("days").addEventListener("change", load);
+$("forget").addEventListener("click", () => {
+  setKey(""); $("app").hidden = true; $("gate").hidden = false; $("gateErr").textContent = "";
+});
+
+if (apiKey()) load();
+</script>
+</body>
+</html>
