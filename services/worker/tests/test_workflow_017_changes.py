@@ -283,3 +283,67 @@ def test_housekeeping_still_runs_before_identity_resolution():
     assert minutes(house) < minutes(ident), (
         "04 must run before 03: 03 resolves customers on the E.164 phone and "
         "04 is what fetches it")
+
+
+# ---------------------------------------------------------------------------
+# A timeout is not a verdict
+#
+# `Prepare chat input` is onError: continueRegularOutput, so a timeout yields an
+# error item instead of stopping the run — and then `should_evaluate` is
+# undefined. The old `Scoreable?` read that as "not true" and routed to
+# `Mark unscoreable`, which is TERMINAL and never retried. On the first night in
+# the corrected schedule, 20 threads were permanently written off as "nothing
+# worth scoring" because a 60-second HTTP call did not come back.
+#
+# unscoreable has to mean the worker looked and said no. Anything else is
+# retryable.
+# ---------------------------------------------------------------------------
+
+CHATS_WF = "01d-chats-evaluate.json"
+
+
+def _conn(wf, node):
+    return wf.get("connections", {}).get(node, {}).get("main", [])
+
+
+def test_a_prepare_that_did_not_answer_is_retryable_not_unscoreable():
+    wf = load(CHATS_WF)
+    outs = _conn(wf, "Prepare answered?")
+    assert outs, "the gate between Prepare chat input and Scoreable? is missing"
+
+    true_branch = [c["node"] for c in (outs[0] or [])]
+    false_branch = [c["node"] for c in (outs[1] or [])] if len(outs) > 1 else []
+
+    assert true_branch == ["Scoreable?"]
+    assert false_branch, "a prepare that did not answer must go somewhere"
+    for target in false_branch:
+        assert "unscoreable" not in target.lower(), (
+            f"{target} is terminal; a timeout must stay retryable")
+
+
+def test_prepare_feeds_the_gate_not_scoreable_directly():
+    wf = load(CHATS_WF)
+    targets = [c["node"] for b in _conn(wf, "Prepare chat input") for c in (b or [])]
+    assert targets == ["Prepare answered?"], (
+        "Prepare chat input must go through the gate, or an error item reaches "
+        "Scoreable? and is read as a 'no'")
+
+
+def test_the_gate_requires_an_actual_boolean():
+    """`should_evaluate` is a boolean the worker sets deliberately. Testing
+    truthiness instead would send `false` — a real 'no' — down the retry
+    branch, and re-ask forever."""
+    wf = load(CHATS_WF)
+    cond = nodes(wf)["Prepare answered?"]["parameters"]["conditions"]["conditions"][0]
+    assert "typeof" in cond["leftValue"] and "'boolean'" in cond["leftValue"]
+
+
+def test_the_prepare_failure_node_reads_a_node_that_ran(): 
+    """gotcha 5: an expression naming a node with no run data yields nothing.
+    'Two AI passes' never runs when prepare is what failed."""
+    wf = load(CHATS_WF)
+    targets = [c["node"] for b in _conn(wf, "Prepare answered?")[1:] for c in (b or [])]
+    for name in targets:
+        repl = nodes(wf)[name]["parameters"]["options"].get("queryReplacement", "")
+        assert "Two AI passes" not in repl, (
+            f"{name} reads $('Two AI passes'), which does not run on this branch")

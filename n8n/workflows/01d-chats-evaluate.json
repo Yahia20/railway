@@ -136,7 +136,7 @@
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify({ external_id: $('Load thread').item.json.external_id, channel: $('Load thread').item.json.channel, messages: $('Load thread').item.json.messages }) }}",
         "options": {
-          "timeout": 60000
+          "timeout": 120000
         }
       },
       "onError": "continueRegularOutput",
@@ -538,6 +538,67 @@
           "name": "railway-pg"
         }
       }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "prepare-answered-c",
+              "leftValue": "={{ typeof ($('Prepare chat input').item.json || {}).should_evaluate === 'boolean' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "looseTypeValidation": true
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1280,
+        300
+      ],
+      "id": "prepare-answered",
+      "name": "Prepare answered?",
+      "notes": "Prepare chat input is onError: continueRegularOutput, so a timeout produces an error item rather than stopping the run -- and then should_evaluate is undefined, which the old Scoreable? read as 'not true' and routed to Mark unscoreable. unscoreable is TERMINAL. A 60-second network timeout was therefore recorded as 'this thread has nothing worth scoring, permanently': 20 threads on the first night. Only an explicit boolean is an answer; anything else is retryable."
+    },
+    {
+      "id": "mark-prepare-failed",
+      "name": "Mark prepare failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2200,
+        710
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- fence-exempt: single-statement UPDATE. The fence IS the statement's own\n-- WHERE clause, so the row is locked and the predicate re-evaluated against\n-- the latest committed version by the UPDATE itself (EvalPlanQual). There is\n-- no read-then-write window to widen, and adding FOR UPDATE would only take\n-- the same lock twice.\n-- Terminal success. The lease is released and last_error cleared, so a row that\n-- previously failed does not keep a stale reason attached to a good result.\n--\n-- Retryable. The judge was unreachable, rate limited, or still contradicted\n-- the rubric after its one correction.\n--\n-- Backed off by attempt number: a judge that is down stays down for minutes,\n-- and retrying immediately turns a rate limit into a ban.\nUPDATE chat_eval_jobs\n   SET status = CASE WHEN judge_attempts >= 3 THEN 'dead_letter' ELSE 'judge_failed' END,\n       claim_token     = NULL,\n       claim_until     = NULL,\n       claimed_at      = NULL,\n       next_attempt_at = now() + (interval '5 minutes' * GREATEST(judge_attempts, 1)),\n       last_error      = left($3::text, 500),\n       updated_at      = now()\n WHERE interaction_id = $1::uuid\n   AND claim_token    = $2::uuid\n   AND status         = 'evaluating'\nRETURNING interaction_id::text AS interaction_id, status, judge_attempts, last_error;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, $('Claim work').item.json.claim_token, ('prepare failed: ' + JSON.stringify($('Prepare chat input').item.json).slice(0, 400)) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Identical to Mark judge failed -- retryable, backed off, dead-lettered after 3 attempts. A separate node only because the reason text has to be read from a node that ran on THIS branch: 'Two AI passes' never runs when prepare is what failed, and an expression naming a node with no run data silently yields nothing (gotcha 5)."
     }
   ],
   "connections": {
@@ -589,7 +650,7 @@
       "main": [
         [
           {
-            "node": "Scoreable?",
+            "node": "Prepare answered?",
             "type": "main",
             "index": 0
           }
@@ -742,6 +803,29 @@
             "index": 0
           }
         ]
+      ]
+    },
+    "Prepare answered?": {
+      "main": [
+        [
+          {
+            "node": "Scoreable?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark prepare failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark prepare failed": {
+      "main": [
+        []
       ]
     }
   },
