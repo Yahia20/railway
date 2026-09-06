@@ -790,7 +790,16 @@ class BitrixContactsRequest(BaseModel):
 
 
 def _bitrix_rest() -> "BitrixRestSource":
-    settings.validate_for("chats")
+    # validate_for raises a bare RuntimeError, which becomes a 500 and an ASGI
+    # traceback — "Internal Server Error" for what is really "nobody set
+    # BITRIX_WEBHOOK_TOKEN". Workflow 04 runs unattended at 03:20, so the
+    # difference between those two is whether tomorrow starts with a diagnosis
+    # or with a log dig. 503 with the variable named, like /report/data does.
+    try:
+        settings.validate_for("chats")
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
     from .sources.bitrix_chats import BitrixRestSource
     return BitrixRestSource(
         portal_domain=settings.bitrix_portal_domain,

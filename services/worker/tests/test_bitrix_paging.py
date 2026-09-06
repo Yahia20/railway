@@ -230,3 +230,26 @@ def test_workflow_04_no_longer_calls_bitrix_directly():
             hdrs = n["parameters"]["headerParameters"]["parameters"]
             assert any(h["name"] == "X-API-Key" for h in hdrs), \
                 f"{n['name']} does not send the worker API key"
+
+
+def test_missing_credentials_is_503_naming_the_variable(monkeypatch):
+    """Seen in production as a bare 500 and an ASGI traceback. Workflow 04 runs
+    unattended at 03:20; "Internal Server Error" and "BITRIX_WEBHOOK_TOKEN is
+    not set" cost very different amounts of somebody's morning."""
+    from fastapi.testclient import TestClient
+
+    from app.config import settings
+    from app.main import app
+
+    monkeypatch.setattr(settings, "worker_api_key", "k", raising=False)
+    monkeypatch.setattr(settings, "bitrix_webhook_token", None, raising=False)
+    c = TestClient(app)
+
+    r = c.post("/bitrix/deals", headers={"X-API-Key": "k"}, json={"days": 7})
+    assert r.status_code == 503
+    assert "BITRIX_WEBHOOK_TOKEN" in r.text
+
+    r2 = c.post("/bitrix/contacts", headers={"X-API-Key": "k"},
+                json={"contact_ids": ["1"]})
+    assert r2.status_code == 503
+    assert "BITRIX_WEBHOOK_TOKEN" in r2.text
