@@ -749,6 +749,7 @@
     "executionOrder": "v1",
     "saveManualExecutions": true,
     "saveDataErrorExecution": "all",
-    "saveDataSuccessExecution": "all"
+    "saveDataSuccessExecution": "all",
+    "timezone": "Asia/Riyadh"
   }
 }

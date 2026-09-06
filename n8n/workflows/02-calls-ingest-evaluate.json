@@ -1361,6 +1361,7 @@
   },
   "settings": {
     "executionOrder": "v1",
-    "saveManualExecutions": true
+    "saveManualExecutions": true,
+    "timezone": "Asia/Riyadh"
   }
 }

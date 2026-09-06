@@ -209,3 +209,65 @@ def test_bitrix_pull_asks_only_for_allowlisted_fields():
     assert "UF_CRM" not in body
     for field in ("ID", "STAGE_ID", "OPPORTUNITY", "CONTACT_ID", "DATE_MODIFY"):
         assert f"'{field}'" in body
+
+
+# ---------------------------------------------------------------------------
+# ...and the discount only exists if n8n resolves the cron in Riyadh
+#
+# Every test above reads a cron expression and calls its hours "local", which
+# silently assumes local IS Asia/Riyadh. In production it was not. n8n resolves
+# an unqualified cron in GENERIC_TIMEZONE, that variable is not set on the n8n
+# service, and only workflow 04 declared a timezone of its own — so the judging
+# window ran on n8n's own default instead, landing 23:00-03:59 somewhere else
+# entirely and putting most of the night inside DeepSeek's peak.
+#
+# The bill doubled and every assertion above still passed, because the cron
+# text never changed. The fix is to stop depending on a platform default: each
+# scheduled workflow carries `settings.timezone`, which the export keeps and
+# which no environment variable can override.
+# ---------------------------------------------------------------------------
+
+PORTAL_TZ = "Asia/Riyadh"
+
+
+def scheduled_workflows() -> list[str]:
+    out = []
+    for path in sorted(WF.glob("*.json")):
+        wf = json.loads(path.read_text(encoding="utf-8"))
+        if any(n["type"].endswith("scheduleTrigger") for n in wf["nodes"]):
+            out.append(path.name)
+    return out
+
+
+def test_there_are_scheduled_workflows_to_check():
+    """Keeps the parametrised test below from passing on an empty list."""
+    assert len(scheduled_workflows()) >= 4
+
+
+@pytest.mark.parametrize("wf_name", scheduled_workflows())
+def test_every_scheduled_workflow_pins_its_own_timezone(wf_name):
+    """A cron with no timezone is not a time. It is a time in whatever zone the
+    n8n instance happens to default to, which is not this project's zone and is
+    not set anywhere in this repo."""
+    tz = json.loads((WF / wf_name).read_text(encoding="utf-8")).get("settings", {}).get("timezone")
+    assert tz == PORTAL_TZ, (
+        f"{wf_name} has settings.timezone={tz!r}. Every cron in this repo is "
+        f"written in {PORTAL_TZ} — the peak-window tests above assume it — so "
+        f"the workflow must say so rather than inherit GENERIC_TIMEZONE.")
+
+
+def test_housekeeping_still_runs_before_identity_resolution():
+    """04 fetches the phones that 03 matches on, so 04 must run first. Both now
+    declare the same timezone, which is what makes comparing their hours mean
+    anything at all."""
+    house = load(HOUSE)
+    ident = load("03-nightly-resolve-and-aggregate.json")
+    assert house["settings"]["timezone"] == ident["settings"]["timezone"]
+
+    def minutes(wf):
+        expr = crons(wf)[0].split()
+        return int(expr[1]) * 60 + int(expr[0])
+
+    assert minutes(house) < minutes(ident), (
+        "04 must run before 03: 03 resolves customers on the E.164 phone and "
+        "04 is what fetches it")

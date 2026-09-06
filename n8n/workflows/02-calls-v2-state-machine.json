@@ -1473,6 +1473,7 @@
   "settings": {
     "executionOrder": "v1",
     "availableInMCP": true,
-    "saveManualExecutions": true
+    "saveManualExecutions": true,
+    "timezone": "Asia/Riyadh"
   }
 }
