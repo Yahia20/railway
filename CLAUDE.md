@@ -38,7 +38,7 @@ that queues 284 empty recordings for a judge that will score them 0.
 | live | **02** Calls v2 — judging | (same workflow) | every 10 min, 23:00–03:59 |
 | live | **04** housekeeping | `z60SxzoYmKOLsH4S` | 03:20 daily |
 | live | **03** identity + promises | `sUnNPv6Ucye6Gsii` | 03:40 daily |
-| not deployed | **Modal** ASR batch | — | would be 23:30 daily |
+| live | **Modal** ASR batch | `travelgate-asr` | 23:30 daily |
 
 The night window is a discount, not a preference — see gotcha 14. 03 runs
 *after* 04 because 04 is what fetches the phones 03 matches on.
@@ -93,29 +93,19 @@ call.
    root cause is not fixed. Look at `DEEPSEEK_MODEL=deepseek-v4-flash`, the
    `batchSize: 2 / batchInterval: 1500` on `Two AI passes`, and whether 10 jobs
    a tick is simply more than the worker can hold open at once.
-2. **Modal cannot reach the database.** All three secrets exist and
-   `modal run … --dry-run` gets as far as `psycopg.connect`, then fails with
-   `Name or service not known`: `DATABASE_URL` points at
-   `postgres.railway.internal`, which is Railway's **private** network, and
-   Modal is outside it. `DATABASE_PUBLIC_URL` exists but its host and port are
-   empty — public networking is off, as this file has always said it must be.
-   Two ways out, and it is a decision, not a bug:
-   * **Worker-mediated (keeps the rule).** Modal calls the worker over HTTPS
-     with the API key instead of touching Postgres: three endpoints — claim,
-     store transcript, mark failed. The lease boundary of gotcha 13 then lives
-     in the worker rather than in `CLAIM_SQL`. More work; nothing new is
-     exposed.
-   * **Enable Railway's TCP proxy.** One toggle, and the database password is
-     then on the public internet. That is the thing "public networking is OFF
-     and must stay off" exists to prevent.
-3. **RTFx is still unmeasured.** Every Modal cost figure assumes 120.
-4. **`customers` is 0 and `follow_ups` is 0.** 04 has never completed a real
+2. **RTFx is still unmeasured.** Modal is deployed and its first run wrote an
+   `asr_runs` row, but it claimed 0 recordings so `rtfx` came back 0. Every
+   Modal cost figure still assumes 120; the first batch with real work settles
+   it, because `rtfx` is a generated column over `audio_seconds / gpu_seconds`.
+   Useful datum meanwhile: a run with **nothing to do costs 0.7 GPU-seconds**,
+   so the nightly schedule is effectively free on quiet nights.
+3. **`customers` is 0 and `follow_ups` is 0.** 04 has never completed a real
    write and 03 depends on the phones 04 backfills. Both should change on the
    03:20/03:40 run — that is the first thing to check.
-5. **`user.get` is not in the webhook's scope** (only `crm` is). Nothing uses
+4. **`user.get` is not in the webhook's scope** (only `crm` is). Nothing uses
    it today; agent names would.
-6. **DPA / PDPL** before customer audio leaves for any processor.
-7. **Drive's own retention** — `purge_raw_content` blanks call text after a
+5. **DPA / PDPL** before customer audio leaves for any processor.
+6. **Drive's own retention** — `purge_raw_content` blanks call text after a
    year. If Drive deletes the WAV sooner, that conversation is gone from the
    world.
 
@@ -191,7 +181,16 @@ numbers that look fine and are wrong.
     finding this project exists to produce. Never "fix" a disagreement by
     overwriting our answer with the CRM's.
 
-11. **Every judge call must land in `model_calls`.** It is the only measurement
+11. **The worker reads; n8n writes — with one named exception.** `app/db.py`
+    exposes `cursor`/`rows`/`one`, which set `default_transaction_read_only`,
+    and `writer`/`write`, which do not. Only `app/asr_jobs.py` may use the
+    second pair, and a test enforces that. The exception exists because Modal
+    runs outside Railway and cannot reach `postgres.railway.internal` at all;
+    the alternative was putting the database on the public internet. Do not
+    widen it, and do not merge the two pools into one with a flag — a flag can
+    be defaulted wrong and reads identically at the call site.
+
+12. **Every judge call must land in `model_calls`.** It is the only measurement
     of what this system costs, and its `UNIQUE (purpose, input_hash,
     prompt_version)` is also the guard that stops a re-run paying twice. A
     judging path that does not write it is a path whose bill nobody can see.
@@ -245,10 +244,10 @@ python scripts/n8n_deploy.py --list          # what is live, and its id
 python scripts/n8n_deploy.py 01d 04          # deploy, leave switched off
 python scripts/n8n_deploy.py 01d --activate
 
-# the Modal transcription batch. The three secrets EXIST (travelgate-db,
-# travelgate-drive, travelgate-hf) and the HF licence is accepted. It still
-# cannot run: DATABASE_URL points at postgres.railway.internal, which Modal
-# cannot resolve. See "Still open" above before touching this.
+# the Modal transcription batch — DEPLOYED, cron 23:30 Riyadh. It reaches the
+# database through the WORKER, not directly: Modal runs outside Railway and
+# postgres.railway.internal is Railway's private network. Secrets:
+# travelgate-worker (WORKER_URL + WORKER_API_KEY), travelgate-drive, travelgate-hf.
 modal profile activate dstravelgate
 modal run modal/transcribe_job.py::main --limit 5 --dry-run   # claims + releases
 modal deploy modal/transcribe_job.py                          # installs the cron

@@ -766,27 +766,53 @@ The **judge-hour histogram** plots `model_calls` by Riyadh hour against
 `priced_at_peak`. It is the only place a timezone mistake is visible after the
 fact.
 
-### 6 · Modal is configured and still cannot run
+### 6 · Modal now talks to the worker, and is deployed
 
-All three secrets exist (`travelgate-db`, `travelgate-drive`, `travelgate-hf`),
-the profile is `dstravelgate`, and the Hugging Face licence **is** accepted —
-verified: the read token fetches `config.json` from the gated model.
+`modal run … --dry-run` failed at `psycopg.connect` with `[Errno -2] Name or
+service not known`. `DATABASE_URL` pointed at `postgres.railway.internal` —
+Railway's **private** network — and Modal runs outside it.
+`DATABASE_PUBLIC_URL` exists with an empty host and port, because public
+networking is off, as this project requires.
 
-`modal run … --dry-run` gets as far as `psycopg.connect` and fails with
-`[Errno -2] Name or service not known`. `DATABASE_URL` points at
-`postgres.railway.internal`, Railway's **private** network; Modal is outside it.
-`DATABASE_PUBLIC_URL` exists on the Postgres service with an **empty host and
-port** — public networking is off, exactly as this project has always required.
+**Chosen: Modal calls the worker.** The API key is now the only credential that
+leaves Modal, the database keeps public networking off, and no new service is
+billed. The alternative — Railway's TCP proxy — is one toggle and puts the
+database password on the public internet.
 
-Nobody wrote down how Modal was supposed to reach the database. It is a
-decision, not a bug:
+`app/asr_jobs.py` holds CLAIM, STORE and FAIL **byte-for-byte** as Modal ran
+them; a script compared them before the old copies were deleted. They were
+themselves lifted from workflow 02's audited nodes, and the lease fence in them
+is the only thing stopping two systems paying to transcribe one call. Gotcha
+13's boundary is untouched: Modal claims `discovered`/`asr_failed` and leaves
+rows `transcribed`; workflow 02 claims `transcribed`/`judge_failed`.
 
-* **Worker-mediated.** Modal calls the worker over HTTPS with the API key:
-  claim, store transcript, mark failed. The lease boundary of gotcha 13 moves
-  from `CLAIM_SQL` into the worker. Nothing new is exposed. This is the option
-  consistent with everything else in the system.
-* **Railway TCP proxy.** One toggle, and the database password is on the public
-  internet. That is the thing the rule exists to prevent.
+Six endpoints behind the API key: `/asr/run/start` — which **mints** the lease
+token, because a caller that chose it could reuse another run's —
+`/asr/claim`, `/asr/store`, `/asr/fail`, `/asr/release`, `/asr/run/finish`.
+
+`app/db.py` grew a **writer**, and it is a separate named path rather than
+`cursor(read_only=False)`: a flag can be defaulted wrong and reads the same at
+the call site either way. Reports stay read-only, and a test asserts
+`asr_jobs.py` is the only module in the package that writes at all. That is now
+rule 11.
+
+Two behaviours worth naming:
+
+* a store the lease fence rejects returns `stored: false`. The GPU time is
+  spent either way, but a batch must not report work it did not keep.
+* `--dry-run` releases the rows **and** gives back the attempt it spent, or it
+  slowly dead-letters the backlog it exists to inspect safely.
+
+**Verified live.** `modal run --limit 5 --dry-run` claimed 0 recordings (correct
+— nothing is stranded) and wrote a real `asr_runs` row through the worker:
+`status succeeded, gpu A10G, model_version 07-2026, gpu_seconds 0.7`. Nothing
+moved in `call_ingest_jobs`. Then `modal deploy` — the app `travelgate-asr` is
+`deployed` and the cron runs 23:30 Riyadh.
+
+**A run with nothing to do costs 0.7 GPU-seconds**, so the nightly schedule is
+effectively free on quiet nights. `rtfx` is still 0 because nothing was
+transcribed; the first batch with real work in it is what measures the number
+every cost estimate in this project has assumed.
 
 ### What the numbers were at the end of the night
 
