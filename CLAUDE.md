@@ -12,19 +12,44 @@ making decisions, not after.
 
 ## Status in one line
 
-**Chats store live; scoring and calls are wired but not yet switched on.**
-Google Drive IS connected — `/calls/list` returns 611 recordings on every run,
-so the old "no Drive credentials" note is retired. What is not running: 01d
-(chat scoring) and 03 (identity) are deactivated, and 02 discovers calls but has
-transcribed none, because every `call_ingest_jobs` row sits in a terminal state
-left over from the August ASR failures.
+**The whole pipeline is live as of 2026-09-06.** Six workflows active, the
+worker deployed from `main`, migration 017 applied. What is NOT running: the
+Modal transcription batch — the code is written (`modal/transcribe_job.py`) and
+has never been deployed or executed, because it needs three Modal secrets and a
+click-through on the gated Hugging Face model page.
 
-**Bitrix is now sending real data** to `/webhook/travelgate/chat-message`, which
-is served by workflow **01c, n8n id `H7r5YWGJ3nNVA99Z`**, deployed from this repo
-on 2026-08-23 and verified live. It stores and does not score.
+Google Drive IS connected. `/calls/list` returns 611 recordings on every run,
+so the old "no Drive credentials" note is retired.
+
+**The calls backlog is DONE, not stuck.** Measured 2026-09-06:
+`call_ingest_jobs` holds 780 `evaluated` and 284 `dead_letter`, and there are
+830 transcripts at confidence 1.00. `Claim work` returning nothing means there
+is no work left, not that something broke — the 284 are genuinely unscoreable
+("transcript holds 86 normalised characters of speech"). Do not "revive" them:
+that queues 284 empty recordings for a judge that will score them 0.
+
+### What runs, and when (all times Asia/Riyadh — n8n's GENERIC_TIMEZONE)
+
+| | workflow | n8n id | when |
+|---|---|---|---|
+| live | **01c** chats store-only | `H7r5YWGJ3nNVA99Z` | every Bitrix message, ~1,300/day |
+| live | **02** Calls v2 — discovery | `Q3ARdzVsO3Z8bcWr` | 23:00 daily |
+| live | **01d** chat scoring | `P1zSFsw16wmV28YF` | every 10 min, 23:00–03:59 |
+| live | **02** Calls v2 — judging | (same workflow) | every 10 min, 23:00–03:59 |
+| live | **04** housekeeping | `z60SxzoYmKOLsH4S` | 03:20 daily |
+| live | **03** identity + promises | `sUnNPv6Ucye6Gsii` | 03:40 daily |
+| not deployed | **Modal** ASR batch | — | would be 23:30 daily |
+
+The night window is a discount, not a preference — see gotcha 14. 03 runs
+*after* 04 because 04 is what fetches the phones 03 matches on.
+
+**Workflow 01** (`i6VM7qxmbYEDebDx`) is still active and has had zero executions
+in weeks. It listens on `/webhook/travelgate/chat`, a different path from 01c's
+`/webhook/travelgate/chat-message`, and scores inline into the `bitrix`
+namespace which `v_chat_eval_due` deliberately excludes. Harmless; left alone.
 
 A second, hand-built 6-node handler (`5iGvWrBUoWckBU6b`, "01c · Chats ·
-per-message store (Bitrix)") held that path first. It is **deactivated, not
+per-message store (Bitrix)") held the chat path first. It is **deactivated, not
 deleted** — keep it as the rollback. Do not reactivate it without reading
 `docs/HANDOFF.md`: it computed `first_response_seconds` in SQL as
 `min(agent) - min(customer)` (negative whenever the agent opens), invented
@@ -35,6 +60,22 @@ two messages in the same second.
 Its rows were migrated from `external_source = 'bitrix'` to `'bitrix_chat_api'`
 so threads would not split across the two namespaces. The 16 older rows still
 under `'bitrix'` belong to workflow 01 and were deliberately left alone.
+
+### The five things still open
+
+1. **Modal is not deployed.** Needs `travelgate-db`, `travelgate-drive` and
+   `travelgate-hf` secrets, plus accepting the model licence on Hugging Face.
+   Nothing is waiting on it right now — every discovered call is transcribed.
+2. **RTFx is unmeasured.** Every Modal cost figure assumes 120. The first real
+   run writes the truth into `asr_runs.rtfx`; `benchmark-runpod/` in
+   `Yahia20/model-hosting` settles it for about $1.
+3. **`crm.deal.list` and `crm.contact.list` have never been called against the
+   portal.** Workflow 04 uses both. `python -m app.sources.bitrix_chats --probe`
+   reports which methods `cultiv.bitrix24.com` actually exposes.
+4. **DPA / PDPL** before customer audio leaves for any processor.
+5. **Drive's own retention** — `purge_raw_content` blanks call text after a
+   year. If Drive deletes the WAV sooner, that conversation is gone from the
+   world. Confirm, or widen the window (call text is only ~0.14 GB/year).
 
 ---
 
@@ -88,6 +129,25 @@ numbers that look fine and are wrong.
    instructions as guidance only…"). Use `DEAL_FIELD_ALLOWLIST` in
    `sources/bitrix_chats.py`.
 
+9. **A conversation can hold more than one request.** pass1 v6 emits
+   `requests[]` and `interaction_requests` keeps every one. The single-value
+   columns on `interaction_analysis` still describe the PRIMARY request, so
+   every existing view keeps working — do not "tidy" them into the new table.
+   A request whose quote is not found verbatim is kept with
+   `evidence_valid = false` and excluded from every count, because an invented
+   request sends a salesperson after a customer who never asked.
+
+10. **Bitrix is the check, not the source, for what a customer wanted.**
+    `v_request_reconciliation` compares what the model found against what the
+    CRM holds. `crm_missing_deals` — a request nobody opened a deal for — is the
+    finding this project exists to produce. Never "fix" a disagreement by
+    overwriting our answer with the CRM's.
+
+11. **Every judge call must land in `model_calls`.** It is the only measurement
+    of what this system costs, and its `UNIQUE (purpose, input_hash,
+    prompt_version)` is also the guard that stops a re-run paying twice. A
+    judging path that does not write it is a path whose bill nobody can see.
+
 ---
 
 ## Commands
@@ -110,6 +170,26 @@ curl -H "X-API-Key: $WORKER_API_KEY" https://railway-production-d648.up.railway.
 export RAILWAY_TOKEN=...
 python scripts/railway_api.py info
 python scripts/railway_configure.py --apply     # needs DEEPSEEK_API_KEY, PGPASSWORD
+
+# reach the database — public networking is OFF and must stay off. The CLI
+# opens an SSH tunnel and PRINTS the password; nothing else has to know it.
+railway connect postgres --tunnel-only --port 55432    # leave running
+export PGPASSWORD=... PGCLIENTENCODING=UTF8
+psql -h 127.0.0.1 -p 55432 -U postgres -d customer360  # NOT the `railway` db
+
+# apply a migration. lock_timeout is in the file: an ADD COLUMN on `interactions`
+# fights live ingestion and deadlocks, so it fails fast and you simply re-run.
+psql -h 127.0.0.1 -p 55432 -U postgres -d customer360      -v ON_ERROR_STOP=1 -f db/migrations/017_*.sql
+
+# deploy workflows: backs up the live copies, stamps the real credential id
+export N8N_API_KEY=...
+python scripts/n8n_deploy.py --list          # what is live, and its id
+python scripts/n8n_deploy.py 01d 04          # deploy, leave switched off
+python scripts/n8n_deploy.py 01d --activate
+
+# the Modal transcription batch (NOT deployed yet — needs the three secrets)
+modal run modal/transcribe_job.py::main --limit 5 --dry-run   # claims + releases
+modal deploy modal/transcribe_job.py                          # installs the cron
 
 # rewrite + activate the n8n chats workflow (edits in place, no clicking)
 export N8N_API_KEY=... PGPASSWORD=... WORKER_API_KEY=...

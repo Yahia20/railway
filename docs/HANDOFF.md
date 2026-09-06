@@ -505,7 +505,138 @@ python scripts/n8n_smoke_test.py                # expect PASS, 13/13 nodes
 If step 4 passes, everything on our side works and the only thing missing is
 real data from Bitrix.
 
-**Status:** database live and migrated; worker deployed and healthy with DeepSeek
-and Postgres connected; ASR and the two-pass evaluation proven on a real call;
-**chats workflow verified end to end and active**; calls workflow built but never
-executed; Bitrix not yet sending.
+**Status:** everything above is history. The current state is section 12.
+
+---
+
+## 12 · 2026-09-06 — the pipeline went live end to end
+
+Six workflows active, migration 017 applied, the worker deployed from `main`.
+This section supersedes every "not yet running" statement above it.
+
+### What was actually wrong, and what was not
+
+Two beliefs this project had been carrying turned out to be false, and both were
+only settled by querying the live database rather than reading the docs:
+
+**The calls backlog was never stuck.** The story was "580 jobs frozen in a
+terminal state from the August ASR failures; they must be revived before Modal
+can do anything". The database says otherwise:
+
+    call_ingest_jobs   780 evaluated   284 dead_letter
+    transcripts        830 rows, average asr_confidence 1.00
+
+`Claim work` returns nothing because there is nothing left to claim. The 284
+dead-lettered are genuinely unscoreable — `last_error` reads "transcript holds 86
+normalised characters of speech". Reviving them would queue 284 empty recordings
+for a judge that scores an empty transcript 0 and destroys an agent's average.
+**Do not revive them.**
+
+**The nightly Bitrix pull did not close the phone gap.** Workflow 03 resolves
+customers on the E.164 phone and nothing else, and the chat API never sends one —
+which is why `customers` was empty and `import_bitrix_phones.py` existed as a
+one-off CSV repair. The first version of workflow 04 fetched `crm.deal.list` and
+stopped. **Deals do not carry a phone; contacts do.** The chain has to be
+deal → `CONTACT_ID` → `crm.contact.list` → phone → normalise → `interactions`,
+and it now is.
+
+Normalisation is a call to the worker (`POST /phones/normalize`), not SQL,
+because `DEFAULT_PHONE_REGION=SA` is a decision with a failure mode, not a
+formatting convention: `0500000000` is a valid Saudi mobile and means nothing in
+Egypt, so a bare Egyptian number must FAIL rather than be assigned +966. A null
+phone is recoverable; a wrong-country match merges two real people. That rule
+lives in one place and the workflow asks it.
+
+### The six changes
+
+1. **`interaction_requests`** — a conversation can hold more than one request.
+   pass1 v6 emits `requests[]` with a verbatim quote each; the single-value
+   columns on `interaction_analysis` still describe the PRIMARY request so every
+   existing view keeps working. `v_request_reconciliation` compares what the
+   model found against what the CRM holds; `crm_missing_deals` is a request
+   nobody opened a deal for.
+2. **`model_calls` is finally written.** It had existed since 006 with nothing
+   writing to it, so every cost figure this project ever produced was arithmetic
+   over a sample. Two columns were missing before it could mean anything:
+   `cached_tokens` (a cached prompt token is priced 31x below a fresh one, and
+   the static prompt is ~15k tokens) and `priced_at_peak`.
+3. **Judging moved to night.** DeepSeek peak is 01:00–04:00 and 06:00–10:00 UTC
+   Mon–Fri at double rates; n8n runs on Asia/Riyadh so the window is 23:00–03:59
+   local and must END before 04:00. Same work, half the price.
+4. **A ceiling on re-judging.** A thread that grows after being judged is judged
+   again — correct, and the only unbounded cost here. Now at most one re-judge,
+   and only if the thread grew by half. The idle window also moved 2 days → 3.
+5. **Throughput.** 01d claimed one job per 30-minute tick: 48 evaluations a day
+   against a backlog of 488. Ten per tick across the night is ~300, paced two at
+   a time so a claimed batch does not become ten 429s.
+6. **Retention.** `purge_raw_content(90, 365)` deletes message bodies,
+   transcript text, raw payloads and `raw_response`; every conclusion and every
+   source id is kept forever. It is a no-op until mid-October — the oldest
+   conversation in the database is 2026-07-19.
+
+### Transcription left Railway
+
+`modal/transcribe_job.py` runs the batch nightly and scales to zero. Railway
+bills reserved RAM by the month, which is why ASR experiments cost about
+$13.50/month for two weeks in August: the worker went from 0.058 GB to 4.675 GB
+on 2026-08-13 and stayed large.
+
+The boundary with n8n is one predicate on each side. **Modal owns
+`discovered`/`asr_failed` and leaves rows `transcribed`; n8n claims from
+`transcribed`/`judge_failed`.** Widen either and the same call is transcribed
+twice and paid for twice. The job reuses workflow 02's audited store statement
+verbatim, including `external_source = 'asterisk_drive'` — a different namespace
+turns one call into two half-filled rows.
+
+**It is written and has never run.** It needs three Modal secrets
+(`travelgate-db`, `travelgate-drive`, `travelgate-hf`) and the gated model
+licence accepted on Hugging Face. Nothing is waiting on it: every discovered
+call is already transcribed.
+
+### Two things that bit during the deploy
+
+**The migration deadlocked.** `ALTER TABLE interactions ADD COLUMN` needs an
+AccessExclusiveLock and 01c inserts roughly once a minute. Postgres killed one
+of them and the whole migration rolled back — cleanly, having changed nothing.
+The file now sets `lock_timeout = '5s'`, so it fails fast instead of fighting,
+and the retry succeeded. Never raise that to "wait forever" on a live table.
+
+**Credentials.** The repo's workflow JSONs carry the placeholder `railway-pg`;
+the live instance uses `eYWvPxQFAwKs0bOu` / "railway-pg (api)". Importing them as
+they sit in git leaves every Postgres node broken, with no error until it runs.
+`scripts/n8n_deploy.py` stamps the real id and backs up the live copy first.
+
+### Verify it in 90 seconds
+
+```bash
+export N8N_API_KEY=...
+python scripts/n8n_deploy.py --list        # expect 01c 01d 02 03 04 all ON
+
+railway connect postgres --tunnel-only --port 55432 &
+export PGPASSWORD=... PGCLIENTENCODING=UTF8
+psql -h 127.0.0.1 -p 55432 -U postgres -d customer360 -c "
+  select (select count(*) from v_chat_eval_due)                        as due,
+         (select count(*) from chat_eval_jobs where status='pending')  as queued,
+         (select count(*) from model_calls)                            as costed,
+         (select count(*) from interaction_requests)                   as requests,
+         (select count(*) from asr_runs)                               as asr_runs;"
+```
+
+`costed`, `requests` and `asr_runs` were all 0 at deploy time. After the first
+night `costed` and `requests` should be non-zero; `asr_runs` stays 0 until Modal
+is deployed. If `costed` is still 0 the morning after, the worker is serving
+stale code — check that `/openapi.json` lists `/phones/normalize`.
+
+### Still open
+
+1. Modal not deployed (secrets + HF licence).
+2. **RTFx is unmeasured** — every Modal cost figure assumes 120. The first real
+   run writes the truth into `asr_runs.rtfx`; `benchmark-runpod/` in
+   `Yahia20/model-hosting` settles it for about $1.
+3. `crm.deal.list` and `crm.contact.list` have never been called against
+   cultiv.bitrix24.com. Workflow 04 depends on both.
+4. DPA / PDPL before customer audio leaves for any processor.
+5. Drive's own retention versus ours: if Drive deletes a WAV before our
+   one-year window, that conversation is gone from the world.
+6. Calls and chats still share one judging prompt. `channel_rules_call_v1.md`
+   is the seam; the 43 KB pass-2 prompt above it is common to both.
