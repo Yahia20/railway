@@ -253,3 +253,66 @@ def test_missing_credentials_is_503_naming_the_variable(monkeypatch):
                 json={"contact_ids": ["1"]})
     assert r2.status_code == 503
     assert "BITRIX_WEBHOOK_TOKEN" in r2.text
+
+
+# ---------------------------------------------------------------------------
+# The select list and the SQL have to agree
+#
+# `deals` held 13 rows from an August CSV import and 23 the model derived, and
+# not one from the nightly Bitrix pull. The reason was two lists disagreeing:
+# the SQL read `d->>'CLOSED'` and CLOSED was not in the select, so it was always
+# NULL — and `deals.is_closed` is NOT NULL. Every row of every batch failed the
+# constraint. It stayed invisible because the node is
+# `onError: continueRegularOutput`, so the workflow carried on and the
+# execution looked healthy.
+# ---------------------------------------------------------------------------
+
+import json as _json
+import re as _re
+from pathlib import Path as _Path
+
+_WF04 = (_Path(__file__).resolve().parents[3] / "n8n" / "workflows"
+         / "04-nightly-housekeeping.json")
+
+
+def _upsert_sql() -> str:
+    wf = _json.loads(_WF04.read_text(encoding="utf-8"))
+    return [n for n in wf["nodes"] if n["name"] == "Upsert deals"][0]["parameters"]["query"]
+
+
+def test_deal_select_covers_every_field_the_sql_reads():
+    """`d->>'FIELD'` on a field nobody asked Bitrix for is NULL, not an error.
+    Whether that is harmless or fatal depends on a NOT NULL three files away."""
+    from app.main import DEAL_SELECT
+
+    read = set(_re.findall(r"d->>'([A-Z_0-9]+)'", _upsert_sql()))
+    missing = sorted(read - set(DEAL_SELECT))
+    assert not missing, (
+        f"Upsert deals reads {missing} but DEAL_SELECT does not request them, "
+        f"so they arrive NULL")
+
+
+def test_is_closed_cannot_be_written_null():
+    """is_closed is NOT NULL DEFAULT false — but an explicit NULL in an INSERT
+    column list overrides the default instead of falling back to it."""
+    sql = _upsert_sql()
+    assert "coalesce((d->>'CLOSED') = 'Y', false)" in sql, (
+        "a bare (d->>'CLOSED') = 'Y' is NULL when CLOSED is absent, and NULL "
+        "violates deals.is_closed NOT NULL")
+
+
+def test_stage_semantic_is_null_not_empty_string():
+    """CHECK (stage_semantic IN ('P','S','F')) — and left('', 1) is '', which
+    is not one of them and fails the whole batch."""
+    sql = _upsert_sql()
+    assert "nullif(left(coalesce(d->>'STAGE_SEMANTIC_ID', ''), 1), '')" in sql
+
+
+def test_health_check_casts_status_to_its_enum():
+    """job_runs.status is the job_status enum. Postgres casts a bare literal
+    for you and refuses to cast a CASE, so this node — the one that reports
+    whether anything got judged — was the only one that could not run."""
+    wf = _json.loads(_WF04.read_text(encoding="utf-8"))
+    sql = [n for n in wf["nodes"]
+           if n["name"] == "Nightly health check"][0]["parameters"]["query"]
+    assert "::job_status" in sql

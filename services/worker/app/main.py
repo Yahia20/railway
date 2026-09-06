@@ -771,8 +771,13 @@ def report_data(days: int = 30, limit: int = report.SAMPLE_LIMIT) -> dict:
 # puts in Python: n8n schedules and branches, the worker does the work.
 # ---------------------------------------------------------------------------
 
+# Every field the Upsert deals SQL reads must appear here, or `d->>'FIELD'`
+# silently yields NULL. CLOSED was missing and `deals.is_closed` is NOT NULL, so
+# the insert violated the constraint on the very first row and workflow 04 had
+# never stored a single Bitrix deal. `test_deal_select_covers_every_field_the_sql_reads`
+# now fails if the two drift apart again.
 DEAL_SELECT = [
-    "ID", "TITLE", "STAGE_ID", "STAGE_SEMANTIC_ID", "CATEGORY_ID",
+    "ID", "TITLE", "STAGE_ID", "STAGE_SEMANTIC_ID", "CATEGORY_ID", "CLOSED",
     "OPPORTUNITY", "CURRENCY_ID", "CONTACT_ID", "ASSIGNED_BY_ID",
     "SOURCE_ID", "DATE_CREATE", "DATE_MODIFY", "BEGINDATE", "CLOSEDATE",
 ]
