@@ -13,10 +13,21 @@ from fastapi.testclient import TestClient
 
 os.environ.setdefault("WORKER_API_KEY", "test-key")
 
+from app.config import settings  # noqa: E402
 from app.main import app  # noqa: E402
 
 client = TestClient(app)
 AUTH = {"X-API-Key": "test-key"}
+
+
+# `settings` reads the environment once, when the dataclass is constructed. The
+# setdefault above therefore only works if this module is the FIRST to import
+# app.config — which made these tests depend on alphabetical filename order,
+# and a new test file sorting earlier turned every 401 assertion into a 503.
+# Set it explicitly instead; monkeypatch still restores it afterwards.
+@pytest.fixture(autouse=True)
+def _api_key(monkeypatch):
+    monkeypatch.setattr(settings, "worker_api_key", "test-key", raising=False)
 
 
 def prepare(messages, external_id="conv-1", channel="whatsapp"):

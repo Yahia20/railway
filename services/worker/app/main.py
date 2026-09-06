@@ -7,6 +7,7 @@ single HTTP call to one of these endpoints.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -20,7 +21,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from . import db, report
+from . import asr_jobs, db, report
 from .asr import cohere_arabic
 from .config import settings
 from .evaluate import judge, metrics, scoring
@@ -871,3 +872,134 @@ def bitrix_contacts(req: BitrixContactsRequest) -> dict:
     return {"result": rows, "total": total, "fetched": len(rows),
             "truncated": len(rows) < total, "requests": requests,
             "requested_ids": len(ids)}
+
+
+# ---------------------------------------------------------------------------
+# ASR batch
+#
+# The Modal transcription batch used to open its own psycopg connection. Modal
+# runs outside Railway, `postgres.railway.internal` is Railway's private
+# network, and the connection never resolved. Opening the database to the
+# public internet would have fixed it and is the thing this project forbids, so
+# Modal calls these instead: the API key is the only credential that leaves
+# Modal, and the database stays private.
+#
+# Modal still owns the GPU, the audio and the chunking. It owns none of the
+# SQL — see app/asr_jobs.py, where the statements were moved verbatim.
+# ---------------------------------------------------------------------------
+
+class AsrRunStart(BaseModel):
+    run_id: str = Field(min_length=1, max_length=200)
+    gpu: str | None = None
+    model_version: str | None = None
+
+
+class AsrClaim(BaseModel):
+    run_id: str = Field(min_length=1, max_length=200)
+    claim_token: str
+    limit: int = Field(default=500, ge=1, le=2000)
+    max_attempts: int = Field(default=3, ge=1, le=10)
+
+
+class AsrStore(BaseModel):
+    uniqueid: str
+    claim_token: str
+    # Sent as objects and re-serialised here, so the caller cannot decide how
+    # this database's jsonb columns get encoded.
+    meta: dict[str, Any]
+    transcript: dict[str, Any]
+
+
+class AsrFail(BaseModel):
+    uniqueid: str
+    claim_token: str
+    error: str = ""
+    max_attempts: int = Field(default=3, ge=1, le=10)
+
+
+class AsrRelease(BaseModel):
+    claim_token: str
+
+
+class AsrRunFinish(BaseModel):
+    run_id: str
+    status: Literal["succeeded", "failed", "partial"]
+    processed: int = 0
+    failed: int = 0
+    audio_seconds: float = 0
+    gpu_seconds: float = 0
+    est_cost_usd: float | None = None
+    error: str | None = None
+
+
+def _asr(fn, *args, **kwargs):
+    """Run one asr_jobs call, turning a missing database into a 503 rather than
+    a 500 — the batch runs unattended at 23:30 and the difference is whether
+    tomorrow starts with a diagnosis or a log dig."""
+    try:
+        return fn(*args, **kwargs)
+    except db.DatabaseUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+
+@app.post("/asr/run/start", dependencies=[Depends(require_api_key)])
+def asr_run_start(req: AsrRunStart) -> dict:
+    """Open the asr_runs row and mint this batch's lease token.
+
+    The token is minted HERE, not by the caller: it is the fence every later
+    write is checked against, and a caller that could choose it could also
+    reuse another run's."""
+    return _asr(asr_jobs.start_run, req.run_id, req.gpu, req.model_version)
+
+
+@app.post("/asr/claim", dependencies=[Depends(require_api_key)])
+def asr_claim(req: AsrClaim) -> dict:
+    """Claim a bounded batch of untranscribed calls.
+
+    Only `discovered` and `asr_failed` — the other half of gotcha 13's boundary
+    is the WHERE in workflow 02's `Claim work`, which takes `transcribed` and
+    `judge_failed`. Widen either and the same call is paid for twice."""
+    rows = _asr(asr_jobs.claim, req.run_id, req.claim_token,
+                req.limit, req.max_attempts)
+    return {"claimed": len(rows), "recordings": rows}
+
+
+@app.post("/asr/store", dependencies=[Depends(require_api_key)])
+def asr_store(req: AsrStore) -> dict:
+    """Store the transcript and release the lease as `transcribed`.
+
+    An empty `updated` means the lease fence rejected the write — expired,
+    or the row was reclaimed by another run. That is not an error, and it must
+    not be reported as success either: the caller has to know its work was
+    discarded."""
+    rows = _asr(asr_jobs.store, req.uniqueid, req.claim_token,
+                json.dumps(req.meta, ensure_ascii=False),
+                json.dumps(req.transcript, ensure_ascii=False))
+    return {"stored": bool(rows), "updated": rows}
+
+
+@app.post("/asr/fail", dependencies=[Depends(require_api_key)])
+def asr_fail(req: AsrFail) -> dict:
+    rows = _asr(asr_jobs.fail, req.uniqueid, req.claim_token,
+                req.error, req.max_attempts)
+    return {"updated": rows}
+
+
+@app.post("/asr/release", dependencies=[Depends(require_api_key)])
+def asr_release(req: AsrRelease) -> dict:
+    """Give back everything this token holds, and the attempt it spent.
+
+    `--dry-run` uses this. Without it a dry run slowly dead-letters the backlog
+    it exists to inspect safely."""
+    rows = _asr(asr_jobs.release, req.claim_token)
+    return {"released": len(rows), "recordings": rows}
+
+
+@app.post("/asr/run/finish", dependencies=[Depends(require_api_key)])
+def asr_run_finish(req: AsrRunFinish) -> dict:
+    """Close the run. `rtfx` comes back computed — it is a generated column, so
+    the first real batch measures what every cost estimate has assumed."""
+    rows = _asr(asr_jobs.finish_run, req.run_id, req.status, req.processed,
+                req.failed, req.audio_seconds, req.gpu_seconds,
+                req.est_cost_usd, req.error)
+    return {"run": rows[0] if rows else None}

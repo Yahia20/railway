@@ -146,20 +146,24 @@ def test_the_asr_node_is_disabled_not_deleted():
 
 def test_modal_writes_the_same_namespace_as_n8n():
     """A different external_source turns one call into two half-filled rows —
-    the split-namespace bug the chat side already had to migrate out of."""
-    job = (Path(__file__).resolve().parents[3] / "modal" / "transcribe_job.py"
-           ).read_text(encoding="utf-8")
-    assert "'asterisk_drive'" in job
-    assert "'pbx_drive'" not in job
+    the split-namespace bug the chat side already had to migrate out of.
+
+    The statement moved from modal/transcribe_job.py into the worker when Modal
+    stopped connecting to Postgres directly; the assertion did not change."""
+    from app import asr_jobs
+
+    assert "'asterisk_drive'" in asr_jobs.STORE_SQL
+    assert "'pbx_drive'" not in asr_jobs.STORE_SQL
 
 
 def test_modal_releases_the_lease_on_handoff():
     """n8n renews the lease because its next node is the judge; Modal is
     finished, so it must set 'transcribed' AND drop the token, or n8n's claim
     will never see the row."""
-    job = (Path(__file__).resolve().parents[3] / "modal" / "transcribe_job.py"
-           ).read_text(encoding="utf-8")
-    tail = job[job.index("UPDATE call_ingest_jobs j\nSET interaction_id"):]
+    from app import asr_jobs
+
+    sql = asr_jobs.STORE_SQL
+    tail = sql[sql.index("UPDATE call_ingest_jobs j"):]
     assert "status         = 'transcribed'" in tail
     assert "claim_token    = NULL" in tail
 

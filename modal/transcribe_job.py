@@ -57,7 +57,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
         "torch==2.5.1", "transformers==4.48.0", "accelerate==1.2.1",
-        "numpy==2.2.1", "psycopg[binary]==3.2.3",
+        "numpy==2.2.1", "httpx==0.28.1",
         "google-api-python-client==2.156.0", "google-auth==2.37.0",
     )
     # The chunker and the WAV reader are already written and already tested in
@@ -76,152 +76,43 @@ app = modal.App(APP_NAME, image=image)
 weights = modal.Volume.from_name("travelgate-asr-weights", create_if_missing=True)
 
 SECRETS = [
-    modal.Secret.from_name("travelgate-db"),      # DATABASE_URL
+    # WORKER_URL + WORKER_API_KEY. This job no longer touches Postgres: Modal
+    # runs outside Railway, `postgres.railway.internal` is Railway's PRIVATE
+    # network, and psycopg failed with "Name or service not known" on the very
+    # first call. The alternative was exposing the database to the internet.
+    modal.Secret.from_name("travelgate-worker"),
     modal.Secret.from_name("travelgate-drive"),   # GOOGLE_SERVICE_ACCOUNT_JSON
     modal.Secret.from_name("travelgate-hf"),      # HF_TOKEN — the model is gated
 ]
 
 
 # ---------------------------------------------------------------------------
-# Database — every statement fenced by the lease this run holds
+# The worker — every statement this job used to run itself
+#
+# The SQL did not change; it moved. services/worker/app/asr_jobs.py holds the
+# same CLAIM / STORE / FAIL statements byte-for-byte, still fenced by the lease
+# token this run holds, and the boundary of gotcha 13 is still one WHERE on each
+# side. What changed is who executes them, and therefore who needs a database
+# password: nobody outside Railway.
 # ---------------------------------------------------------------------------
 
-def _connect():
-    import psycopg
-    return psycopg.connect(os.environ["DATABASE_URL"], autocommit=True)
+def _worker(path: str, payload: dict, timeout: float = 120.0) -> dict:
+    """One call to the worker. Raises on anything that is not a 2xx.
 
+    A failure here is not recoverable inside the batch — if the worker cannot
+    be reached, the lease cannot be released either — so it propagates and the
+    lease expires on its own. That is the behaviour the recovery sweep in
+    workflow 02 already exists to handle.
+    """
+    import httpx
 
-CLAIM_SQL = """
--- Take a bounded batch of untranscribed calls and stamp this run on them.
---
--- FOR UPDATE SKIP LOCKED, not a plain FOR UPDATE: a second run started by hand
--- from the dashboard walks past locked rows instead of queueing behind them.
---
--- ATTEMPTS ARE SPENT AT CLAIM TIME. A run that dies before it can record
--- anything has still spent an attempt, and that is the only version of this
--- counter a crash cannot reset — three failures and the row is dead-lettered
--- and visible, rather than retried nightly forever at full GPU price.
-WITH picked AS (
-  SELECT j.uniqueid
-  FROM call_ingest_jobs j
-  WHERE j.claim_until IS NULL
-    AND j.meta <> '{}'::jsonb
-    AND j.status IN ('discovered', 'asr_failed')
-    AND j.asr_attempts < %(max_attempts)s
-  ORDER BY j.discovered_at
-  LIMIT %(limit)s
-  FOR UPDATE SKIP LOCKED
-)
-UPDATE call_ingest_jobs j
-   SET status       = 'transcribing',
-       claim_token  = %(token)s::uuid,
-       claim_until  = now() + (%(lease)s * interval '1 second'),
-       claimed_at   = now(),
-       asr_attempts = j.asr_attempts + 1,
-       asr_run_id   = %(run_id)s,
-       updated_at   = now()
-  FROM picked p
- WHERE j.uniqueid = p.uniqueid
-RETURNING j.uniqueid, j.filename, j.audio_uri, j.meta;
-"""
-
-STORE_SQL = """
--- Lifted VERBATIM from workflow 02's "Store call + transcript" node, which
--- was reviewed four times and whose lease fence is the reason two writers
--- cannot overwrite each other. Copying it is deliberate: a second, simpler
--- version of this statement is a second set of rules to keep in step, and the
--- namespace alone ('asterisk_drive') decides whether a call is one row or two
--- half-filled ones.
---
--- ONE DIFFERENCE, AT THE END. n8n renews the lease here because its next node
--- is the judge. Modal is finished, so it sets status='transcribed' and RELEASES
--- the lease — that is the whole handoff protocol between the two systems.
-WITH lease AS MATERIALIZED (
-  SELECT j.uniqueid, j.claim_token
-  FROM call_ingest_jobs j
-  WHERE j.uniqueid    = %(uniqueid)s
-    AND j.claim_token = %(token)s::uuid
-    AND j.status IN ('transcribing')
-    AND j.claim_until > now()
-  FOR UPDATE
-),
-r AS (SELECT %(meta)s::jsonb AS meta, %(tr)s::jsonb AS tr FROM lease),
-ins AS (
-  INSERT INTO interactions (
-    external_source, external_id, channel, started_at, duration_seconds,
-    customer_phone_raw, customer_phone_e164, agent_id, handled_by
-  )
-  SELECT 'asterisk_drive', meta->>'uniqueid', 'phone_call'::channel,
-         (meta->>'started_at')::timestamptz,
-         round((tr->>'duration_seconds')::numeric)::int,
-         meta->>'customer_phone_raw', meta->>'customer_phone_e164',
-         -- 'q' recordings carry the QUEUE extension (3009), not a person.
-         -- Attributing them to an agent row makes every scorecard wrong.
-         CASE WHEN meta->>'kind' = 'q' THEN NULL
-              ELSE (SELECT agent_id FROM agents WHERE phone_extension = meta->>'agent_extension') END,
-         'agent'::speaker_role
-  FROM r
-  ON CONFLICT (external_source, external_id) DO UPDATE SET updated_at = now()
-  RETURNING interaction_id
-),
-stored AS (
-  INSERT INTO transcripts (
-    interaction_id, audio_uri, duration_seconds, sample_rate_hz, channels,
-    asr_provider, asr_model_version, asr_confidence, language,
-    full_text, segments, diarization, asr_metrics
-  )
-  SELECT ins.interaction_id, r.meta->>'audio_uri',
-         (r.tr->>'duration_seconds')::numeric,
-         (r.tr->>'sample_rate_hz')::int, (r.tr->>'channels')::int,
-         r.tr->>'provider', r.tr->>'model_version',
-         (r.tr->>'confidence')::numeric, 'ar',
-         r.tr->>'full_text', coalesce(r.tr->'segments', '[]'::jsonb),
-         r.tr->>'diarization', coalesce(r.tr->'asr_metrics', '{}'::jsonb)
-  FROM ins, r
-  -- A re-transcription replaces EVERY value that came out of ASR, not just the
-  -- text. Leaving asr_provider / asr_model_version / duration behind next to
-  -- new segments produces a row that says it was produced by a run that did
-  -- not produce it, which is the version of this bug that survives review.
-  ON CONFLICT (interaction_id) DO UPDATE SET
-    audio_uri         = EXCLUDED.audio_uri,
-    duration_seconds  = EXCLUDED.duration_seconds,
-    sample_rate_hz    = EXCLUDED.sample_rate_hz,
-    channels          = EXCLUDED.channels,
-    asr_provider      = EXCLUDED.asr_provider,
-    asr_model_version = EXCLUDED.asr_model_version,
-    asr_confidence    = EXCLUDED.asr_confidence,
-    language          = EXCLUDED.language,
-    full_text         = EXCLUDED.full_text,
-    segments          = EXCLUDED.segments,
-    diarization       = EXCLUDED.diarization,
-    asr_metrics       = EXCLUDED.asr_metrics,
-    transcribed_at    = now()
-  RETURNING interaction_id
-)
-UPDATE call_ingest_jobs j
-SET interaction_id = stored.interaction_id,
-    status         = 'transcribed',
-    claim_token    = NULL,
-    claim_until    = NULL,
-    claimed_at     = NULL,
-    last_error     = NULL,
-    updated_at     = now()
-FROM stored, lease
-WHERE j.uniqueid    = lease.uniqueid
-  AND j.claim_token = lease.claim_token
-RETURNING j.uniqueid, j.interaction_id, j.status;
-"""
-
-FAIL_SQL = """
--- Retryable up to the attempt ceiling, then dead-lettered and visible.
-UPDATE call_ingest_jobs
-   SET status = CASE WHEN asr_attempts >= %(max_attempts)s
-                     THEN 'dead_letter' ELSE 'asr_failed' END,
-       claim_token = NULL, claim_until = NULL, claimed_at = NULL,
-       last_error = left(%(error)s, 500), updated_at = now()
- WHERE uniqueid = %(uniqueid)s AND claim_token = %(token)s::uuid
-RETURNING uniqueid, status;
-"""
+    base = os.environ["WORKER_URL"].rstrip("/")
+    r = httpx.post(f"{base}{path}",
+                   headers={"X-API-Key": os.environ["WORKER_API_KEY"]},
+                   json=payload, timeout=timeout)
+    if r.status_code >= 400:
+        raise RuntimeError(f"worker {path} -> {r.status_code}: {r.text[:300]}")
+    return r.json()
 
 
 # ---------------------------------------------------------------------------
@@ -273,31 +164,32 @@ def transcribe_batch(limit: int = 500, max_attempts: int = 3,
     import cohere_arabic as ca  # the repo's chunker and WAV reader
 
     run_id = f"asr-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:6]}"
-    token = str(uuid.uuid4())
     started = time.monotonic()
-    conn = _connect()
 
-    conn.execute(
-        "INSERT INTO asr_runs (run_id, gpu, model_version, status) "
-        "VALUES (%s, %s, %s, 'running')", (run_id, GPU, MODEL_VERSION))
+    # The lease token is minted by the worker, not here. It is the fence every
+    # later write is checked against, and a caller that chose it could reuse
+    # another run's.
+    token = _worker("/asr/run/start", {
+        "run_id": run_id, "gpu": GPU, "model_version": MODEL_VERSION,
+    })["claim_token"]
 
-    rows = conn.execute(CLAIM_SQL, {
-        "limit": limit, "max_attempts": max_attempts, "token": token,
-        "lease": LEASE_SECONDS, "run_id": run_id}).fetchall()
-    conn.execute("UPDATE asr_runs SET claimed = %s WHERE run_id = %s",
-                 (len(rows), run_id))
+    claimed = _worker("/asr/claim", {
+        "run_id": run_id, "claim_token": token,
+        "limit": limit, "max_attempts": max_attempts,
+    })
+    rows = [(r["uniqueid"], r["filename"], r["audio_uri"], r["meta"])
+            for r in claimed["recordings"]]
     print(f"[{run_id}] claimed {len(rows)} recordings")
 
     if dry_run or not rows:
-        conn.execute(
-            "UPDATE asr_runs SET status='succeeded', finished_at=now() WHERE run_id=%s",
-            (run_id,))
-        # A dry run must not keep the rows it looked at.
+        # A dry run must not keep the rows it looked at, and must give back the
+        # attempt it spent — otherwise --dry-run slowly dead-letters the very
+        # backlog it exists to inspect safely.
         if dry_run and rows:
-            conn.execute(
-                "UPDATE call_ingest_jobs SET status='discovered', claim_token=NULL,"
-                " claim_until=NULL, claimed_at=NULL, asr_attempts=asr_attempts-1"
-                " WHERE claim_token = %s::uuid", (token,))
+            released = _worker("/asr/release", {"claim_token": token})["released"]
+            print(f"[{run_id}] released {released} back to discovered")
+        _worker("/asr/run/finish", {"run_id": run_id, "status": "succeeded",
+                                    "gpu_seconds": time.monotonic() - started})
         return {"run_id": run_id, "claimed": len(rows), "dry_run": dry_run}
 
     # One model per container, loaded once. Loading per call would pay the
@@ -365,19 +257,32 @@ def transcribe_batch(limit: int = 500, max_attempts: int = 3,
                     "run_id": run_id,
                 },
             }
-            conn.execute(STORE_SQL, {
-                "meta": json.dumps(meta or {}, ensure_ascii=False),
-                "tr": json.dumps(transcript, ensure_ascii=False),
-                "uniqueid": uniqueid, "token": token,
+            result = _worker("/asr/store", {
+                "uniqueid": uniqueid, "claim_token": token,
+                "meta": meta or {}, "transcript": transcript,
             })
+            if not result.get("stored"):
+                # The lease fence rejected the write: it expired, or another run
+                # reclaimed the row. The GPU time is spent either way, but this
+                # must not be counted as a success.
+                failed += 1
+                print(f"[{run_id}] {uniqueid}: lease lost, transcript discarded")
+                continue
             processed += 1
             print(f"[{run_id}] {uniqueid}: {duration:.0f}s, {len(texts)} chunks, "
                   f"confidence {confidence}")
         except Exception as exc:                       # noqa: BLE001
             failed += 1
-            conn.execute(FAIL_SQL, {"uniqueid": uniqueid, "token": token,
-                                    "max_attempts": max_attempts,
-                                    "error": f"{type(exc).__name__}: {exc}"})
+            try:
+                _worker("/asr/fail", {
+                    "uniqueid": uniqueid, "claim_token": token,
+                    "max_attempts": max_attempts,
+                    "error": f"{type(exc).__name__}: {exc}"})
+            except Exception as report_exc:   # noqa: BLE001
+                # Could not even record the failure. The lease expires on its
+                # own and workflow 02's recovery sweep reopens the row.
+                print(f"[{run_id}] {uniqueid} FAILED and could not be recorded: "
+                      f"{report_exc}")
             print(f"[{run_id}] {uniqueid} FAILED: {exc}")
         finally:
             try:
@@ -386,14 +291,18 @@ def transcribe_batch(limit: int = 500, max_attempts: int = 3,
                 pass
 
     gpu_seconds = time.monotonic() - started
-    conn.execute(
-        "UPDATE asr_runs SET status=%s, finished_at=now(), processed=%s, failed=%s,"
-        " audio_seconds=%s, gpu_seconds=%s, est_cost_usd=%s WHERE run_id=%s",
-        ("succeeded" if not failed else "partial", processed, failed,
-         round(audio_seconds, 1), round(gpu_seconds, 1),
-         round(gpu_seconds / 3600 * GPU_HOURLY_USD, 4), run_id))
+    run = _worker("/asr/run/finish", {
+        "run_id": run_id,
+        "status": "succeeded" if not failed else "partial",
+        "processed": processed, "failed": failed,
+        "audio_seconds": round(audio_seconds, 1),
+        "gpu_seconds": round(gpu_seconds, 1),
+        "est_cost_usd": round(gpu_seconds / 3600 * GPU_HOURLY_USD, 4),
+    }).get("run") or {}
 
-    rtfx = audio_seconds / gpu_seconds if gpu_seconds else 0
+    # rtfx comes back COMPUTED — it is a generated column, so this is the first
+    # measurement of the number every cost estimate in this project assumed.
+    rtfx = float(run.get("rtfx") or 0) or (audio_seconds / gpu_seconds if gpu_seconds else 0)
     print(f"[{run_id}] done: {processed} ok, {failed} failed, "
           f"{audio_seconds/3600:.2f} audio-hours in {gpu_seconds/3600:.2f} GPU-hours "
           f"(RTFx {rtfx:.0f}, ${gpu_seconds/3600*GPU_HOURLY_USD:.2f})")
