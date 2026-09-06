@@ -61,19 +61,41 @@ Its rows were migrated from `external_source = 'bitrix'` to `'bitrix_chat_api'`
 so threads would not split across the two namespaces. The 16 older rows still
 under `'bitrix'` belong to workflow 01 and were deliberately left alone.
 
-### The five things still open
+### What is still open — measured 2026-09-06, not assumed
 
-1. **Modal is not deployed.** Needs `travelgate-db`, `travelgate-drive` and
+Read `/report` first; these are the things it cannot fix by itself.
+
+1. **The live 01d is older than this repo.** 30 chats were judged on 2026-09-06
+   and wrote **zero** `model_calls` and **zero** `interaction_requests`. The
+   repo's 01d wires `Record model cost` and `Store requests` correctly (checked
+   the graph — both have edges in and out), so the running copy predates 017.
+   That breaks rule 11 twice over: no bill, and no `UNIQUE` guard against paying
+   for the same judgement again. Fix: `python scripts/n8n_deploy.py 01d 02 03
+   --activate`, which also ships the timezone fix. Needs `N8N_API_KEY`.
+2. **Bitrix has never been called.** The n8n service has 35 variables and none
+   of them is `BITRIX_PORTAL_DOMAIN`, `BITRIX_WEBHOOK_TOKEN` or
+   `BITRIX_WEBHOOK_USER_ID`, so workflow 04 builds
+   `https:///rest/1//crm.deal.list.json` and fails — which is why `customers` is
+   0 and only 13 of 921 chat threads are linked to a deal. The worker holds
+   `BITRIX_WEBHOOK_SECRET`, but that is the *inbound* webhook secret; the
+   outbound REST token does not exist anywhere. `python -m
+   app.sources.bitrix_chats --probe` reports what the portal exposes.
+3. **Modal is not deployed.** Needs `travelgate-db`, `travelgate-drive` and
    `travelgate-hf` secrets, plus accepting the model licence on Hugging Face.
-   Nothing is waiting on it right now — every discovered call is transcribed.
-2. **RTFx is unmeasured.** Every Modal cost figure assumes 120. The first real
+   Note the README in `Yahia20/model-hosting` is an older draft (monthly batch,
+   one `asr-secrets`, tables that were renamed) — `modal/transcribe_job.py`
+   here supersedes it. Nothing is stranded today (`/report` says 0), but 017
+   moved transcription out of workflow 02, so the first NEW recording Drive
+   gains has no owner at all.
+4. **RTFx is unmeasured.** Every Modal cost figure assumes 120. The first real
    run writes the truth into `asr_runs.rtfx`; `benchmark-runpod/` in
    `Yahia20/model-hosting` settles it for about $1.
-3. **`crm.deal.list` and `crm.contact.list` have never been called against the
-   portal.** Workflow 04 uses both. `python -m app.sources.bitrix_chats --probe`
-   reports which methods `cultiv.bitrix24.com` actually exposes.
-4. **DPA / PDPL** before customer audio leaves for any processor.
-5. **Drive's own retention** — `purge_raw_content` blanks call text after a
+5. **503 chat threads are due and 11 are stuck** in `evaluating` since
+   2026-08-31 with expired leases; 222 have sat `pending` since the same day.
+   The recovery sweep reopens expired leases, so this clears itself once 01d
+   runs on a schedule that fires.
+6. **DPA / PDPL** before customer audio leaves for any processor.
+7. **Drive's own retention** — `purge_raw_content` blanks call text after a
    year. If Drive deletes the WAV sooner, that conversation is gone from the
    world. Confirm, or widen the window (call text is only ~0.14 GB/year).
 
@@ -165,6 +187,16 @@ python scripts/railway_usage.py
 
 # what is configured, live
 curl -H "X-API-Key: $WORKER_API_KEY" https://railway-production-d648.up.railway.app/ready
+
+# THE REPORT. Open in a browser and paste WORKER_API_KEY when it asks — the page
+# holds no data and fetches /report/data itself, because a browser cannot set a
+# header on a navigation and a key in the URL lands in history and proxy logs.
+#   https://railway-production-d648.up.railway.app/report
+# Sixteen panels, each separately fallible; `errors` is present and empty when
+# healthy. crm_missing_deals leads. `build_dashboard_data.py` and
+# `build_crm_pages_data.py` are superseded — they wrote a JSON file by hand next
+# to a static page and nothing scheduled ever ran them.
+curl -H "X-API-Key: $WORKER_API_KEY"   'https://railway-production-d648.up.railway.app/report/data?days=30'
 
 # read/set Railway config without the CLI
 export RAILWAY_TOKEN=...
@@ -335,6 +367,17 @@ rows.
 Asia/Riyadh, so the crons sit at 23:00–03:59 local and must END before 04:00.
 Moving a schedule an hour later doubles the model bill for identical work;
 `tests/test_workflow_017_changes.py` fails if any cron drifts into the window.
+
+**And a cron with no timezone is not a time.** n8n resolves an unqualified cron
+in `GENERIC_TIMEZONE`, which **is not set on the n8n service** — so until
+2026-09-06 only workflow 04 declared a zone and 01d, 02 and 03 ran on n8n's own
+default, hours away from where they were written and mostly inside peak. The
+cron text never changed, so every test above passed while the bill doubled.
+Every scheduled workflow now carries `settings.timezone: Asia/Riyadh` and a test
+asserts it for anything with a `scheduleTrigger`. Never rely on the platform
+default; the histogram on `/report` is the only place the mistake is visible
+after the fact, because it plots `model_calls` by Riyadh hour against
+`priced_at_peak`.
 
 ---
 
