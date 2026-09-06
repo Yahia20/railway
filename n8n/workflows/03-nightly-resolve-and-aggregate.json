@@ -7,7 +7,7 @@
           "interval": [
             {
               "field": "cronExpression",
-              "expression": "0 2 * * *"
+              "expression": "40 3 * * *"
             }
           ]
         }
@@ -19,7 +19,8 @@
       "position": [
         -600,
         300
-      ]
+      ],
+      "notes": "03:40 — AFTER 04 has pulled contacts and written phones at 03:20. Identity resolution matches on the E.164 phone and nothing else, so running it first would resolve last night's phones against tonight's conversations and be a day behind forever."
     },
     {
       "parameters": {
@@ -37,8 +38,8 @@
       ],
       "credentials": {
         "postgres": {
-          "id": "railway-pg",
-          "name": "Railway Postgres"
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
         }
       },
       "notes": "Phone match only — it is the one match that is certain. CRM-id and fuzzy-name matching are deliberately NOT automated: a wrong merge is expensive to undo and every match is written to customer_identities with its method and confidence."
@@ -46,7 +47,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- STEP 2 — turn agent promises extracted by pass 1 into follow_up rows,\n-- then close any that a later interaction fulfilled.\nINSERT INTO follow_ups (customer_id, agent_id, promised_in, promise_text, promised_at, due_at, channel)\nSELECT i.customer_id, i.agent_id, i.interaction_id,\n       p->>'promise',\n       i.started_at,\n       CASE WHEN p->>'due_hint' IS NOT NULL THEN i.started_at + interval '24 hours' END,\n       i.channel\nFROM interaction_analysis ia\nJOIN interactions i ON i.interaction_id = ia.interaction_id\nCROSS JOIN LATERAL jsonb_array_elements(\n  coalesce(ia.raw_response->'promises_made_by_agent', '[]'::jsonb)) AS p\nWHERE i.agent_id IS NOT NULL\n  AND NOT EXISTS (\n    SELECT 1 FROM follow_ups f\n    WHERE f.promised_in = i.interaction_id AND f.promise_text = p->>'promise'\n  );",
+        "query": "-- STEP 2 — turn agent promises extracted by pass 1 into follow_up rows,\n-- then close any that a later interaction fulfilled.\nINSERT INTO follow_ups (customer_id, agent_id, promised_in, promise_text, promised_at, due_at, channel)\nSELECT i.customer_id, i.agent_id, i.interaction_id,\n       p->>'promise',\n       i.started_at,\n       CASE WHEN p->>'due_hint' IS NOT NULL THEN i.started_at + interval '24 hours' END,\n       i.channel\nFROM interaction_analysis ia\nJOIN interactions i ON i.interaction_id = ia.interaction_id\nCROSS JOIN LATERAL jsonb_array_elements(\n  coalesce(ia.raw_response->'promises_made_by_agent', '[]'::jsonb)) AS p\nWHERE i.agent_id IS NOT NULL\n  AND NOT EXISTS (\n    SELECT 1 FROM follow_ups f\n    WHERE f.promised_in = i.interaction_id AND f.promise_text = p->>'promise'\n  )\n-- RETURNING added (017). Without it a Postgres mutation hands n8n a single\n-- {success:true} however many rows it touched, so the next node cannot tell\n-- 'wrote 40 promises' from 'wrote none' -- and check_workflow_json rejects\n-- the shape outright. Nothing downstream reads these rows; they exist so a\n-- run leaves a countable trace.\nRETURNING follow_up_id, promised_in, promise_text, due_at;",
         "options": {}
       },
       "id": "promises",
@@ -59,15 +60,15 @@
       ],
       "credentials": {
         "postgres": {
-          "id": "railway-pg",
-          "name": "Railway Postgres"
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
         }
       }
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- STEP 3 — close promises that a later outbound contact fulfilled.\nUPDATE follow_ups f\nSET fulfilled_in = nxt.interaction_id,\n    fulfilled_at = nxt.started_at,\n    hours_to_fulfil = round(extract(epoch from (nxt.started_at - f.promised_at))/3600.0, 2),\n    status = CASE\n      WHEN nxt.started_at <= coalesce(f.due_at, f.promised_at + interval '24 hours')\n        THEN 'fulfilled' ELSE 'late' END,\n    updated_at = now()\nFROM LATERAL (\n  SELECT i.interaction_id, i.started_at\n  FROM interactions i\n  WHERE i.customer_id = f.customer_id\n    AND i.started_at > f.promised_at\n    AND i.agent_id = f.agent_id\n  ORDER BY i.started_at\n  LIMIT 1\n) nxt\nWHERE f.status = 'open';\n\n-- Anything still open past its deadline is a missed promise, not a pending one.\nUPDATE follow_ups\nSET status = 'missed', updated_at = now()\nWHERE status = 'open'\n  AND coalesce(due_at, promised_at + interval '48 hours') < now();",
+        "query": "-- STEP 3 — close promises that a later outbound contact fulfilled.\nUPDATE follow_ups f\nSET fulfilled_in = nxt.interaction_id,\n    fulfilled_at = nxt.started_at,\n    hours_to_fulfil = round(extract(epoch from (nxt.started_at - f.promised_at))/3600.0, 2),\n    status = CASE\n      WHEN nxt.started_at <= coalesce(f.due_at, f.promised_at + interval '24 hours')\n        THEN 'fulfilled' ELSE 'late' END,\n    updated_at = now()\nFROM LATERAL (\n  SELECT i.interaction_id, i.started_at\n  FROM interactions i\n  WHERE i.customer_id = f.customer_id\n    AND i.started_at > f.promised_at\n    AND i.agent_id = f.agent_id\n  ORDER BY i.started_at\n  LIMIT 1\n) nxt\nWHERE f.status = 'open';\n\n-- Anything still open past its deadline is a missed promise, not a pending one.\nUPDATE follow_ups\nSET status = 'missed', updated_at = now()\nWHERE status = 'open'\n  AND coalesce(due_at, promised_at + interval '48 hours') < now()\n-- RETURNING added (017). Without it a Postgres mutation hands n8n a single\n-- {success:true} however many rows it touched, so the next node cannot tell\n-- 'wrote 40 promises' from 'wrote none' -- and check_workflow_json rejects\n-- the shape outright. Nothing downstream reads these rows; they exist so a\n-- run leaves a countable trace.\nRETURNING follow_up_id, status, fulfilled_at;",
         "options": {}
       },
       "id": "close-promises",
@@ -80,8 +81,8 @@
       ],
       "credentials": {
         "postgres": {
-          "id": "railway-pg",
-          "name": "Railway Postgres"
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
         }
       }
     },
@@ -101,8 +102,8 @@
       ],
       "credentials": {
         "postgres": {
-          "id": "railway-pg",
-          "name": "Railway Postgres"
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
         }
       },
       "notes": "Truncate and rebuild. customer_metrics is fully derived, so it can always be dropped and recomputed — which is what stops a wrong dashboard number from becoming permanent."
@@ -125,8 +126,8 @@
       ],
       "credentials": {
         "postgres": {
-          "id": "railway-pg",
-          "name": "Railway Postgres"
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
         }
       }
     }

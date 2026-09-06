@@ -12,8 +12,12 @@ making decisions, not after.
 
 ## Status in one line
 
-**Chats work end to end and are live.** Calls are built but never run — no Google
-Drive credentials.
+**Chats store live; scoring and calls are wired but not yet switched on.**
+Google Drive IS connected — `/calls/list` returns 611 recordings on every run,
+so the old "no Drive credentials" note is retired. What is not running: 01d
+(chat scoring) and 03 (identity) are deactivated, and 02 discovers calls but has
+transcribed none, because every `call_ingest_jobs` row sits in a terminal state
+left over from the August ASR failures.
 
 **Bitrix is now sending real data** to `/webhook/travelgate/chat-message`, which
 is served by workflow **01c, n8n id `H7r5YWGJ3nNVA99Z`**, deployed from this repo
@@ -89,8 +93,15 @@ numbers that look fine and are wrong.
 ## Commands
 
 ```bash
-# tests — no credentials needed (37 pass; 4 skip without fixtures)
+# tests — no credentials needed (548 pass)
 cd services/worker && pytest tests/ -q
+
+# the compile step n8n does not have: run it on every workflow you touch
+python scripts/check_workflow_json.py n8n/workflows/*.json
+
+# what Railway is actually charging, per service
+export RAILWAY_TOKEN=...   # account or project token; both headers are tried
+python scripts/railway_usage.py
 
 # what is configured, live
 curl -H "X-API-Key: $WORKER_API_KEY" https://railway-production-d648.up.railway.app/ready
@@ -129,7 +140,7 @@ python scripts/simulate_conversation.py <id> --webhook  # POST at live n8n
 ## Layout
 
 ```
-db/migrations/         001-007, already applied to Railway
+db/migrations/         001-016 applied to Railway; 017 written, NOT yet applied
 services/worker/app/
   serve.py             entrypoint — see gotcha 1 and 2 below
   main.py              FastAPI
@@ -140,8 +151,11 @@ services/worker/app/
   evaluate/judge.py         the two DeepSeek passes
   evaluate/scoring.py       weights, null handling, evidence validation
   prompts/                  THE RUBRIC — treat as source code, version it
-n8n/workflows/         01 chats (live), 01c store-only chat API,
-                       02 calls (untested), 03 nightly
+n8n/workflows/         01 chats (live), 01c store-only chat API (live),
+                       01d chat scoring (off), 02-calls-v2-state-machine
+                       (the colleague's, discovery live), 03 nightly (off),
+                       04 nightly housekeeping (new)
+modal/transcribe_job.py  the nightly ASR batch — replaces ASR in the worker
 scripts/               railway_api, railway_configure, n8n_setup, n8n_smoke_test
 docs/HANDOFF.md        full context
 docs/bitrix-integration-spec.md   forward to the client's IT team
@@ -224,6 +238,23 @@ Fixed by moving the acknowledgement into the webhook node itself —
 `responseMode: onReceived` — which cannot be reordered by dragging a box.
 **For any fire-and-forget ingest webhook, use `onReceived`, not a responder
 node.** Workflow 01b already did.
+
+**13 · Two systems must never claim the same job.** Transcription moved out of
+the worker into a Modal batch (017). Modal owns `call_ingest_jobs` rows in
+`discovered`/`asr_failed` and leaves them `transcribed`; workflow 02 claims them
+back only from `transcribed`/`judge_failed`. That boundary lives in exactly two
+places — the `WHERE` in 02's `Claim work` and the `WHERE` in `CLAIM_SQL` in
+`modal/transcribe_job.py`. Widen either one and the same call is transcribed
+twice and paid for twice, which is the bug the lease was added to stop in the
+first place. Modal also writes `external_source = 'asterisk_drive'`, the same
+namespace 02 uses; a different one would turn one call into two half-filled
+rows.
+
+**14 · The judging window is a discount, not a preference.** DeepSeek peak is
+01:00–04:00 and 06:00–10:00 UTC Mon–Fri, where every rate doubles. n8n runs on
+Asia/Riyadh, so the crons sit at 23:00–03:59 local and must END before 04:00.
+Moving a schedule an hour later doubles the model bill for identical work;
+`tests/test_workflow_017_changes.py` fails if any cron drifts into the window.
 
 ---
 

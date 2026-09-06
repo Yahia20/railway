@@ -1,0 +1,362 @@
+{
+  "name": "04 - Nightly housekeeping - Bitrix, retention, health",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "20 3 * * *"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -200,
+        300
+      ],
+      "id": "housekeeping-trigger",
+      "name": "Housekeeping - 03:20 daily",
+      "notes": "After the judging window closes (04:00 local) and before the working day, so a report opened at 08:00 already carries last night's numbers."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $env.BITRIX_PORTAL_DOMAIN }}/rest/{{ $env.BITRIX_WEBHOOK_USER_ID || 1 }}/{{ $env.BITRIX_WEBHOOK_TOKEN }}/crm.deal.list.json",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ select: ['ID','TITLE','STAGE_ID','STAGE_SEMANTIC_ID','CATEGORY_ID','OPPORTUNITY','CURRENCY_ID','CONTACT_ID','ASSIGNED_BY_ID','SOURCE_ID','DATE_CREATE','DATE_MODIFY','BEGINDATE','CLOSEDATE'], filter: { '>DATE_MODIFY': new Date(Date.now() - 7*24*3600*1000).toISOString().slice(0,10) }, start: 0 }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        20,
+        300
+      ],
+      "id": "fetch-bitrix-deals",
+      "name": "Fetch Bitrix deals",
+      "onError": "continueRegularOutput",
+      "notes": "DEAL_FIELD_ALLOWLIST, verbatim from sources/bitrix_chats.py. Only deals modified in the last 7 days: the CRM holds 2,496 and re-reading all of them nightly buys nothing.\n\nUNVERIFIED AGAINST THE PORTAL. bitrix_chats.py says so in writing for the imopenlines methods; crm.deal.list is the best documented of the set but has still never been called against cultiv.bitrix24.com. Run the probe before trusting a run."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Bitrix deals, pulled instead of exported by hand.\n--\n-- WHAT THIS REPLACES. A human exported DEAL_*.csv from the CRM, copied it to a\n-- laptop, opened a Railway tunnel and ran import_bitrix_phones.py. That is a\n-- snapshot with a date on it: re-running it a month later knows nothing about\n-- anything that happened since, and between exports every new conversation is\n-- an island with no customer to belong to.\n--\n-- ONLY THE ALLOWLISTED FIELDS. The deal object carries UF_CRM_1781281581, which\n-- contains prose addressed to a bot, and a dozen fields holding another\n-- system's AI verdicts on lead temperature and intent -- the exact judgements\n-- this project exists to produce from the conversation itself, with evidence.\n-- Importing somebody else's unverifiable version of them puts two disagreeing\n-- answers in one database with nothing to say which is which.\nINSERT INTO deals (\n  bitrix_deal_id, title, category_id, stage_id, stage_semantic, is_closed,\n  amount, currency, created_at_src, modified_at_src, begin_date, close_date,\n  origin)\nSELECT d->>'ID', d->>'TITLE', d->>'CATEGORY_ID', d->>'STAGE_ID',\n       left(coalesce(d->>'STAGE_SEMANTIC_ID', ''), 1),\n       (d->>'CLOSED') = 'Y',\n       nullif(d->>'OPPORTUNITY', '')::numeric,\n       nullif(d->>'CURRENCY_ID', ''),\n       nullif(d->>'DATE_CREATE', '')::timestamptz,\n       nullif(d->>'DATE_MODIFY', '')::timestamptz,\n       nullif(d->>'BEGINDATE', '')::date,\n       nullif(d->>'CLOSEDATE', '')::date,\n       'bitrix_rest'\nFROM jsonb_array_elements($1::jsonb) AS d\nWHERE d->>'ID' IS NOT NULL\nON CONFLICT (bitrix_deal_id) DO UPDATE SET\n  title           = EXCLUDED.title,\n  stage_id        = EXCLUDED.stage_id,\n  stage_semantic  = EXCLUDED.stage_semantic,\n  is_closed       = EXCLUDED.is_closed,\n  -- NEVER overwrite an amount a human typed. is_manual_amount marks those, and\n  -- the CRM's own number losing to it is the whole point of that flag.\n  amount          = CASE WHEN deals.is_manual_amount THEN deals.amount\n                         ELSE EXCLUDED.amount END,\n  currency        = EXCLUDED.currency,\n  modified_at_src = EXCLUDED.modified_at_src,\n  close_date      = EXCLUDED.close_date,\n  updated_at      = now()\nRETURNING deal_id, bitrix_deal_id, stage_id;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.result || []) ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        240,
+        300
+      ],
+      "id": "upsert-deals",
+      "name": "Upsert deals",
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Link conversations to the deals that now exist, and nothing else.\n--\n-- 01c deliberately does not create a stub deal, so a thread that arrived before\n-- its deal was pulled carries external_deal_id and a NULL FK. This closes that\n-- gap once the deal is really there.\n--\n-- NEVER OVERWRITES: only rows where deal_id IS NULL are touched.\nUPDATE interactions i\n   SET deal_id = d.deal_id, updated_at = now()\n  FROM deals d\n WHERE d.bitrix_deal_id = i.external_deal_id\n   AND i.deal_id IS NULL\nRETURNING i.interaction_id, d.bitrix_deal_id;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        460,
+        300
+      ],
+      "id": "link-conversations-to-deals",
+      "name": "Link conversations to deals",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Retention. Raw customer words older than the window are deleted; every\n-- conclusion drawn from them, and the id needed to fetch them again from\n-- Bitrix or Drive, is kept forever.\n--\n-- CHAT AND CALL WINDOWS DIFFER ON PURPOSE. Bitrix still holds the chat text,\n-- so 90 days is recoverable. A call recording is not reliably recoverable: if\n-- Drive's own retention deletes the WAV after we deleted our transcript, that\n-- conversation is gone from the world. Call text therefore keeps a year, which\n-- costs 0.14 GB.\n--\n-- The rule lives in purge_raw_content (017), not here, so a backfill and this\n-- node can never disagree about what \"old\" means.\nSELECT * FROM purge_raw_content(90, 365, false);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        680,
+        300
+      ],
+      "id": "purge-raw-content",
+      "name": "Purge raw content",
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Did anything actually get judged today, and what has it cost?\n--\n-- WHY THIS EXISTS. Chat threads were stored for six days without a single one\n-- being evaluated and nobody noticed -- 01d was simply switched off. Storage\n-- succeeding while scoring silently does nothing is the failure this pipeline\n-- is most prone to, because every dashboard keeps rendering the older numbers\n-- and looks healthy.\n--\n-- A row with detail->>'alert' = true is the signal. It is deliberately a ROW\n-- and not an exception: a workflow that throws stops, and a nightly job that\n-- stops is one more thing that fails quietly.\nWITH last24 AS (\n  SELECT\n    (SELECT count(*) FROM agent_evaluations WHERE created_at > now() - interval '24 hours') AS evaluations,\n    (SELECT count(*) FROM chat_messages     WHERE created_at > now() - interval '24 hours') AS messages_in,\n    (SELECT count(*) FROM transcripts       WHERE transcribed_at > now() - interval '24 hours') AS transcripts_in,\n    (SELECT count(*) FROM chat_eval_jobs    WHERE status IN ('pending','judge_failed')) AS queue,\n    (SELECT coalesce(sum(cost_usd), 0) FROM model_calls WHERE created_at > now() - interval '24 hours') AS spend_24h,\n    (SELECT coalesce(sum(cost_usd), 0) FROM model_calls WHERE created_at > date_trunc('month', now())) AS spend_month\n)\nINSERT INTO job_runs (job_name, started_at, finished_at, status, items_in, items_ok, cost_usd, detail)\nSELECT 'nightly_health', now(), now(),\n       CASE WHEN evaluations = 0 AND messages_in > 0 THEN 'failed' ELSE 'succeeded' END,\n       messages_in, evaluations, spend_month,\n       jsonb_build_object(\n         'evaluations_24h', evaluations,\n         'messages_24h',    messages_in,\n         'transcripts_24h', transcripts_in,\n         'queue_depth',     queue,\n         'spend_24h_usd',   spend_24h,\n         'spend_month_usd', spend_month,\n         -- The budget guard. Crossing it does not stop anything by itself; it\n         -- puts a visible row in job_runs, which is what a human acts on.\n         'over_budget',     spend_month > 40,\n         'alert',           (evaluations = 0 AND messages_in > 0) OR spend_month > 40)\nFROM last24\nRETURNING run_id, job_name, status, detail;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        900,
+        300
+      ],
+      "id": "nightly-health-check",
+      "name": "Nightly health check",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Which contacts do we still have no phone for?\n--\n-- Bounded on purpose. crm.contact.list takes a filter, not the whole address\n-- book, and 500 ids is already more than a night's worth of new conversations.\n-- Anything left over is picked up tomorrow.\nSELECT jsonb_agg(DISTINCT external_contact_id) AS contact_ids,\n       count(DISTINCT external_contact_id)     AS n\nFROM (\n  SELECT external_contact_id\n  FROM interactions\n  WHERE external_contact_id IS NOT NULL\n    AND customer_phone_e164 IS NULL\n  LIMIT 500\n) s;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        460,
+        480
+      ],
+      "id": "contacts-missing-a-phone",
+      "name": "Contacts missing a phone",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $env.BITRIX_PORTAL_DOMAIN }}/rest/{{ $env.BITRIX_WEBHOOK_USER_ID || 1 }}/{{ $env.BITRIX_WEBHOOK_TOKEN }}/crm.contact.list.json",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ select: ['ID','PHONE'], filter: { ID: $json.contact_ids || [] } }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        680,
+        480
+      ],
+      "id": "fetch-bitrix-contacts",
+      "name": "Fetch Bitrix contacts",
+      "onError": "continueRegularOutput",
+      "notes": "ID and PHONE only. A contact record also carries name, email and assorted UF_ fields; none of them is needed to link a conversation to a person, and every one of them would be personal data stored for no stated purpose."
+    },
+    {
+      "parameters": {
+        "jsCode": "// One pass, two arrays, same order — the SQL join downstream is by position,\n// so building them separately would silently pair the wrong phone with the\n// wrong person.\n//\n// Bitrix returns PHONE as a list of typed values ([{VALUE, VALUE_TYPE}]); the\n// first is the one the CRM shows. A contact with no phone contributes nothing\n// rather than an empty pair, which would shift every later index by one.\nconst contacts = $input.first().json.result || [];\nconst pairs = [];\nfor (const c of contacts) {\n  const raw = (c.PHONE || []).map(p => p && p.VALUE).find(v => v && String(v).trim());\n  if (!raw) continue;\n  pairs.push({ contact_id: String(c.ID), raw: String(raw) });\n}\nreturn [{ json: { pairs, values: pairs.map(p => p.raw), count: pairs.length } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        480
+      ],
+      "id": "pair-contact-to-phone",
+      "name": "Pair contact to phone"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORKER_URL }}/phones/normalize",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ values: $json.values }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        480
+      ],
+      "id": "normalise-phones",
+      "name": "Normalise phones",
+      "notes": "DEFAULT_PHONE_REGION=SA is a DECISION, not a format: 0500000000 is a valid Saudi mobile and meaningless in Egypt. A bare Egyptian number fails here rather than being assigned +966 — a null phone is recoverable, a wrong-country match merges two real people. The rule lives in the worker; this asks it instead of keeping a second copy in SQL."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Write the normalised phone onto every conversation of that contact.\n--\n-- ZIPPED BY POSITION. The worker returns one result per value, in the order it\n-- received them, so ordinality is the join key. That is only safe because the\n-- pairing node builds both arrays in one pass -- if either list is ever built\n-- separately, this join silently pairs the wrong phone with the wrong person.\n--\n-- NEVER OVERWRITES. Only rows where customer_phone_e164 IS NULL are touched: a\n-- phone already there came from the source that owns the conversation, and a\n-- nightly CRM sweep does not get to overrule it.\n--\n-- NULLS ARE SKIPPED, NOT WRITTEN. A number that failed to normalise (a bare\n-- Egyptian mobile, say) leaves the row untouched and eligible tomorrow, rather\n-- than being stamped with a wrong-country guess that would merge two people.\nWITH pairs AS (\n  SELECT ordinality AS o, value->>'contact_id' AS cid\n  FROM jsonb_array_elements($1::jsonb) WITH ORDINALITY AS t(value, ordinality)\n), norm AS (\n  SELECT ordinality AS o, value->>'e164' AS e164\n  FROM jsonb_array_elements($2::jsonb) WITH ORDINALITY AS t(value, ordinality)\n)\nUPDATE interactions i\n   SET customer_phone_e164 = n.e164,\n       updated_at = now()\n  FROM pairs p\n  JOIN norm n ON n.o = p.o\n WHERE i.external_contact_id = p.cid\n   AND i.customer_phone_e164 IS NULL\n   AND n.e164 IS NOT NULL\nRETURNING i.interaction_id, i.external_contact_id, i.customer_phone_e164;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('Pair contact to phone').item.json.pairs), JSON.stringify($json.results || []) ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1340,
+        480
+      ],
+      "id": "backfill-customer-phones",
+      "name": "Backfill customer phones",
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Housekeeping - 03:20 daily": {
+      "main": [
+        [
+          {
+            "node": "Fetch Bitrix deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Bitrix deals": {
+      "main": [
+        [
+          {
+            "node": "Upsert deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert deals": {
+      "main": [
+        [
+          {
+            "node": "Link conversations to deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Link conversations to deals": {
+      "main": [
+        [
+          {
+            "node": "Contacts missing a phone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Purge raw content": {
+      "main": [
+        [
+          {
+            "node": "Nightly health check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contacts missing a phone": {
+      "main": [
+        [
+          {
+            "node": "Fetch Bitrix contacts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Bitrix contacts": {
+      "main": [
+        [
+          {
+            "node": "Pair contact to phone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pair contact to phone": {
+      "main": [
+        [
+          {
+            "node": "Normalise phones",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise phones": {
+      "main": [
+        [
+          {
+            "node": "Backfill customer phones",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backfill customer phones": {
+      "main": [
+        [
+          {
+            "node": "Purge raw content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Riyadh"
+  }
+}

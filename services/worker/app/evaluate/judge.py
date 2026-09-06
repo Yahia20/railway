@@ -15,6 +15,7 @@ import threading
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -24,7 +25,7 @@ from . import scoring
 
 PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
-PASS1_VERSION = "pass1-customer-v5"
+PASS1_VERSION = "pass1-customer-v6"
 PASS2_VERSION = "pass2-agent-quality-v6"
 
 # Version and file are kept together on purpose: bumping one and not the other
@@ -42,7 +43,7 @@ PASS2_VERSION = "pass2-agent-quality-v6"
 # Step 0's MANDATORY CONSISTENCY block. v5 is frozen as the audited candidate
 # it was — it is the text every score stamped `pass2-agent-quality-v5` came
 # from, and the round-3 audit is a record of what it does.
-PASS1_PROMPT_FILE = "pass1_customer_v5.md"
+PASS1_PROMPT_FILE = "pass1_customer_v6.md"
 PASS2_PROMPT_FILE = "pass2_agent_quality_v6.md"
 
 # The explicit model id, not the `deepseek-chat` alias.
@@ -147,6 +148,11 @@ class Pass1Result:
     usage: dict[str, Any] = field(default_factory=dict)
     input_hash: str = ""
     validation: dict[str, Any] = field(default_factory=dict)
+    # One row per distinct thing the customer asked for, evidence already
+    # checked (017). Empty on a pre-v6 prompt, which carries only one request
+    # in the top-level columns — so an empty list means "schema too old to
+    # know", never "the customer wanted nothing".
+    requests: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _load(name: str) -> str:
@@ -438,6 +444,244 @@ def validate_pass1(payload: dict, conversation: str) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# What a call cost — measured, not estimated
+# ---------------------------------------------------------------------------
+#
+# `model_calls` has existed since 006 with columns for prompt_tokens,
+# output_tokens and cost_usd, and nothing has ever written to it. Every cost
+# figure this project has produced was therefore arithmetic over a sample,
+# and nobody could answer "what did last month actually cost" from the data.
+#
+# The worker holds no database connection by design — n8n owns every write —
+# so this builds the row and the caller inserts it.
+#
+# Prices per million tokens, api-docs.deepseek.com/quick_start/pricing, read
+# 2026-09-02. Off-peak is exactly half, and the discount is the reason the
+# judging batch runs at night: see PEAK_HOURS_UTC.
+DEEPSEEK_PRICING = {
+    "deepseek-v4-flash":            {"hit": 0.014, "miss": 0.44, "out": 1.32},
+    "deepseek-v4-flash-vision-exp": {"hit": 0.014, "miss": 0.44, "out": 1.32},
+    "deepseek-v4-pro":              {"hit": 0.044, "miss": 1.32, "out": 3.96},
+}
+
+# Peak is 01:00-04:00 and 06:00-10:00 UTC, Monday through Friday. Everything
+# else is half price. In Riyadh (UTC+3) that is 04:00-07:00 and 09:00-13:00,
+# which is why the nightly chain is scheduled 23:00-04:00 local.
+PEAK_HOURS_UTC = frozenset(range(1, 4)) | frozenset(range(6, 10))
+
+
+def is_peak(when: datetime | None = None) -> bool:
+    when = when or datetime.now(timezone.utc)
+    return when.weekday() < 5 and when.hour in PEAK_HOURS_UTC
+
+
+def estimate_cost_usd(usage: dict, model: str, when: datetime | None = None) -> float | None:
+    """Dollars for one completion, from the token counts the API reported.
+
+    Returns None for a model with no published price rather than guessing —
+    a wrong number in `cost_usd` is worse than a null, because a null shows up
+    in a sum as a missing row and a wrong number does not show up at all.
+
+    DeepSeek reports the cache split directly (`prompt_cache_hit_tokens` /
+    `prompt_cache_miss_tokens`). It matters: the static prompt is ~15k tokens
+    and a hit is priced 31x lower than a miss, so pricing the whole prompt at
+    the miss rate overstates a chat evaluation by roughly 5x.
+    """
+    price = DEEPSEEK_PRICING.get((model or "").strip())
+    if not price:
+        return None
+    prompt = int(usage.get("prompt_tokens") or 0)
+    hit = usage.get("prompt_cache_hit_tokens")
+    miss = usage.get("prompt_cache_miss_tokens")
+    if hit is None and miss is None:
+        details = usage.get("prompt_tokens_details") or {}
+        hit = details.get("cached_tokens")
+    hit = int(hit or 0)
+    # Trust the reported total over the split: if only one side is reported,
+    # the other is whatever is left, and it can never go negative.
+    miss = int(miss) if miss is not None else max(0, prompt - hit)
+    out = int(usage.get("completion_tokens") or 0)
+
+    factor = 1.0 if is_peak(when) else 0.5
+    dollars = (hit * price["hit"] + miss * price["miss"] + out * price["out"]) / 1e6
+    return round(dollars * factor, 6)
+
+
+def cost_row(purpose: str, *, model: str, prompt_version: str, input_hash: str,
+             usage: dict, latency_ms: int | None = None,
+             succeeded: bool = True, error: str | None = None) -> dict:
+    """One `model_calls` row, ready for the INSERT n8n runs.
+
+    `input_hash` is already the hash of the exact text sent, and the table's
+    UNIQUE (purpose, input_hash, prompt_version) turns a re-run of the same
+    input into a no-op instead of a second charge.
+    """
+    return {
+        "purpose": purpose,
+        "provider": "deepseek",
+        "model": model,
+        "prompt_version": prompt_version,
+        "input_hash": input_hash,
+        "prompt_tokens": int(usage.get("prompt_tokens") or 0) or None,
+        "output_tokens": int(usage.get("completion_tokens") or 0) or None,
+        "cached_tokens": int(usage.get("prompt_cache_hit_tokens") or 0) or None,
+        "cost_usd": estimate_cost_usd(usage, model),
+        "priced_at_peak": is_peak(),
+        "latency_ms": latency_ms,
+        "succeeded": succeeded,
+        "error": error,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Multiple requests in one conversation (017)
+# ---------------------------------------------------------------------------
+
+# The columns `interaction_requests` holds, and the only keys copied out of the
+# model's `requests[]`. Anything else the model invents is dropped here rather
+# than in SQL, so a prompt that starts emitting a new field cannot widen the
+# write without somebody editing this list.
+_REQUEST_KEYS = (
+    "service", "service_raw", "intent", "buying_stage", "destination",
+    "date_start", "date_end", "nights", "travelers_total",
+    "budget_amount", "budget_currency",
+)
+
+# Enum-typed columns refuse an unknown label with a 22P02 that aborts the whole
+# transaction — including the pass-1 row that was fine. Anything not in the
+# enum becomes NULL, and the model's own word survives in `service_raw`.
+_SERVICE_VALUES = frozenset({
+    "package", "flight", "hotel", "cruise", "visa", "transfer",
+    "insurance", "other", "unknown",
+})
+_STAGE_VALUES = frozenset({
+    "awareness", "consideration", "decision", "purchased", "lost", "unknown",
+})
+
+
+def _as_date(value: Any) -> str | None:
+    """An ISO date string, or None. Never raises, never guesses a year.
+
+    The model is asked for `YYYY-MM-DD` and mostly complies; "next August",
+    "١٥/١١" and "" are the failure modes, and all three become None rather than
+    a date somebody would later plan a trip around.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.strptime(value.strip()[:10], "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return None
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(str(value).strip()) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_number(value: Any) -> float | None:
+    """A budget, or None. Strips currency words and separators the model leaves
+    in — "17,200 ريال" is a number a human wrote, and dropping it to NULL loses
+    the one field the commercial half of this project exists to collect."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    digits = re.sub(r"[^\d.]", "", str(value).replace(",", ""))
+    try:
+        return float(digits) if digits not in ("", ".") else None
+    except ValueError:
+        return None
+
+
+def normalize_requests(payload: dict, conversation: str) -> list[dict[str, Any]]:
+    """`requests[]` as rows, each with its evidence checked against the text.
+
+    WHY THE QUOTE CHECK IS NOT OPTIONAL. A request row with no grounding is an
+    opportunity somebody will chase: `v_request_reconciliation` reads an
+    unmatched request as "the agent never opened a deal for this", which sends
+    a human after a customer. A model that invents a fourth request therefore
+    invents work, and `evidence_valid=False` is what keeps it out of the count.
+
+    `evidence_valid` is None when the model supplied no quote at all — absent is
+    not the same as fabricated, and the view treats only False as disqualifying.
+
+    A conversation with no `requests[]` key returns []. That is the pre-v6
+    schema, and the caller falls back to the single-request columns.
+    """
+    raw = payload.get("requests")
+    if not isinstance(raw, list):
+        return []
+
+    haystacks, folded = scoring.conversation_spans(conversation)
+    rows: list[dict[str, Any]] = []
+    for i, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            continue
+        row: dict[str, Any] = {k: item.get(k) for k in _REQUEST_KEYS}
+
+        # Coerced HERE, not in SQL. A date column handed "next August" raises
+        # 22007 and Postgres aborts the WHOLE statement — so one unparseable
+        # date would lose every request in the conversation, including the four
+        # that were fine. Same for the numerics.
+        row["date_start"] = _as_date(row.get("date_start"))
+        row["date_end"] = _as_date(row.get("date_end"))
+        for key in ("nights", "travelers_total"):
+            row[key] = _as_int(row.get(key))
+        row["budget_amount"] = _as_number(row.get("budget_amount"))
+        cur = row.get("budget_currency")
+        row["budget_currency"] = (
+            cur.strip().upper()[:3] if isinstance(cur, str) and cur.strip() else None)
+
+        if row.get("service") not in _SERVICE_VALUES:
+            # Keep the model's word rather than lose it to the enum.
+            row["service_raw"] = row.get("service_raw") or row.get("service")
+            row["service"] = None
+        if row.get("buying_stage") not in _STAGE_VALUES:
+            row["buying_stage"] = None
+
+        quotes = [q.get("quote") if isinstance(q, dict) else q
+                  for q in (item.get("evidence") or [])]
+        quotes = [q for q in quotes if isinstance(q, str) and q.strip()]
+        row["evidence"] = quotes
+        row["evidence_valid"] = (
+            all(scoring.quote_problem(q, haystacks, folded) is None for q in quotes)
+            if quotes else None
+        )
+
+        # Same fixed mapping the database applies to the conversation as a
+        # whole, fed this request's own two observations. The model is never
+        # asked for the outcome — see deal_outcome_from_analysis in 015.
+        row["outcome"] = _request_outcome(item, payload)
+        row["seq"] = i
+        rows.append(row)
+    return rows
+
+
+def _request_outcome(item: dict, payload: dict) -> str | None:
+    """won / lost / in_progress / no_opportunity / unknown, by fixed rule.
+
+    Mirrors `deal_outcome_from_analysis` (015) so one request and one whole
+    conversation can never disagree about what the same two observations mean.
+    A request inside a thread the model judged not a real inquiry is not an
+    opportunity, whatever stage it claims.
+    """
+    real = payload.get("real_ask")
+    if isinstance(real, dict) and real.get("is_real_inquiry") is False:
+        return "no_opportunity"
+    stage = item.get("buying_stage")
+    if stage == "purchased":
+        return "won"
+    if stage == "lost":
+        return "lost"
+    if stage in ("awareness", "consideration", "decision"):
+        return "in_progress"
+    return "unknown"
+
+
 def run_pass1(conversation: str, client: DeepSeekClient | None = None) -> Pass1Result:
     """Extract the customer's request. Never mentions the agent's performance."""
     client = client or DeepSeekClient()
@@ -445,6 +689,7 @@ def run_pass1(conversation: str, client: DeepSeekClient | None = None) -> Pass1R
     payload, usage = client.complete_json(prompt)
     validation = validate_pass1(payload, conversation)
     payload["pass1_validation"] = validation
+    requests = normalize_requests(payload, conversation)
     return Pass1Result(
         payload=payload,
         prompt_version=PASS1_VERSION,
@@ -452,6 +697,7 @@ def run_pass1(conversation: str, client: DeepSeekClient | None = None) -> Pass1R
         usage=usage,
         input_hash=_hash_input(PASS1_VERSION, conversation),
         validation=validation,
+        requests=requests,
     )
 
 

@@ -291,6 +291,46 @@ def prepare_chat(req: PrepareChatRequest) -> dict:
     }
 
 
+class NormalizePhonesRequest(BaseModel):
+    values: list[str | None] = Field(
+        description="Raw phone strings, in any shape the CRM stores them")
+    default_region: str | None = Field(
+        default=None,
+        description="Overrides DEFAULT_PHONE_REGION. Almost never set it — the "
+                    "region is a decision, not a per-call preference.")
+
+
+@app.post("/phones/normalize", dependencies=[Depends(require_api_key)])
+def normalize_phones(req: NormalizePhonesRequest) -> dict:
+    """Raw CRM phone strings to E.164, in bulk.
+
+    WHY THIS IS AN ENDPOINT AND NOT SQL. The nightly Bitrix pull needs to turn
+    contact phones into the E.164 key that identity resolution matches on, and
+    n8n can only do that in SQL. A second copy of the rule in SQL is a second
+    copy to keep in step — and this particular rule is not a formatting
+    convention, it is a decision with a failure mode:
+
+    `0500000000` is a valid Saudi mobile and means nothing in Egypt, so
+    DEFAULT_PHONE_REGION=SA is applied to bare national numbers. A bare
+    Egyptian number FAILS TO NORMALISE rather than being assigned +966 — a null
+    phone is recoverable, a wrong-country match merges two real people.
+
+    Errors are returned per value, never raised: one unparseable number in a
+    batch of five hundred must not lose the other four hundred and ninety-nine.
+    """
+    region = req.default_region or settings.default_phone_region
+    out = []
+    for raw in req.values:
+        e164, error = try_normalize(raw, region)
+        out.append({"raw": raw, "e164": e164, "error": error})
+    return {
+        "region": region,
+        "results": out,
+        "normalised": sum(1 for r in out if r["e164"]),
+        "failed": sum(1 for r in out if r["e164"] is None and r["raw"]),
+    }
+
+
 @app.post("/calls/parse-name", dependencies=[Depends(require_api_key)])
 def parse_call_name(filename: str) -> dict:
     try:
@@ -570,7 +610,16 @@ def evaluate(req: EvaluateRequest) -> dict:
             # and should not have to reach through a jsonb blob to find out
             # whether the quote behind a follow-up task was ever real.
             "pass1_validation": p1.validation,
+            # One row per distinct thing the customer asked for, evidence
+            # already checked (017). Lifted out for the same reason: n8n writes
+            # these straight into interaction_requests and must not have to
+            # parse the payload to do it. Empty on a pre-v6 prompt.
+            "requests": p1.requests,
         }
+        out.setdefault("model_calls", []).append(judge.cost_row(
+            "pass1_customer", model=p1.model, prompt_version=p1.prompt_version,
+            input_hash=p1.input_hash, usage=p1.usage,
+        ))
 
     if req.run_pass2:
         # A response that still breaks the rubric after the re-ask is a bad
@@ -614,6 +663,15 @@ def evaluate(req: EvaluateRequest) -> dict:
             # NOT a usable score and must never be stored as one.
             "pre_enforcement_score": p2.pre_enforcement_score,
         }
+        # Recorded whatever the contract status: a response that broke the
+        # rubric still burned tokens, and a cost table that only counts the
+        # successes understates the bill by exactly the retries.
+        out.setdefault("model_calls", []).append(judge.cost_row(
+            "pass2_agent", model=p2.model, prompt_version=p2.prompt_version,
+            input_hash=p2.input_hash, usage=p2.usage,
+            succeeded=p2.contract_status == "ok",
+            error=None if p2.contract_status == "ok" else p2.contract_status,
+        ))
 
     return out
 

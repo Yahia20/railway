@@ -189,7 +189,10 @@ def test_run_pass1_attaches_the_verdict_without_touching_the_answer():
     # The model's own claim is preserved exactly as returned.
     assert result.payload["real_ask"]["is_real_inquiry"] is True
     assert result.payload["real_ask"]["evidence"][0]["quote"] == "كلام لم يقله أحد"
-    assert result.prompt_version == "pass1-customer-v5"
+    # Pinned to a literal on purpose: an accidental prompt bump changes every
+    # score and must fail here rather than be discovered from the numbers.
+    # Moved v5 → v6 deliberately in 017, for `requests[]`.
+    assert result.prompt_version == "pass1-customer-v6"
 
 
 def test_the_evaluate_endpoint_exposes_the_flags(monkeypatch):

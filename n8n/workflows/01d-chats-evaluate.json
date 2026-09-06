@@ -3,7 +3,7 @@
   "nodes": [
     {
       "id": "every-30-min",
-      "name": "Every 30 min",
+      "name": "Every 10 min, 23:00-04:00",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [
@@ -15,12 +15,12 @@
           "interval": [
             {
               "field": "cronExpression",
-              "expression": "*/30 * * * *"
+              "expression": "*/10 23,0-3 * * *"
             }
           ]
         }
       },
-      "notes": "The idle window is 2 days; the tick only decides how soon after that a thread is picked up."
+      "notes": "n8n's GENERIC_TIMEZONE is Asia/Riyadh, so this is 23:00-03:59 LOCAL = 20:00-00:59 UTC. DeepSeek's peak is 01:00-04:00 and 06:00-10:00 UTC Mon-Fri, where every rate doubles; this window is entirely outside both, which halves the judge bill for the same work. It must also FINISH before 04:00 local (01:00 UTC), which is why the window ends at 03:59 rather than running to dawn."
     },
     {
       "id": "register-due",
@@ -33,7 +33,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Register every thread the idle rule says is finished.\n--\n-- THE RULE IS NOT HERE. `v_chat_eval_due` (015) owns \"silent for 2 days, has\n-- both sides, at least 2 messages\". A copy of that predicate in this node\n-- would be a second definition to keep in step with the backfill's.\n--\n-- ALREADY-ANALYSED THREADS ARE REGISTERED AS 'evaluated', not skipped. A\n-- thread scored through workflow 01 has no job row; inserting it as done\n-- records that, and means the ON CONFLICT below can still reopen it if it\n-- grows. Skipping it instead would leave it invisible to this workflow\n-- forever and it would be re-judged from scratch the day it gained a message.\n--\n-- REOPENING. A thread that gains a message after being judged is judged again,\n-- against the fuller thread -- a score computed over half a conversation is\n-- worse than a late one. Only 'evaluated' and 'unscoreable' reopen:\n-- 'dead_letter' is a decision a human made and must not be undone by traffic,\n-- and 'evaluating' / 'judge_failed' / 'pending' are already in flight.\nINSERT INTO chat_eval_jobs (interaction_id, idle_through, status)\nSELECT d.interaction_id,\n       d.last_message_at,\n       CASE WHEN a.interaction_id IS NOT NULL THEN 'evaluated' ELSE 'pending' END\nFROM v_chat_eval_due d\nLEFT JOIN interaction_analysis a ON a.interaction_id = d.interaction_id\nON CONFLICT (interaction_id) DO UPDATE SET\n  status = CASE\n    WHEN EXCLUDED.idle_through > chat_eval_jobs.idle_through\n         AND chat_eval_jobs.status IN ('evaluated', 'unscoreable')\n      THEN 'pending'\n    ELSE chat_eval_jobs.status\n  END,\n  -- Attempts belong to the version of the thread they were spent on. A\n  -- reopened thread is a new piece of work and starts with a full budget.\n  judge_attempts = CASE\n    WHEN EXCLUDED.idle_through > chat_eval_jobs.idle_through\n         AND chat_eval_jobs.status IN ('evaluated', 'unscoreable')\n      THEN 0 ELSE chat_eval_jobs.judge_attempts\n  END,\n  next_attempt_at = CASE\n    WHEN EXCLUDED.idle_through > chat_eval_jobs.idle_through\n         AND chat_eval_jobs.status IN ('evaluated', 'unscoreable')\n      THEN now() ELSE chat_eval_jobs.next_attempt_at\n  END,\n  idle_through = GREATEST(chat_eval_jobs.idle_through, EXCLUDED.idle_through),\n  updated_at = now()\nRETURNING interaction_id, status;",
+        "query": "-- lease-exempt: this is REGISTRATION, before any lease exists. It writes\n-- only chat_eval_jobs' own queue columns and never touches claim_token,\n-- claim_until or a row in flight -- the ON CONFLICT clause reopens only\n-- 'evaluated' and 'unscoreable', both of which are unleased by definition.\n--\n-- Register every thread the idle rule says is finished.\n--\n-- THE RULE IS NOT HERE. `v_chat_eval_due` owns \"silent for 3 days (2 until\n-- 017), has both sides, at least 2 messages\". A copy of that predicate in this\n-- node would be a second definition to keep in step with the backfill's.\n--\n-- ALREADY-ANALYSED THREADS ARE REGISTERED AS 'evaluated', not skipped, so the\n-- ON CONFLICT below can still reopen them if they grow.\n--\n-- REOPENING, AND ITS CEILING (017). A thread that gains messages after being\n-- judged is judged again against the fuller thread -- a score computed over\n-- half a conversation is worse than a late one. That rule had no limit, and\n-- the judge bill is the only cost in this system that scales without one, so\n-- two conditions now bound it:\n--\n--   judge_runs < 2                       at most one re-judge, ever.\n--   observed >= judged * 1.5             and only if the thread grew by half.\n--\n-- Why not \"any new message\": one \"شكرا\" arriving three days later moves no\n-- module score, and re-judging for it pays full price for the same answer.\n--\n-- Only 'evaluated' and 'unscoreable' reopen: 'dead_letter' is a decision a\n-- human made and must not be undone by traffic, and 'evaluating' /\n-- 'judge_failed' / 'pending' are already in flight.\nINSERT INTO chat_eval_jobs (interaction_id, idle_through, status, observed_message_count)\nSELECT d.interaction_id,\n       d.last_message_at,\n       CASE WHEN a.interaction_id IS NOT NULL THEN 'evaluated' ELSE 'pending' END,\n       d.message_count\nFROM v_chat_eval_due d\nLEFT JOIN interaction_analysis a ON a.interaction_id = d.interaction_id\nON CONFLICT (interaction_id) DO UPDATE SET\n  status = CASE\n    WHEN EXCLUDED.idle_through > chat_eval_jobs.idle_through\n         AND chat_eval_jobs.status IN ('evaluated', 'unscoreable')\n         AND chat_eval_jobs.judge_runs < 2\n         AND EXCLUDED.observed_message_count\n             >= coalesce(chat_eval_jobs.judged_message_count, 0) * 1.5\n      THEN 'pending'\n    ELSE chat_eval_jobs.status\n  END,\n  -- Attempts belong to the version of the thread they were spent on. A\n  -- reopened thread is a new piece of work and starts with a full budget.\n  judge_attempts = CASE\n    WHEN EXCLUDED.idle_through > chat_eval_jobs.idle_through\n         AND chat_eval_jobs.status IN ('evaluated', 'unscoreable')\n         AND chat_eval_jobs.judge_runs < 2\n         AND EXCLUDED.observed_message_count\n             >= coalesce(chat_eval_jobs.judged_message_count, 0) * 1.5\n      THEN 0 ELSE chat_eval_jobs.judge_attempts\n  END,\n  next_attempt_at = CASE\n    WHEN EXCLUDED.idle_through > chat_eval_jobs.idle_through\n         AND chat_eval_jobs.status IN ('evaluated', 'unscoreable')\n         AND chat_eval_jobs.judge_runs < 2\n         AND EXCLUDED.observed_message_count\n             >= coalesce(chat_eval_jobs.judged_message_count, 0) * 1.5\n      THEN now() ELSE chat_eval_jobs.next_attempt_at\n  END,\n  idle_through = GREATEST(chat_eval_jobs.idle_through, EXCLUDED.idle_through),\n  -- Always refreshed, reopen or not: it is the yardstick the +50% test uses\n  -- next time, and a stale one would let a thread reopen on growth it already\n  -- had.\n  observed_message_count = EXCLUDED.observed_message_count,\n  updated_at = now()\nRETURNING interaction_id, status;",
         "options": {}
       },
       "credentials": {
@@ -55,7 +55,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- A worker that died mid-judge leaves a job 'evaluating' with a lease nobody\n-- will ever release. Reclaim it once the lease is provably dead.\n--\n-- ATTEMPTS WERE ALREADY SPENT at claim time, so a crash loop cannot run\n-- forever: three expiries and the job is dead-lettered and visible, rather\n-- than retried silently until the judge budget is gone.\nUPDATE chat_eval_jobs\n   SET status = CASE WHEN judge_attempts >= 3 THEN 'dead_letter' ELSE 'judge_failed' END,\n       claim_token     = NULL,\n       claim_until     = NULL,\n       claimed_at      = NULL,\n       -- Back off further each time. A judge that is down stays down for\n       -- minutes, and hammering it is how a rate limit becomes a ban.\n       next_attempt_at = now() + (interval '5 minutes' * GREATEST(judge_attempts, 1)),\n       last_error      = 'lease expired after ' || judge_attempts\n                         || ' attempt(s): worker vanished mid-judge',\n       updated_at      = now()\n WHERE status = 'evaluating'\n   AND claim_until < now()\nRETURNING interaction_id, status;",
+        "query": "-- lease-exempt: this IS the lease breaker. Matching on claim_token would\n-- defeat its only purpose, which is to reclaim rows from workers that are\n-- gone. It is safe because it only touches rows whose claim_until has\n-- already passed, and it clears the token as it goes.\n-- Give back the work of executions that died holding a lease.\n--\n-- 'transcribing' and 'evaluating' mean \"a worker holds this row right now\".\n-- If the worker crashed, was cancelled, or hung past claim_until, nothing else\n-- would ever pick the row up again: it is not 'discovered', not failed, and\n-- not terminal, so no claim predicate matches it. That is a permanent loss of\n-- exactly the kind 008 exists to prevent, and it is invisible -- the row looks\n-- busy forever.\n--\n-- Recovery puts the row back in the stage-appropriate failed state so the\n-- normal retry budget applies, and only dead-letters it once that budget is\n-- spent. The cooldown is the same 45 minutes the failure paths use: a run that\n-- died because the ASR Space was throttling must not be re-claimed instantly.\n--\n-- The attempt was already counted at claim time, so recovery does not count it\n-- again -- that is the whole point of counting at claim: a worker that dies\n-- without writing anything still spent an attempt, and a poison row cannot be\n-- claimed forever.\n--\n-- $1 = cooldown minutes, $2 = max attempts per stage.\n--\n-- A worker that died mid-judge leaves a job 'evaluating' with a lease nobody\n-- will ever release. Reclaim it once the lease is provably dead.\n--\n-- ATTEMPTS WERE ALREADY SPENT at claim time, so a crash loop cannot run\n-- forever: three expiries and the job is dead-lettered and visible, rather\n-- than retried silently until the judge budget is gone.\nUPDATE chat_eval_jobs\n   SET status = CASE WHEN judge_attempts >= 3 THEN 'dead_letter' ELSE 'judge_failed' END,\n       claim_token     = NULL,\n       claim_until     = NULL,\n       claimed_at      = NULL,\n       -- Back off further each time. A judge that is down stays down for\n       -- minutes, and hammering it is how a rate limit becomes a ban.\n       next_attempt_at = now() + (interval '5 minutes' * GREATEST(judge_attempts, 1)),\n       last_error      = 'lease expired after ' || judge_attempts\n                         || ' attempt(s): worker vanished mid-judge',\n       updated_at      = now()\n WHERE status = 'evaluating'\n   AND claim_until < now()\nRETURNING interaction_id, status;",
         "options": {}
       },
       "credentials": {
@@ -77,7 +77,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Take exactly one job, and make the taking visible to every other runner.\n--\n-- SKIP LOCKED, not a plain FOR UPDATE: two overlapping ticks must take\n-- different rows, never queue behind the same one. LIMIT 1 keeps a slow judge\n-- from holding a batch of leases it cannot finish inside them.\n--\n-- ATTEMPTS ARE INCREMENTED AT CLAIM TIME, not on failure. A worker that dies\n-- before it can record anything has still spent an attempt, and that is the\n-- only version of this counter that a crash cannot reset.\n--\n-- OLDEST IDLE FIRST: the thread that has been waiting longest is the one whose\n-- coaching is most overdue.\nWITH pick AS (\n  SELECT j.interaction_id\n  FROM chat_eval_jobs j\n  WHERE j.status IN ('pending', 'judge_failed')\n    AND j.next_attempt_at <= now()\n  ORDER BY j.idle_through\n  LIMIT 1\n  FOR UPDATE SKIP LOCKED\n)\nUPDATE chat_eval_jobs j\n   SET status         = 'evaluating',\n       claim_token    = gen_random_uuid(),\n       claimed_at     = now(),\n       -- Longer than the judge's own 300 s timeout plus both passes, so a slow\n       -- but healthy run is never reclaimed underneath itself.\n       claim_until    = now() + interval '15 minutes',\n       judge_attempts = j.judge_attempts + 1,\n       last_error     = NULL,\n       updated_at     = now()\n  FROM pick\n WHERE j.interaction_id = pick.interaction_id\nRETURNING j.interaction_id::text AS interaction_id,\n          j.claim_token::text    AS claim_token,\n          j.judge_attempts;",
+        "query": "-- Take exactly one job, and make the taking visible to every other runner.\n--\n-- SKIP LOCKED, not a plain FOR UPDATE: two overlapping ticks must take\n-- different rows, never queue behind the same one. LIMIT 1 keeps a slow judge\n-- from holding a batch of leases it cannot finish inside them.\n--\n-- ATTEMPTS ARE INCREMENTED AT CLAIM TIME, not on failure. A worker that dies\n-- before it can record anything has still spent an attempt, and that is the\n-- only version of this counter that a crash cannot reset.\n--\n-- OLDEST IDLE FIRST: the thread that has been waiting longest is the one whose\n-- coaching is most overdue.\nWITH pick AS (\n  SELECT j.interaction_id\n  FROM chat_eval_jobs j\n  WHERE j.status IN ('pending', 'judge_failed')\n    AND j.next_attempt_at <= now()\n  ORDER BY j.idle_through\n  -- 017: was LIMIT 1, a hard ceiling of 48 evaluations a day at one\n  -- tick per 30 minutes. Ten per tick across the nightly window is ~300 a\n  -- night, which clears 200 chats/day with headroom. Raise this and the\n  -- HTTP batching on \"Two AI passes\" has to move with it.\n  LIMIT 10\n  FOR UPDATE SKIP LOCKED\n)\nUPDATE chat_eval_jobs j\n   SET status         = 'evaluating',\n       claim_token    = gen_random_uuid(),\n       claimed_at     = now(),\n       -- Longer than the judge's own 300 s timeout plus both passes, so a slow\n       -- but healthy run is never reclaimed underneath itself.\n       claim_until    = now() + interval '15 minutes',\n       judge_attempts = j.judge_attempts + 1,\n       last_error     = NULL,\n       updated_at     = now()\n  FROM pick\n WHERE j.interaction_id = pick.interaction_id\nRETURNING j.interaction_id::text AS interaction_id,\n          j.claim_token::text    AS claim_token,\n          j.judge_attempts;",
         "options": {}
       },
       "credentials": {
@@ -203,11 +203,17 @@
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify({ conversation: $('Prepare chat input').item.json.transcript_text, input_type: 'chat', metadata: $('Prepare chat input').item.json.metrics, run_pass1: true, run_pass2: true }) }}",
         "options": {
-          "timeout": 300000
+          "timeout": 300000,
+          "batching": {
+            "batch": {
+              "batchSize": 2,
+              "batchInterval": 1500
+            }
+          }
         }
       },
       "onError": "continueRegularOutput",
-      "notes": "Two separate model calls behind one endpoint. Neither sees the other's output -- merging them lets an angry customer drag down the agent's score and a strong agent inflate the forecast."
+      "notes": "Two at a time, 1.5s apart. The worker is one replica on a thread pool and DeepSeek rate-limits per minute; ten simultaneous evaluations turn a claimed batch into ten 429s and ten spent attempts."
     },
     {
       "id": "evaluation-ok",
@@ -363,7 +369,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Terminal, and the happy path. Fenced: a job whose lease was reclaimed while\n-- the judge was running must not be marked done by the execution that lost it.\nUPDATE chat_eval_jobs\n   SET status      = 'evaluated',\n       claim_token = NULL,\n       claim_until = NULL,\n       claimed_at  = NULL,\n       last_error  = NULL,\n       updated_at  = now()\n WHERE interaction_id = $1::uuid\n   AND claim_token    = $2::uuid\n   AND status         = 'evaluating'\nRETURNING interaction_id::text AS interaction_id, status, judge_attempts;",
+        "query": "-- fence-exempt: single-statement UPDATE. The fence IS the statement's own\n-- WHERE clause, so the row is locked and the predicate re-evaluated against\n-- the latest committed version by the UPDATE itself (EvalPlanQual). There is\n-- no read-then-write window to widen, and adding FOR UPDATE would only take\n-- the same lock twice.\n-- Terminal success. The lease is released and last_error cleared, so a row that\n-- previously failed does not keep a stale reason attached to a good result.\n--\n-- Terminal, and the happy path. Fenced: a job whose lease was reclaimed while\n-- the judge was running must not be marked done by the execution that lost it.\n--\n-- 017: judge_runs is the ceiling the reopen rule reads, and\n-- judged_message_count is the yardstick its +50% test measures from. Both are\n-- written HERE, at the only point a judge is known to have completed -- setting\n-- them at claim time would count an attempt that died mid-call as a run.\nUPDATE chat_eval_jobs\n   SET status      = 'evaluated',\n       claim_token = NULL,\n       claim_until = NULL,\n       claimed_at  = NULL,\n       last_error  = NULL,\n       judge_runs  = judge_runs + 1,\n       judged_message_count = coalesce(observed_message_count, judged_message_count),\n       updated_at  = now()\n WHERE interaction_id = $1::uuid\n   AND claim_token    = $2::uuid\n   AND status         = 'evaluating'\nRETURNING interaction_id, status, judge_attempts, judge_runs;",
         "options": {
           "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, $('Claim work').item.json.claim_token ] }}"
         }
@@ -387,7 +393,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Terminal, and NOT a failure. Three different kinds of nothing arrive here:\n-- a bot-only thread with no agent to grade, a thread where every turn is\n-- labelled as the agent (a source labelling fault, not a conversation), and a\n-- thread holding less text than the scoring minimum.\n--\n-- Retrying any of them re-asks a model that already answered, or asks one\n-- about a conversation that is not there, and can only manufacture a score. So\n-- the reason is written down and the job stops.\n--\n-- NO agent_evaluations ROW IS WRITTEN. Workflow 02 does write one for an\n-- unscoreable call, because a call that was recorded and could not be\n-- transcribed is a quality signal about the ASR. These are different: there is\n-- no agent turn to grade at all, and a row under an agent's name for a thread\n-- they never joined is worse than no row.\nUPDATE chat_eval_jobs\n   SET status      = 'unscoreable',\n       claim_token = NULL,\n       claim_until = NULL,\n       claimed_at  = NULL,\n       last_error  = left($3::text, 500),\n       updated_at  = now()\n WHERE interaction_id = $1::uuid\n   AND claim_token    = $2::uuid\n   AND status         = 'evaluating'\nRETURNING interaction_id::text AS interaction_id, status, last_error;",
+        "query": "-- fence-exempt: single-statement UPDATE. The fence IS the statement's own\n-- WHERE clause, so the row is locked and the predicate re-evaluated against\n-- the latest committed version by the UPDATE itself (EvalPlanQual). There is\n-- no read-then-write window to widen, and adding FOR UPDATE would only take\n-- the same lock twice.\n-- Terminal success. The lease is released and last_error cleared, so a row that\n-- previously failed does not keep a stale reason attached to a good result.\n--\n-- Terminal, and NOT a failure. Three different kinds of nothing arrive here:\n-- a bot-only thread with no agent to grade, a thread where every turn is\n-- labelled as the agent (a source labelling fault, not a conversation), and a\n-- thread holding less text than the scoring minimum.\n--\n-- Retrying any of them re-asks a model that already answered, or asks one\n-- about a conversation that is not there, and can only manufacture a score. So\n-- the reason is written down and the job stops.\n--\n-- NO agent_evaluations ROW IS WRITTEN. Workflow 02 does write one for an\n-- unscoreable call, because a call that was recorded and could not be\n-- transcribed is a quality signal about the ASR. These are different: there is\n-- no agent turn to grade at all, and a row under an agent's name for a thread\n-- they never joined is worse than no row.\nUPDATE chat_eval_jobs\n   SET status      = 'unscoreable',\n       claim_token = NULL,\n       claim_until = NULL,\n       claimed_at  = NULL,\n       last_error  = left($3::text, 500),\n       updated_at  = now()\n WHERE interaction_id = $1::uuid\n   AND claim_token    = $2::uuid\n   AND status         = 'evaluating'\nRETURNING interaction_id::text AS interaction_id, status, last_error;",
         "options": {
           "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, $('Claim work').item.json.claim_token, ($('Prepare chat input').item.json.has_no_customer_turn ? 'every turn is labelled as the agent: a source labelling fault, not a conversation' : ($('Prepare chat input').item.json.is_bot_only ? 'bot-only thread: no human agent ever joined' : ('nothing to score: ' + JSON.stringify($('Prepare chat input').item.json).slice(0, 300)))) ] }}"
         }
@@ -411,7 +417,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Terminal, and NOT a failure. Three different kinds of nothing arrive here:\n-- a bot-only thread with no agent to grade, a thread where every turn is\n-- labelled as the agent (a source labelling fault, not a conversation), and a\n-- thread holding less text than the scoring minimum.\n--\n-- Retrying any of them re-asks a model that already answered, or asks one\n-- about a conversation that is not there, and can only manufacture a score. So\n-- the reason is written down and the job stops.\n--\n-- NO agent_evaluations ROW IS WRITTEN. Workflow 02 does write one for an\n-- unscoreable call, because a call that was recorded and could not be\n-- transcribed is a quality signal about the ASR. These are different: there is\n-- no agent turn to grade at all, and a row under an agent's name for a thread\n-- they never joined is worse than no row.\nUPDATE chat_eval_jobs\n   SET status      = 'unscoreable',\n       claim_token = NULL,\n       claim_until = NULL,\n       claimed_at  = NULL,\n       last_error  = left($3::text, 500),\n       updated_at  = now()\n WHERE interaction_id = $1::uuid\n   AND claim_token    = $2::uuid\n   AND status         = 'evaluating'\nRETURNING interaction_id::text AS interaction_id, status, last_error;",
+        "query": "-- fence-exempt: single-statement UPDATE. The fence IS the statement's own\n-- WHERE clause, so the row is locked and the predicate re-evaluated against\n-- the latest committed version by the UPDATE itself (EvalPlanQual). There is\n-- no read-then-write window to widen, and adding FOR UPDATE would only take\n-- the same lock twice.\n-- Terminal success. The lease is released and last_error cleared, so a row that\n-- previously failed does not keep a stale reason attached to a good result.\n--\n-- Terminal, and NOT a failure. Three different kinds of nothing arrive here:\n-- a bot-only thread with no agent to grade, a thread where every turn is\n-- labelled as the agent (a source labelling fault, not a conversation), and a\n-- thread holding less text than the scoring minimum.\n--\n-- Retrying any of them re-asks a model that already answered, or asks one\n-- about a conversation that is not there, and can only manufacture a score. So\n-- the reason is written down and the job stops.\n--\n-- NO agent_evaluations ROW IS WRITTEN. Workflow 02 does write one for an\n-- unscoreable call, because a call that was recorded and could not be\n-- transcribed is a quality signal about the ASR. These are different: there is\n-- no agent turn to grade at all, and a row under an agent's name for a thread\n-- they never joined is worse than no row.\nUPDATE chat_eval_jobs\n   SET status      = 'unscoreable',\n       claim_token = NULL,\n       claim_until = NULL,\n       claimed_at  = NULL,\n       last_error  = left($3::text, 500),\n       updated_at  = now()\n WHERE interaction_id = $1::uuid\n   AND claim_token    = $2::uuid\n   AND status         = 'evaluating'\nRETURNING interaction_id::text AS interaction_id, status, last_error;",
         "options": {
           "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, $('Claim work').item.json.claim_token, ('judge refused: ' + JSON.stringify(($('Two AI passes').item.json.pass2 || {}).warnings || [])) ] }}"
         }
@@ -472,7 +478,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Retryable. The judge was unreachable, rate limited, or still contradicted\n-- the rubric after its one correction.\n--\n-- Backed off by attempt number: a judge that is down stays down for minutes,\n-- and retrying immediately turns a rate limit into a ban.\nUPDATE chat_eval_jobs\n   SET status = CASE WHEN judge_attempts >= 3 THEN 'dead_letter' ELSE 'judge_failed' END,\n       claim_token     = NULL,\n       claim_until     = NULL,\n       claimed_at      = NULL,\n       next_attempt_at = now() + (interval '5 minutes' * GREATEST(judge_attempts, 1)),\n       last_error      = left($3::text, 500),\n       updated_at      = now()\n WHERE interaction_id = $1::uuid\n   AND claim_token    = $2::uuid\n   AND status         = 'evaluating'\nRETURNING interaction_id::text AS interaction_id, status, judge_attempts, last_error;",
+        "query": "-- fence-exempt: single-statement UPDATE. The fence IS the statement's own\n-- WHERE clause, so the row is locked and the predicate re-evaluated against\n-- the latest committed version by the UPDATE itself (EvalPlanQual). There is\n-- no read-then-write window to widen, and adding FOR UPDATE would only take\n-- the same lock twice.\n-- Terminal success. The lease is released and last_error cleared, so a row that\n-- previously failed does not keep a stale reason attached to a good result.\n--\n-- Retryable. The judge was unreachable, rate limited, or still contradicted\n-- the rubric after its one correction.\n--\n-- Backed off by attempt number: a judge that is down stays down for minutes,\n-- and retrying immediately turns a rate limit into a ban.\nUPDATE chat_eval_jobs\n   SET status = CASE WHEN judge_attempts >= 3 THEN 'dead_letter' ELSE 'judge_failed' END,\n       claim_token     = NULL,\n       claim_until     = NULL,\n       claimed_at      = NULL,\n       next_attempt_at = now() + (interval '5 minutes' * GREATEST(judge_attempts, 1)),\n       last_error      = left($3::text, 500),\n       updated_at      = now()\n WHERE interaction_id = $1::uuid\n   AND claim_token    = $2::uuid\n   AND status         = 'evaluating'\nRETURNING interaction_id::text AS interaction_id, status, judge_attempts, last_error;",
         "options": {
           "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, $('Claim work').item.json.claim_token, ('judge failed: ' + JSON.stringify($('Two AI passes').item.json).slice(0, 400)) ] }}"
         }
@@ -484,20 +490,57 @@
         }
       },
       "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Every judge call, with what it cost. 006 created this table; nothing has ever\n-- written to it, so every cost figure this project has produced was arithmetic\n-- over a sample rather than a measurement.\n--\n-- lease-exempt: append-only, and unique on (purpose, input_hash, prompt_version)\n-- with ON CONFLICT DO NOTHING. input_hash is the hash of the exact text sent, so\n-- a stale worker re-recording the same call writes a row that is either\n-- identical or skipped -- there is no state here for it to corrupt. That same\n-- key is also the second cost guard: a workflow re-run over an unchanged thread\n-- records no new row, and the absence of that row is how a real month-over-month\n-- rise is told apart from a replay.\n--\n-- ONE jsonb PARAMETER, not one per field: n8n splits queryReplacement on commas,\n-- and a dozen scalars would shred into a dozen bogus parameters.\nINSERT INTO model_calls (\n  interaction_id, purpose, provider, model, prompt_version, input_hash,\n  prompt_tokens, output_tokens, cached_tokens, cost_usd, priced_at_peak,\n  succeeded, error)\nSELECT $1::uuid,\n       c->>'purpose', c->>'provider', c->>'model', c->>'prompt_version',\n       c->>'input_hash',\n       (c->>'prompt_tokens')::int, (c->>'output_tokens')::int,\n       (c->>'cached_tokens')::int, (c->>'cost_usd')::numeric,\n       (c->>'priced_at_peak')::boolean,\n       coalesce((c->>'succeeded')::boolean, true), c->>'error'\nFROM jsonb_array_elements($2::jsonb) AS c\nWHERE c->>'input_hash' IS NOT NULL\nON CONFLICT (purpose, input_hash, prompt_version) DO NOTHING\nRETURNING call_id, purpose, cost_usd;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, JSON.stringify($('Two AI passes').item.json.model_calls || []) ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2420,
+        280
+      ],
+      "id": "record-model-cost",
+      "name": "Record model cost",
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One row per distinct thing the customer asked for (017).\n--\n-- WHY THIS EXISTS. interaction_analysis holds exactly one service, one intent\n-- and one budget, so a chat where the customer asked about a package AND a visa\n-- lost the second one silently -- and the agent who opened one deal instead of\n-- two looked correct in every report.\n--\n-- FENCED, like every other durable write here. This is an UPSERT keyed on\n-- (interaction_id, seq): a stale execution holding an older reading of the\n-- thread would overwrite a newer one, so `lease` takes a real row lock on a LIVE\n-- claim and every write below selects FROM it. An unlocked existence check\n-- would not do -- it reads a snapshot and lets go, and the recovery sweep can\n-- reclaim the row inside that window while this write still commits.\n--\n-- EVERY VALUE IS ALREADY COERCED. The worker turned dates, budgets and enum\n-- labels into safe values before they got here: an unparseable date raises\n-- 22007 and Postgres aborts the WHOLE statement, which would lose the four good\n-- requests along with the bad one.\n--\n-- seq 1 IS MATCHED TO THE CRM DEAL. The primary request is the one the agent\n-- logged; every later seq is unmatched until proven otherwise, and\n-- v_request_reconciliation counts exactly those as opportunities nobody opened\n-- a deal for.\nWITH lease AS MATERIALIZED (\n  SELECT j.interaction_id\n  FROM chat_eval_jobs j\n  WHERE j.interaction_id = $1::uuid\n    AND j.claim_token    = $2::uuid\n    AND j.status         = 'evaluating'\n    AND j.claim_until    > now()\n  FOR UPDATE\n)\nINSERT INTO interaction_requests (\n  interaction_id, seq, service, service_raw, intent, buying_stage, destination,\n  date_start, date_end, nights, travelers_total, budget_amount, budget_currency,\n  outcome, evidence, evidence_valid, matched_bitrix_deal_id, prompt_version)\nSELECT $1::uuid,\n       (r->>'seq')::int,\n       (r->>'service')::service_type,\n       r->>'service_raw',\n       r->>'intent',\n       (r->>'buying_stage')::buying_stage,\n       r->>'destination',\n       (r->>'date_start')::date,\n       (r->>'date_end')::date,\n       (r->>'nights')::int,\n       (r->>'travelers_total')::int,\n       (r->>'budget_amount')::numeric,\n       r->>'budget_currency',\n       r->>'outcome',\n       coalesce(r->'evidence', '[]'::jsonb),\n       (r->>'evidence_valid')::boolean,\n       CASE WHEN (r->>'seq')::int = 1 THEN $4 END,\n       $5\nFROM lease, jsonb_array_elements($3::jsonb) AS r\nON CONFLICT (interaction_id, seq) DO UPDATE SET\n  service         = EXCLUDED.service,\n  service_raw     = EXCLUDED.service_raw,\n  intent          = EXCLUDED.intent,\n  buying_stage    = EXCLUDED.buying_stage,\n  destination     = EXCLUDED.destination,\n  date_start      = EXCLUDED.date_start,\n  date_end        = EXCLUDED.date_end,\n  nights          = EXCLUDED.nights,\n  travelers_total = EXCLUDED.travelers_total,\n  budget_amount   = EXCLUDED.budget_amount,\n  budget_currency = EXCLUDED.budget_currency,\n  outcome         = EXCLUDED.outcome,\n  evidence        = EXCLUDED.evidence,\n  evidence_valid  = EXCLUDED.evidence_valid,\n  prompt_version  = EXCLUDED.prompt_version\nRETURNING request_id, seq, service, evidence_valid;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, $('Claim work').item.json.claim_token, JSON.stringify((($('Two AI passes').item.json.pass1 || {}).requests) || []), $('Load thread').item.json.external_deal_id || null, (($('Two AI passes').item.json.pass1 || {}).prompt_version) || null ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2640,
+        280
+      ],
+      "id": "store-requests",
+      "name": "Store requests",
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
     }
   ],
   "connections": {
-    "Every 30 min": {
-      "main": [
-        [
-          {
-            "node": "Register due threads",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Register due threads": {
       "main": [
         [
@@ -638,7 +681,7 @@
       "main": [
         [
           {
-            "node": "Mark evaluated",
+            "node": "Record model cost",
             "type": "main",
             "index": 0
           }
@@ -657,6 +700,44 @@
         [
           {
             "node": "Mark judge failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 10 min, 23:00-04:00": {
+      "main": [
+        [
+          {
+            "node": "Register due threads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark evaluated": {
+      "main": [
+        []
+      ]
+    },
+    "Record model cost": {
+      "main": [
+        [
+          {
+            "node": "Store requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store requests": {
+      "main": [
+        [
+          {
+            "node": "Mark evaluated",
             "type": "main",
             "index": 0
           }
