@@ -316,3 +316,19 @@ def test_health_check_casts_status_to_its_enum():
     sql = [n for n in wf["nodes"]
            if n["name"] == "Nightly health check"][0]["parameters"]["query"]
     assert "::job_status" in sql
+
+
+def test_upsert_origin_is_a_value_the_check_constraint_allows():
+    """deals_origin_ck (migration 015) allows 'bitrix' and 'ai_derived'. The
+    workflow wrote 'bitrix_rest', so every row of the nightly pull failed the
+    check — the third constraint in this one INSERT to do that. The allowed
+    set is read from the migration so the two cannot drift."""
+    mig = (_Path(__file__).resolve().parents[3] / "db" / "migrations"
+           / "015_chat_evaluation_and_derived_deals.sql").read_text(encoding="utf-8")
+    m = _re.search(r"deals_origin_ck[\s\S]{0,200}?CHECK\s*\(origin IN \(([^)]*)\)\)", mig)
+    assert m, "could not read deals_origin_ck out of migration 015"
+    allowed = set(_re.findall(r"'([^']+)'", m.group(1)))
+
+    written = set(_re.findall(r"^\s*'([a-z_]+)'\s*$", _upsert_sql(), _re.M))
+    bad = written - allowed
+    assert not bad, f"Upsert deals writes origin {bad}, but the check allows {allowed}"
