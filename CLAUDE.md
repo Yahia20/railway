@@ -12,21 +12,38 @@ making decisions, not after.
 
 ## Status in one line
 
-**The whole pipeline is live as of 2026-09-06.** Six workflows active, the
-worker deployed from `main`, migration 017 applied. What is NOT running: the
-Modal transcription batch — the code is written (`modal/transcribe_job.py`) and
-has never been deployed or executed, because it needs three Modal secrets and a
-click-through on the gated Hugging Face model page.
+**Everything is deployed and correct. It is stopped, on purpose, because
+DeepSeek has no credit.** Balance −0.10 USD, `is_available: false`. Top the
+account up and the pipeline resumes on its own — 599 threads are waiting,
+`judge_attempts = 0`, nothing lost. **There is no command to run afterwards.**
 
-Google Drive IS connected. `/calls/list` returns 611 recordings on every run,
-so the old "no Drive credentials" note is retired.
+Check it in one call:
 
-**The calls backlog is DONE, not stuck.** Measured 2026-09-06:
-`call_ingest_jobs` holds 780 `evaluated` and 284 `dead_letter`, and there are
-830 transcripts at confidence 1.00. `Claim work` returning nothing means there
-is no work left, not that something broke — the 284 are genuinely unscoreable
-("transcript holds 86 normalised characters of speech"). Do not "revive" them:
-that queues 284 empty recordings for a judge that will score them 0.
+```bash
+curl -s https://railway-production-d648.up.railway.app/spend        # the page
+```
+
+**Calls are paused by you, not broken.** Drive's newest recording is
+2026-08-19; all 1,064 are processed and terminal. Nothing is stranded. The
+lane needs no code change to resume — but see the two things to insist on with
+the new recorder in `docs/CHANGING_THE_CALL_SOURCE.md`, because **calls cannot
+currently be scored per agent at all**: every recording decodes to extension
+`3009`, which is a queue and not a person.
+
+**Modal is deployed** (`travelgate-asr`, cron 23:30) and capped at a hard
+30 USD/month enforced in the worker, not in the batch. It has $0.99 of free
+credit left, so add a payment method before calls resume.
+
+**The judging queue is production-only and honest**: 599 pending, 27 evaluated,
+6 unscoreable. It said 40 evaluated until `021` removed 13 rows belonging to
+the retired workflow-01 namespace, four of which claimed success while holding
+no evaluation.
+
+Before trusting any number on `/report`, run:
+
+```bash
+python scripts/audit_data_integrity.py --port 55432   # 0 failures as of 2026-09-09
+```
 
 ### What runs, and when (all times Asia/Riyadh — n8n's GENERIC_TIMEZONE)
 
@@ -121,6 +138,74 @@ railway variables --service railway --set DEEPSEEK_THINKING=disabled
 python scripts/n8n_deploy.py 03 04 01d --activate
 python scripts/revive_chat_dead_letters.py --apply      # AFTER the variable is live
 ```
+
+### 2026-09-09, fourth pass — the money gate, and production
+
+**DeepSeek is out of credit: balance −0.10 USD, `is_available: false`.** The
+judge cannot run at all. Nothing in the pipeline knew that, and 599 threads sat
+`pending` — the next window would have claimed them ten at a time, failed every
+call, incremented `judge_attempts` and dead-lettered the whole queue inside
+three nights, for a reason with nothing to do with the conversations in it.
+
+**The rule now enforced everywhere: stop BEFORE claiming, not after failing.**
+An unclaimed job keeps its status, its attempt count and its place in the
+queue, so an outage of any length costs nothing and loses nothing, and work
+resumes on its own when the money returns. No backfill, no manual step.
+
+```
+Check budget ──▶ Record provider status ──▶ Read budget gate ──▶ May we spend?
+                                                                  │        └── false ──▶ Log blocked run  (job_runs, status 'skipped')
+                                                                  └── true ──▶ Register/Claim …
+```
+
+Two statements, not one: a parameterised query may carry only one command, and
+a CTE beside the INSERT would read the pre-update snapshot — **the same bug 03
+shipped**.
+
+| where | what |
+|---|---|
+| `020` | `provider_budgets` / `provider_status`, `v_spend_mtd`, `v_pipeline_gate`, `v_spend_by_component` |
+| `app/budget.py` | one probe per provider; `/budget/preflight`, `/budget/spend` |
+| `/spend` | **the spend report page** — where the money went, and why work is stopped |
+| `/asr/claim` | **the Modal 30 USD hard cap**, enforced in the worker |
+
+**The Modal cap is in the worker on purpose.** Modal reaches the database only
+through the worker, so that is the one chokepoint every batch must pass. A cap
+in `modal/transcribe_job.py` would be advisory — a redeploy or a hand-run
+`modal run --limit 500` would step straight past it. The claim is also trimmed
+to what the remaining budget can pay for, so one large batch cannot vault the
+ceiling in a single go.
+
+**The gate fails CLOSED** for any provider whose balance we can check and have
+not. An unchecked DeepSeek is exactly the state that would have emptied the
+queue.
+
+**Adding a provider** is a `_probe_<name>()` function, a `PROBES` entry and a
+row in `provider_budgets`. **Changing a cap is an UPDATE, not a deploy.**
+
+**Data integrity is now checked, not assumed.** `scripts/audit_data_integrity.py`
+holds 24 assertions about what the numbers MEAN — an evaluation attached to no
+agent, a request counted twice, a rate over the wrong denominator. It found a
+real one: 13 retired-namespace rows were still in the judging queue, four
+claiming success with no evaluation, so `/report` said **40 threads evaluated
+when 27 were**. Cleaned in `021`. Run it after any migration; it is currently
+**0 failures**.
+
+`interaction_metrics` was backfilled for all 42 judged conversations using the
+worker's own `compute_chat_metrics` (rule 3 — never a second implementation),
+so `v_agent_scorecard.avg_first_response_sec` is populated for the first time:
+the spread runs from 85 seconds to 19 hours.
+
+**Bitrix is fully automated except one thing.** `crm.deal.list` pages nightly
+and carries `ASSIGNED_BY_ID`, so deals, stages, amounts and owners all arrive
+on their own. The only manual step is naming a NEW member of staff, because
+`user.get` is outside the webhook's scope — `v_roster_gaps` (and a `/report`
+panel) names any Bitrix user id owning deals with no `agents` row. Fix with one
+line in `local-reports/agent_roster.json` and `scripts/seed_agents.py --apply`.
+
+**Changing the call source: `docs/CHANGING_THE_CALL_SOURCE.md`.** Modal's audio
+fetch is now scheme-dispatched (`drive://`, `https://`, `s3://`), so a recorder
+that can produce a signed URL needs no new code at all.
 
 ### 2026-09-09, third pass — production hardening
 
@@ -328,6 +413,21 @@ python scripts/railway_usage.py
 # what is configured, live
 curl -H "X-API-Key: $WORKER_API_KEY" https://railway-production-d648.up.railway.app/ready
 
+# THE SPEND REPORT. Where the money went, and why work is stopped if it is.
+#   https://railway-production-d648.up.railway.app/spend
+curl -H "X-API-Key: $WORKER_API_KEY" https://railway-production-d648.up.railway.app/budget/spend
+
+# Is the pipeline allowed to spend right now? (this is what the workflows ask)
+curl -X POST -H "X-API-Key: $WORKER_API_KEY" -H 'Content-Type: application/json'      -d '{"providers":["deepseek","modal"]}'      https://railway-production-d648.up.railway.app/budget/preflight
+
+# Do the numbers MEAN what the reports say? Run after every migration.
+export PGPASSWORD=...
+python scripts/audit_data_integrity.py --port 55432
+
+# Roster: name a new member of staff (the one manual Bitrix step)
+#   edit local-reports/agent_roster.json, then:
+python scripts/seed_agents.py --roster local-reports/agent_roster.json --apply
+
 # THE REPORT. Open in a browser and paste WORKER_API_KEY when it asks — the page
 # holds no data and fetches /report/data itself, because a browser cannot set a
 # header on a navigation and a key in the URL lands in history and proxy logs.
@@ -403,7 +503,8 @@ python scripts/simulate_conversation.py <id> --webhook  # POST at live n8n
 ## Layout
 
 ```
-db/migrations/         001-019 all applied to Railway (018 attribution, 019 bots+alerts)
+db/migrations/         001-021 all applied to Railway (018 attribution, 019 bots+alerts,
+                       020 spend governance, 021 queue hygiene)
 services/worker/app/
   serve.py             entrypoint — see gotcha 1 and 2 below
   main.py              FastAPI
