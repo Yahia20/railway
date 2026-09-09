@@ -124,6 +124,41 @@ WHERE status IN ('discovered', 'asr_failed')
   AND claim_until IS NULL
 """
 
+# Alert evaluation runs AFTER the job is terminal, and a terminal job is never
+# claimed again -- so a throw in that node loses the whole tick's alerts
+# permanently and silently. The stamp is written in the same statement as the
+# evaluation, which makes the gap countable: a judged thread with no stamp is
+# work that was dropped, not work not yet due. Should always read zero.
+SQL_ALERTS_NOT_EVALUATED = """
+SELECT count(*)          AS threads_missing_alerts,
+       min(evaluated_at) AS oldest,
+       max(evaluated_at) AS newest
+FROM v_chat_alerts_pending
+"""
+
+# Money, and whether the pipeline is allowed to spend any. A stopped pipeline
+# and a broken one look identical from the outside, so the reason has to be a
+# panel rather than something you infer from an empty queue.
+SQL_BUDGET_GATE = """
+SELECT provider, may_run, reason, spend_mtd_usd, monthly_cap_usd,
+       remaining_usd, balance_usd, checked_at
+FROM v_pipeline_gate ORDER BY may_run, provider
+"""
+
+SQL_SPEND = """
+SELECT provider, component, calls, failed, output_tokens, cached_tokens,
+       spend_usd, at_peak_rate, last_at
+FROM v_spend_by_component ORDER BY spend_usd DESC NULLS LAST
+"""
+
+# The one part of the Bitrix integration that is not automated: `user.get` is
+# outside the webhook's scope, so a salesperson who joins after the roster was
+# built owns deals under a Bitrix id nobody has named. Silent otherwise.
+SQL_ROSTER_GAPS = """
+SELECT bitrix_user_id, deals, first_deal_at, latest_deal_at
+FROM v_roster_gaps LIMIT 25
+"""
+
 SQL_DUE_NOW = """
 SELECT count(*)                                   AS threads_due,
        min(idle_days)                             AS min_idle_days,
@@ -302,6 +337,10 @@ def build(days: int = 30, limit: int = SAMPLE_LIMIT) -> dict:
     _panel("call_jobs", lambda: db.rows(SQL_CALL_JOBS), data, errors)
     _panel("stranded_calls", lambda: db.one(SQL_STRANDED), data, errors)
     _panel("threads_due", lambda: db.one(SQL_DUE_NOW), data, errors)
+    _panel("alerts_pending", lambda: db.one(SQL_ALERTS_NOT_EVALUATED), data, errors)
+    _panel("budget_gate", lambda: db.rows(SQL_BUDGET_GATE), data, errors)
+    _panel("spend", lambda: db.rows(SQL_SPEND), data, errors)
+    _panel("roster_gaps", lambda: db.rows(SQL_ROSTER_GAPS), data, errors)
     _panel("ingest", lambda: db.rows(SQL_INGEST_FRESHNESS), data, errors)
     _panel("identity", lambda: db.rows(SQL_IDENTITY_COVERAGE), data, errors)
 

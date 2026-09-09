@@ -21,7 +21,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from . import asr_jobs, db, report
+from . import asr_jobs, budget, db, report
 from .asr import cohere_arabic
 from .config import settings
 from .evaluate import judge, metrics, scoring
@@ -720,6 +720,7 @@ def recompute(modules: dict[str, Any]) -> dict:
 # ---------------------------------------------------------------------------
 
 REPORT_PAGE = Path(__file__).resolve().parent / "static" / "report.html"
+SPEND_PAGE = Path(__file__).resolve().parent / "static" / "spend.html"
 
 
 @app.get("/report", response_class=HTMLResponse, include_in_schema=False)
@@ -958,10 +959,28 @@ def asr_claim(req: AsrClaim) -> dict:
 
     Only `discovered` and `asr_failed` — the other half of gotcha 13's boundary
     is the WHERE in workflow 02's `Claim work`, which takes `transcribed` and
-    `judge_failed`. Widen either and the same call is paid for twice."""
+    `judge_failed`. Widen either and the same call is paid for twice.
+
+    THE MONEY GATE LIVES HERE, not in Modal. Modal reaches the database only
+    through this worker, so this is the one chokepoint every batch must pass:
+    a cap enforced in `modal/transcribe_job.py` would be advisory, and a
+    redeploy or a hand-run `modal run --limit 500` would walk straight past it.
+    Claiming nothing is the correct way to stop — an unclaimed recording keeps
+    its status and its attempt count, so a batch that is refused costs nothing
+    and loses nothing.
+    """
+    # Through _asr for the same reason every other statement here is: a missing
+    # database must be a 503, not a 500. The batch runs unattended at 23:30 and
+    # the difference is whether tomorrow starts with a diagnosis or a log dig.
+    allowed, note = _asr(budget.asr_claim_allowance, req.limit)
+    if allowed <= 0:
+        log.warning("asr claim refused: %s", note)
+        return {"claimed": 0, "recordings": [], "budget_blocked": True,
+                "reason": note}
     rows = _asr(asr_jobs.claim, req.run_id, req.claim_token,
-                req.limit, req.max_attempts)
-    return {"claimed": len(rows), "recordings": rows}
+                allowed, req.max_attempts)
+    return {"claimed": len(rows), "recordings": rows,
+            "budget_blocked": False, "reason": note}
 
 
 @app.post("/asr/store", dependencies=[Depends(require_api_key)])
@@ -1003,3 +1022,54 @@ def asr_run_finish(req: AsrRunFinish) -> dict:
                 req.failed, req.audio_seconds, req.gpu_seconds,
                 req.est_cost_usd, req.error)
     return {"run": rows[0] if rows else None}
+
+
+# ---------------------------------------------------------------------------
+# Money. See app/budget.py for why a pipeline needs a gate before it claims.
+# ---------------------------------------------------------------------------
+
+class PreflightRequest(BaseModel):
+    providers: list[str] | None = Field(
+        default=None,
+        description="Which providers to probe. Default: all registered ones.")
+
+
+@app.post("/budget/preflight", dependencies=[Depends(require_api_key)])
+def budget_preflight(req: PreflightRequest) -> dict:
+    """May we start spending, and with whom?
+
+    Called FIRST by every workflow that costs money, before it claims any
+    work. A job that is never claimed keeps its status and its attempt count,
+    so an outage costs nothing and loses nothing however long it lasts.
+
+    This endpoint only READS (rule 11): it returns the verdict and n8n writes
+    it into `provider_status`, so there is exactly one write path.
+    """
+    return budget.preflight(req.providers)
+
+
+@app.get("/budget/spend", dependencies=[Depends(require_api_key)])
+def budget_spend() -> dict:
+    """Where the money went this month, per provider and per component."""
+    return budget.spend_report()
+
+
+@app.get("/spend", response_class=HTMLResponse, include_in_schema=False)
+def spend_page() -> HTMLResponse:
+    """The spend report as a page. Holds no data and no key: it fetches
+    /budget/spend itself, for the same reason /report does — a browser cannot
+    set a header on a navigation, and a key in the URL lands in history and in
+    every proxy log along the way."""
+    try:
+        html = SPEND_PAGE.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            f"spend page missing: {exc}") from exc
+    return HTMLResponse(
+        html,
+        headers={
+            "Cache-Control": "no-store",
+            "X-Frame-Options": "DENY",
+            "Referrer-Policy": "no-referrer",
+        },
+    )

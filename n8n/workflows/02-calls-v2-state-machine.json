@@ -1045,6 +1045,144 @@
           "name": "railway-pg"
         }
       }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://railway-production-d648.up.railway.app/budget/preflight",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ providers: [\"deepseek\"] }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -660,
+        300
+      ],
+      "id": "b2d0c9a4-3e77-4b21-9a56-7f0e2c4d8a22",
+      "name": "Check budget",
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: pipeline-wide state, not per-job work. It claims no job, so\n-- there is no lease to carry; ON CONFLICT makes a concurrent identical probe\n-- idempotent.\n-- Persist what the probe found. ONE statement, because a parameterised query\n-- may carry only one command -- and because the verdict has to be read in a\n-- SEPARATE statement to see this write at all (a CTE would share this\n-- snapshot and read the pre-update row, which is precisely the bug workflow\n-- 03 shipped).\n--\n-- THE WORKER PROBES, N8N WRITES (rule 11). app/budget.py computes; this is the\n-- single write path into provider_status.\nINSERT INTO provider_status\n  (provider, checked_at, available, reason, balance_usd, spend_mtd_usd, raw)\nSELECT e.key,\n       now(),\n       (e.value->>'available')::boolean,\n       e.value->>'reason',\n       nullif(e.value->>'balance_usd', '')::numeric,\n       nullif(e.value->>'spend_mtd_usd', '')::numeric,\n       coalesce(e.value->'raw', '{}'::jsonb)\n  FROM jsonb_each($1::jsonb) AS e\nON CONFLICT (provider) DO UPDATE\n   SET checked_at    = EXCLUDED.checked_at,\n       available     = EXCLUDED.available,\n       reason        = EXCLUDED.reason,\n       balance_usd   = EXCLUDED.balance_usd,\n       spend_mtd_usd = EXCLUDED.spend_mtd_usd,\n       raw           = EXCLUDED.raw\nRETURNING provider, available;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.providers || {}) ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -440,
+        300
+      ],
+      "id": "c2d0c9a4-3e77-4b21-9a56-7f0e2c4d8a22",
+      "name": "Record provider status",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "gate-may-run",
+              "leftValue": "={{ $json.may_run }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -120,
+        300
+      ],
+      "id": "d2d0c9a4-3e77-4b21-9a56-7f0e2c4d8a22",
+      "name": "May we spend?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: a run log entry, not durable per-job data. Nothing was\n-- claimed, so there is no lease to carry and nothing another worker could\n-- overwrite.\n-- The run happened; it just did not spend anything. Say so, every cycle.\n--\n-- WHY A ROW AND NOT SILENCE. An automated pipeline that stops and says nothing\n-- is indistinguishable from one that is broken, and from one that had no work.\n-- This row is what /report and /spend read to tell an operator \"the pipeline\n-- is fine, the account is empty\" — with the provider's own words in `error`.\n--\n-- NOTHING WAS CLAIMED. status = 'skipped', not 'failed': no job changed state,\n-- no attempt was spent, nothing is missing. When the money returns the queue\n-- is exactly as it was, and the next tick picks it up with no backfill needed.\nINSERT INTO job_runs (job_name, status, started_at, finished_at,\n                      items_in, items_ok, items_failed, error, detail)\nSELECT $1::text,\n       'skipped'::job_status,\n       now(), now(),\n       (SELECT count(*) FROM chat_eval_jobs\n         WHERE status IN ('pending', 'judge_failed')),\n       0, 0,\n       $2::text,\n       jsonb_build_object('gate', 'provider_budget',\n                          'provider', 'deepseek',\n                          'reason', $2::text)\nRETURNING run_id, job_name, status, error;",
+        "options": {
+          "queryReplacement": "={{ [ \"calls_judge\", $json.reason || 'blocked' ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -120,
+        500
+      ],
+      "id": "e2d0c9a4-3e77-4b21-9a56-7f0e2c4d8a22",
+      "name": "Log blocked run",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- multi-item: a plain read of one row; running it per input item is harmless\n-- and the upstream write returns exactly one row anyway.\n-- The verdict. A SEPARATE statement so it sees the write above, and a read of\n-- v_pipeline_gate rather than a re-derivation, so the POLICY -- cap reached?\n-- balance gone? provider switched off? -- lives in exactly one place.\n--\n-- Fails CLOSED: the view returns may_run = false for a provider whose balance\n-- we can check and have not, so a probe that never answered stops the spend\n-- instead of waving it through.\nSELECT provider, may_run, reason, spend_mtd_usd, monthly_cap_usd, balance_usd\n  FROM v_pipeline_gate\n WHERE provider = 'deepseek';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -330,
+        300
+      ],
+      "id": "a9f1c3d2-5b48-4e60-8c17-2d9b6e0f4a32",
+      "name": "Read budget gate",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true
     }
   ],
   "connections": {
@@ -1430,12 +1568,7 @@
       "main": [
         [
           {
-            "node": "Recover expired leases",
-            "type": "main",
-            "index": 0
-          },
-          {
-            "node": "Reconcile alert evaluations",
+            "node": "Check budget",
             "type": "main",
             "index": 0
           }
@@ -1463,6 +1596,62 @@
         [
           {
             "node": "Mark evaluated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check budget": {
+      "main": [
+        [
+          {
+            "node": "Record provider status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record provider status": {
+      "main": [
+        [
+          {
+            "node": "Read budget gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "May we spend?": {
+      "main": [
+        [
+          {
+            "node": "Recover expired leases",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Reconcile alert evaluations",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log blocked run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read budget gate": {
+      "main": [
+        [
+          {
+            "node": "May we spend?",
             "type": "main",
             "index": 0
           }

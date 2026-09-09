@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 import uuid
 from datetime import datetime, timezone
@@ -119,7 +120,11 @@ def _worker(path: str, payload: dict, timeout: float = 120.0) -> dict:
 # Audio
 # ---------------------------------------------------------------------------
 
-def _drive_download(file_id: str, dest: str) -> str:
+class UnknownAudioScheme(RuntimeError):
+    """`audio_uri` names a place we have no fetcher for."""
+
+
+def _fetch_drive(ref: str, dest: str) -> str:
     """Pull one recording straight from Drive into the container.
 
     The audio never touches Railway. That is the point: routing it through the
@@ -136,11 +141,79 @@ def _drive_download(file_id: str, dest: str) -> str:
     )
     drive = build("drive", "v3", credentials=creds, cache_discovery=False)
     with open(dest, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, drive.files().get_media(fileId=file_id))
+        downloader = MediaIoBaseDownload(fh, drive.files().get_media(fileId=ref))
         done = False
         while not done:
             _, done = downloader.next_chunk()
     return dest
+
+
+def _fetch_http(ref: str, dest: str, scheme: str = "https") -> str:
+    """Any recorder that can hand out a URL. No credentials of our own.
+
+    Use a signed URL: an unsigned one that works from here works from anywhere,
+    and these are recordings of real customers.
+    """
+    import urllib.request
+
+    req = urllib.request.Request(f"{scheme}://{ref}", headers={"User-Agent": "travelgate-asr"})
+    with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as fh:
+        shutil.copyfileobj(r, fh)
+    return dest
+
+
+def _fetch_s3(ref: str, dest: str) -> str:
+    """s3://bucket/key. boto3 is not in the image until a source needs it."""
+    try:
+        import boto3
+    except ImportError as exc:                     # pragma: no cover - env-dependent
+        raise UnknownAudioScheme(
+            "s3:// audio needs boto3 in the Modal image and AWS credentials in "
+            "a Modal secret. Add both, then this fetcher works unchanged."
+        ) from exc
+    bucket, _, key = ref.partition("/")
+    boto3.client("s3").download_file(bucket, key, dest)
+    return dest
+
+
+# ---------------------------------------------------------------------------
+# ADDING A CALL SOURCE IS ONE FUNCTION AND ONE ENTRY.
+#
+# `call_ingest_jobs.audio_uri` has always been scheme-prefixed — the column
+# comment in migration 003 says "drive://<fileId> or s3://..." — but this job
+# used to do `audio_uri.replace("drive://", "")` and call Drive unconditionally.
+# That silently made Drive the only possible source: a row carrying an s3:// or
+# https:// URI would have had its scheme stripped and been looked up as a Drive
+# file id, failing with an error about a missing file rather than an
+# unsupported source.
+#
+# Dispatching on the scheme means the PBX can change without this file
+# changing: point the new recorder at a bucket or a URL, write the URI with its
+# scheme, and the batch fetches it. A scheme with no fetcher now fails LOUDLY
+# and terminally, which is the honest outcome — it is a configuration mistake,
+# not a transient one, and retrying it three times helps nobody.
+# ---------------------------------------------------------------------------
+FETCHERS = {
+    "drive": _fetch_drive,
+    "https": lambda ref, dest: _fetch_http(ref, dest, "https"),
+    "http": lambda ref, dest: _fetch_http(ref, dest, "http"),
+    "s3": _fetch_s3,
+}
+
+
+def fetch_audio(audio_uri: str, dest: str) -> str:
+    """Resolve `<scheme>://<ref>` to a local file, whoever the recorder is."""
+    scheme, sep, ref = (audio_uri or "").partition("://")
+    if not sep:
+        raise UnknownAudioScheme(
+            f"audio_uri {audio_uri!r} has no scheme; expected one of "
+            f"{sorted(FETCHERS)}")
+    fetcher = FETCHERS.get(scheme.lower())
+    if fetcher is None:
+        raise UnknownAudioScheme(
+            f"no fetcher for {scheme!r}; known schemes are {sorted(FETCHERS)}. "
+            f"Add one to FETCHERS in modal/transcribe_job.py.")
+    return fetcher(ref, dest)
 
 
 # ---------------------------------------------------------------------------
@@ -207,8 +280,7 @@ def transcribe_batch(limit: int = 500, max_attempts: int = 3,
     for uniqueid, filename, audio_uri, meta in rows:
         try:
             local = f"/tmp/{uniqueid}.wav"
-            file_id = (audio_uri or "").replace("drive://", "")
-            _drive_download(file_id, local)
+            fetch_audio(audio_uri, local)
 
             pcm, rate, channels = ca.read_pcm(local)
             duration = len(pcm) / rate

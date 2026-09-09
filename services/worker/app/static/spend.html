@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TravelGate — spend &amp; budget</title>
+<style>
+  :root{
+    --paper:#e7ebee; --surface:#f7f9fa; --surface-2:#dce3e8;
+    --ink:#0e1418; --ink-2:#3d4a55; --ink-3:#66737e; --rule:#bfc8d0;
+    --ok:#276f45; --warn:#8f6210; --crit:#a53222; --accent:#2b6ba7;
+    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:"IBM Plex Sans Condensed","Helvetica Neue",Arial,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --paper:#0b1015; --surface:#141c23; --surface-2:#1d2731;
+      --ink:#e3e9ee; --ink-2:#a8b5bf; --ink-3:#7d8a95; --rule:#2b3641;
+      --ok:#51b57c; --warn:#d4a442; --crit:#e4735f; --accent:#74ade0;
+    }
+  }
+  *{box-sizing:border-box}
+  body{background:var(--paper);color:var(--ink);font-family:var(--sans);
+       margin:0;padding:0 0 70px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1150px;margin:0 auto;padding:0 24px}
+  header{border-bottom:2px solid var(--ink);padding:32px 0 16px}
+  h1{font-family:var(--mono);font-size:23px;font-weight:600;margin:0 0 6px;letter-spacing:-.4px}
+  .sub{color:var(--ink-2);font-size:14px;margin:0;max-width:62ch;line-height:1.5}
+  .stamp{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);
+         letter-spacing:.06em;text-transform:uppercase;margin-top:12px}
+  h2{font-family:var(--mono);font-size:11.5px;letter-spacing:.15em;text-transform:uppercase;
+     color:var(--ink-3);border-top:1px solid var(--rule);padding-top:14px;
+     margin:34px 0 14px;font-weight:500}
+  .keyrow{display:flex;gap:8px;align-items:center;margin:20px 0 6px;flex-wrap:wrap}
+  input{font-family:var(--mono);font-size:13px;padding:9px 11px;flex:1;min-width:240px;
+        border:1px solid var(--rule);background:var(--surface);color:var(--ink);border-radius:3px}
+  button{font-family:var(--sans);font-weight:600;font-size:13px;padding:9px 18px;
+         border:1px solid var(--ink);background:var(--ink);color:var(--paper);
+         border-radius:3px;cursor:pointer}
+  button:hover{opacity:.88}
+  .hint{font-size:11.5px;color:var(--ink-3);margin:0 0 10px}
+  .gate{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+  .g{background:var(--surface);border:1px solid var(--rule);border-left:4px solid var(--ac);
+     padding:14px 16px;display:flex;flex-direction:column;gap:7px}
+  .g-h{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+  .g-n{font-family:var(--mono);font-size:14px;color:var(--ink)}
+  .g-s{font-family:var(--mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+       color:var(--ac);border:1px solid var(--ac);border-radius:9px;padding:2px 8px;white-space:nowrap}
+  .g-r{font-size:12.5px;color:var(--ink-2);line-height:1.45;margin:0}
+  .bar{height:7px;background:var(--surface-2);border-radius:4px;overflow:hidden}
+  .bar i{display:block;height:100%;background:var(--ac)}
+  .g-f{font-family:var(--mono);font-size:11.5px;color:var(--ink-3);
+       display:flex;justify-content:space-between;font-variant-numeric:tabular-nums}
+  table{border-collapse:collapse;width:100%;background:var(--surface);
+        border:1px solid var(--rule)}
+  th{font-family:var(--mono);font-size:10px;letter-spacing:.11em;text-transform:uppercase;
+     color:var(--ink-3);text-align:left;padding:10px 13px;border-bottom:1px solid var(--rule);
+     font-weight:500}
+  td{padding:9px 13px;border-bottom:1px solid var(--rule);font-size:12.5px;color:var(--ink-2)}
+  tr:last-child td{border-bottom:none}
+  .m{font-family:var(--mono);color:var(--ink)}
+  .n{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--ink)}
+  tfoot td{border-top:2px solid var(--ink);background:var(--surface-2);font-weight:600}
+  .scroll{overflow-x:auto}
+  .err{background:var(--surface);border-left:4px solid var(--crit);padding:13px 16px;
+       font-family:var(--mono);font-size:12.5px;color:var(--crit);white-space:pre-wrap}
+  .empty{color:var(--ink-3);font-size:13px;padding:14px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Spend &amp; budget</h1>
+    <p class="sub">What this pipeline has cost this month, where it went, and
+      whether it is allowed to spend any more. A provider that is out of money
+      or over its cap stops the work <em>before</em> anything is claimed, so an
+      outage costs nothing and loses nothing.</p>
+    <p class="stamp" id="stamp">not loaded</p>
+  </header>
+
+  <div class="keyrow">
+    <input id="key" type="password" placeholder="WORKER_API_KEY" autocomplete="off">
+    <button id="go">Load</button>
+  </div>
+  <p class="hint">The key is held in this tab only — it is never put in the URL,
+     because a URL lands in browser history and in every proxy log on the way.</p>
+
+  <div id="out"></div>
+</div>
+
+<script>
+(function () {
+  var out = document.getElementById("out");
+  var stamp = document.getElementById("stamp");
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+  function money(v) {
+    var n = Number(v || 0);
+    return n.toFixed(n < 1 && n !== 0 ? 4 : 2);
+  }
+
+  function gateCards(gate) {
+    if (!gate || !gate.length) return '<p class="empty">no providers configured</p>';
+    return '<div class="gate">' + gate.map(function (g) {
+      var ok = g.may_run;
+      var pct = g.monthly_cap_usd
+        ? Math.min(100, 100 * Number(g.spend_mtd_usd || 0) / Number(g.monthly_cap_usd))
+        : 0;
+      var col = ok ? (pct > 80 ? "var(--warn)" : "var(--ok)") : "var(--crit)";
+      return '<div class="g" style="--ac:' + col + '">' +
+        '<div class="g-h"><span class="g-n">' + esc(g.display_name || g.provider) + '</span>' +
+        '<span class="g-s">' + (ok ? "running" : "stopped") + '</span></div>' +
+        '<p class="g-r">' + esc(g.reason || (ok ? "within budget and funded" : "blocked")) + '</p>' +
+        (g.monthly_cap_usd
+          ? '<div class="bar"><i style="width:' + pct.toFixed(1) + '%"></i></div>' +
+            '<div class="g-f"><span>$' + money(g.spend_mtd_usd) + ' spent</span>' +
+            '<span>cap $' + money(g.monthly_cap_usd) + '</span></div>'
+          : '<div class="g-f"><span>$' + money(g.spend_mtd_usd) + ' spent</span>' +
+            '<span>no cap</span></div>') +
+        (g.balance_usd != null
+          ? '<div class="g-f"><span>provider balance</span><span>$' +
+            money(g.balance_usd) + '</span></div>' : '') +
+      '</div>';
+    }).join("") + '</div>';
+  }
+
+  function providerTable(rows) {
+    if (!rows || !rows.length) return '<p class="empty">nothing spent this month</p>';
+    var total = 0, cap = 0;
+    var body = rows.map(function (r) {
+      total += Number(r.spend_mtd_usd || 0);
+      cap += Number(r.monthly_cap_usd || 0);
+      return "<tr><td class='m'>" + esc(r.display_name || r.provider) + "</td>" +
+        "<td class='n'>" + money(r.spend_mtd_usd) + "</td>" +
+        "<td class='n'>" + (r.monthly_cap_usd == null ? "—" : money(r.monthly_cap_usd)) + "</td>" +
+        "<td class='n'>" + (r.remaining_usd == null ? "—" : money(r.remaining_usd)) + "</td>" +
+        "<td class='n'>" + (r.pct_of_cap == null ? "—" : r.pct_of_cap + "%") + "</td>" +
+        "<td class='n'>" + esc(r.units_mtd) + "</td></tr>";
+    }).join("");
+    return '<div class="scroll"><table><thead><tr><th>Provider</th>' +
+      "<th class='n'>Spent</th><th class='n'>Cap</th><th class='n'>Left</th>" +
+      "<th class='n'>Used</th><th class='n'>Calls</th></tr></thead><tbody>" +
+      body + "</tbody><tfoot><tr><td>Total this month</td><td class='n'>" +
+      money(total) + "</td><td class='n'>" + money(cap) +
+      "</td><td class='n'>" + money(cap - total) + "</td><td></td><td></td>" +
+      "</tr></tfoot></table></div>";
+  }
+
+  function componentTable(rows) {
+    if (!rows || !rows.length) return '<p class="empty">nothing spent this month</p>';
+    return '<div class="scroll"><table><thead><tr><th>Provider</th><th>Component</th>' +
+      "<th class='n'>Calls</th><th class='n'>Failed</th><th class='n'>Output tok</th>" +
+      "<th class='n'>Cached tok</th><th class='n'>Spent</th><th class='n'>At peak</th>" +
+      "</tr></thead><tbody>" +
+      rows.map(function (r) {
+        return "<tr><td class='m'>" + esc(r.provider) + "</td>" +
+          "<td class='m'>" + esc(r.component) + "</td>" +
+          "<td class='n'>" + esc(r.calls) + "</td>" +
+          "<td class='n'>" + esc(r.failed) + "</td>" +
+          "<td class='n'>" + (r.output_tokens == null ? "—" : esc(r.output_tokens)) + "</td>" +
+          "<td class='n'>" + (r.cached_tokens == null ? "—" : esc(r.cached_tokens)) + "</td>" +
+          "<td class='n'>" + money(r.spend_usd) + "</td>" +
+          "<td class='n'>" + esc(r.at_peak_rate) + "</td></tr>";
+      }).join("") + "</tbody></table></div>";
+  }
+
+  function render(d) {
+    var gate = d.gate || [], stopped = gate.filter(function (g) { return !g.may_run; });
+    var html = "";
+    if (stopped.length) {
+      html += '<h2>Work is stopped</h2><div class="err">' +
+        stopped.map(function (g) {
+          return esc(g.display_name || g.provider) + ": " + esc(g.reason);
+        }).join("\n") +
+        "\n\nNothing has been claimed, so no job has lost an attempt and no data " +
+        "is missing. Work resumes on its own once this clears.</div>";
+    }
+    html += "<h2>Can it spend?</h2>" + gateCards(gate);
+    html += "<h2>This month, by provider</h2>" + providerTable(d.by_provider);
+    html += "<h2>This month, by component</h2>" + componentTable(d.by_component);
+    out.innerHTML = html;
+    stamp.textContent = "loaded " + new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
+  }
+
+  function load() {
+    var key = document.getElementById("key").value.trim();
+    if (!key) { out.innerHTML = '<div class="err">enter WORKER_API_KEY</div>'; return; }
+    out.innerHTML = '<p class="empty">loading…</p>';
+    fetch("/budget/spend", { headers: { "X-API-Key": key } })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status + " — " + r.statusText);
+        return r.json();
+      })
+      .then(render)
+      .catch(function (e) {
+        out.innerHTML = '<div class="err">' + esc(e.message) + "</div>";
+      });
+  }
+
+  document.getElementById("go").addEventListener("click", load);
+  document.getElementById("key").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") load();
+  });
+})();
+</script>
+</body>
+</html>

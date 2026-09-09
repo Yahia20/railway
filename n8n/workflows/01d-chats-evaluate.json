@@ -42,7 +42,8 @@
           "name": "railway-pg"
         }
       },
-      "alwaysOutputData": true
+      "alwaysOutputData": true,
+      "executeOnce": true
     },
     {
       "id": "recover-leases",
@@ -64,7 +65,8 @@
           "name": "railway-pg"
         }
       },
-      "alwaysOutputData": true
+      "alwaysOutputData": true,
+      "executeOnce": true
     },
     {
       "id": "claim-work",
@@ -86,7 +88,8 @@
           "name": "railway-pg"
         }
       },
-      "notes": "Returns nothing when there is no work, which ends the execution here. That is the intended idle path -- no IF node required."
+      "notes": "Returns nothing when there is no work, which ends the execution here. That is the intended idle path -- no IF node required.",
+      "executeOnce": true
     },
     {
       "id": "load-thread",
@@ -99,7 +102,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- The thread as the judge must read it: every message, in the order it was\n-- sent.\n--\n-- ORDERED BY sent_at, NOT seq. 01c renumbers seq after every batch, and a\n-- thread read mid-renumber must still come out in the order the messages were\n-- actually sent. seq is the tie-break only.\n--\n-- TIMESTAMPS RENDERED EXPLICITLY IN UTC WITH THE OFFSET SPELLED OUT.\n-- to_jsonb() on a timestamptz renders it in the session TimeZone, which n8n\n-- does not set, so the same row could be handed to the worker as +03 today and\n-- +00 tomorrow. after_hours converts before comparing (gotcha 11), which it\n-- can only do if the offset actually arrives.\nSELECT i.interaction_id::text AS interaction_id,\n       i.external_id,\n       i.channel::text        AS channel,\n       coalesce(jsonb_agg(\n         jsonb_build_object(\n           'seq',     m.seq,\n           'sender',  m.sender::text,\n           'body',    m.body,\n           'sent_at', to_char(m.sent_at AT TIME ZONE 'UTC',\n                              'YYYY-MM-DD\"T\"HH24:MI:SS') || '+00:00'\n         ) ORDER BY m.sent_at, m.seq\n       ) FILTER (WHERE m.message_id IS NOT NULL), '[]'::jsonb) AS messages\nFROM interactions i\nLEFT JOIN chat_messages m ON m.interaction_id = i.interaction_id\nWHERE i.interaction_id = $1::uuid\nGROUP BY i.interaction_id, i.external_id, i.channel;",
+        "query": "-- The thread as the judge must read it: every message, in the order it was\n-- sent.\n--\n-- ORDERED BY sent_at, NOT seq. 01c renumbers seq after every batch, and a\n-- thread read mid-renumber must still come out in the order the messages were\n-- actually sent. seq is the tie-break only.\n--\n-- TIMESTAMPS RENDERED EXPLICITLY IN UTC WITH THE OFFSET SPELLED OUT.\n-- to_jsonb() on a timestamptz renders it in the session TimeZone, which n8n\n-- does not set, so the same row could be handed to the worker as +03 today and\n-- +00 tomorrow. after_hours converts before comparing (gotcha 11), which it\n-- can only do if the offset actually arrives.\n--\n-- AN AUTOMATION'S TURNS ARE RELABELLED **AND REDACTED** (019).\n--\n-- Bitrix user 1 posts two things and neither was ever sent to a customer:\n-- 294 copies of the PROMPT it sends its own model (\"generate a short, natural\n-- follow-up message in Saudi Arabic ...\") and 863 bare thumbs-up reactions.\n--\n-- Relabelling alone is not enough, and it is worth being exact about why.\n-- `Conversation.transcript_text()` renders EVERY turn as\n-- \"[ts] SENDER: body\", bot turns included, so a turn merely relabelled to\n-- 'bot' still puts those instructions inside the judge's prompt. That is\n-- rule 8's failure — prose addressed to a model, inside a model's input —\n-- arriving through a door nobody was watching. The body has to go too.\n--\n-- REDACTED, NOT DELETED. An automated turn still sits between a customer's\n-- question and the agent's answer, and removing the row would close a response\n-- gap that really was that long (011 makes the same point about attachments).\n-- The turn keeps its timestamp and its place; only the text is withheld.\n--\n-- DRIVEN OFF `agents.is_bot`, never a hardcoded id, so silencing the next\n-- automation somebody wires up is one UPDATE and no deploy. Genuine\n-- qualification-bot turns are stored with sender='bot' already and are NOT\n-- touched: this CASE only fires on sender='agent'.\nSELECT i.interaction_id::text AS interaction_id,\n       i.external_id,\n       i.channel::text        AS channel,\n       coalesce(jsonb_agg(\n         jsonb_build_object(\n           'seq',     m.seq,\n           'sender',  CASE WHEN m.sender = 'agent' AND a.is_bot\n                           THEN 'bot' ELSE m.sender::text END,\n           'body',    CASE WHEN m.sender = 'agent' AND a.is_bot\n                           THEN '[automated system turn - content withheld]'\n                           ELSE m.body END,\n           'sent_at', to_char(m.sent_at AT TIME ZONE 'UTC',\n                              'YYYY-MM-DD\"T\"HH24:MI:SS') || '+00:00'\n         ) ORDER BY m.sent_at, m.seq\n       ) FILTER (WHERE m.message_id IS NOT NULL), '[]'::jsonb) AS messages\nFROM interactions i\nLEFT JOIN chat_messages m ON m.interaction_id = i.interaction_id\nLEFT JOIN agents a        ON a.bitrix_user_id = m.sender_external_id\nWHERE i.interaction_id = $1::uuid\nGROUP BY i.interaction_id, i.external_id, i.channel;",
         "options": {
           "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id ] }}"
         }
@@ -599,6 +602,193 @@
       },
       "alwaysOutputData": true,
       "notes": "Identical to Mark judge failed -- retryable, backed off, dead-lettered after 3 attempts. A separate node only because the reason text has to be read from a node that ran on THIS branch: 'Two AI passes' never runs when prepare is what failed, and an expression naming a node with no run data silently yields nothing (gotcha 5)."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The computed metrics, stored where the scorecard can find them.\n--\n-- WHY THIS NODE EXISTS. /chats/prepare has ALWAYS returned a `metrics` object:\n-- the worker derives it from message timestamps in evaluate/metrics.py, which\n-- is the only place that rule is allowed to live (rule 3 -- never ask a model\n-- for a number you can compute, and never keep a second copy of the rule in\n-- SQL). Nothing ever stored the answer. `interaction_metrics` therefore had no\n-- writer at all, and v_agent_scorecard -- which LEFT JOINs it for\n-- first_response_seconds -- reported NULL response times for every agent.\n--\n-- NOTHING IS RECOMPUTED HERE. Every value is read straight out of the worker's\n-- response; this node is storage, not a second implementation.\n--\n-- FENCED, like every other durable write in this workflow: an execution whose\n-- lease was recovered underneath it must not overwrite the new owner's\n-- numbers. MATERIALIZED + FOR UPDATE takes a real row lock, so there is no\n-- read-then-write window for the recovery sweep to slip through.\nWITH lease AS MATERIALIZED (\n  SELECT j.interaction_id\n    FROM chat_eval_jobs j\n   WHERE j.interaction_id = $1::uuid\n     AND j.claim_token    = $2::uuid\n     AND j.status         = 'evaluating'\n     AND j.claim_until    > now()\n   FOR UPDATE\n), m AS (\n  SELECT $3::jsonb AS j\n)\nINSERT INTO interaction_metrics (\n  interaction_id, first_response_seconds, median_response_seconds,\n  max_response_gap_seconds, agent_talk_ratio, customer_message_count,\n  agent_message_count, conversation_span_seconds, after_hours,\n  language_matched, computed_at)\nSELECT lease.interaction_id,\n       (m.j->>'first_response_seconds')::int,\n       (m.j->>'median_response_seconds')::int,\n       (m.j->>'max_response_gap_seconds')::int,\n       (m.j->>'agent_talk_ratio')::numeric,\n       coalesce((m.j->>'customer_message_count')::int, 0),\n       coalesce((m.j->>'agent_message_count')::int, 0),\n       (m.j->>'conversation_span_seconds')::int,\n       (m.j->>'after_hours')::boolean,\n       (m.j->>'language_matched')::boolean,\n       now()\n  FROM lease, m\nON CONFLICT (interaction_id) DO UPDATE SET\n  first_response_seconds    = EXCLUDED.first_response_seconds,\n  median_response_seconds   = EXCLUDED.median_response_seconds,\n  max_response_gap_seconds  = EXCLUDED.max_response_gap_seconds,\n  agent_talk_ratio          = EXCLUDED.agent_talk_ratio,\n  customer_message_count    = EXCLUDED.customer_message_count,\n  agent_message_count       = EXCLUDED.agent_message_count,\n  conversation_span_seconds = EXCLUDED.conversation_span_seconds,\n  after_hours               = EXCLUDED.after_hours,\n  language_matched          = EXCLUDED.language_matched,\n  computed_at               = now()\nRETURNING interaction_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id, $('Claim work').item.json.claim_token, JSON.stringify($('Prepare chat input').item.json.metrics || {}) ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2420,
+        20
+      ],
+      "id": "c53b8e10-7d4a-4a19-9f62-2b7c14d6a3e8",
+      "name": "Store metrics",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The follow-up QUEUE for chats. Same function, same stamping discipline as\n-- workflow 02 uses for calls.\n--\n-- WHY THIS DID NOT EXIST. `evaluate_alert_rules(uuid)` reads\n-- interaction_analysis and interactions and has never known what a call is —\n-- it was channel-agnostic from the day it was written. Only 02 ever called it,\n-- so every alert in the database is a call alert: all 25 occurrences are\n-- `phone_call`. With calls paused that leaves the follow-up queue completely\n-- dark, which is the opposite of what an alerting table is for.\n--\n-- NOT BEST EFFORT. This node runs AFTER the job is terminal, and a terminal\n-- job is never claimed again — so a transient failure here would lose that\n-- thread's occurrences permanently and silently. `alerts_evaluated_at` is set\n-- in the SAME statement as the evaluation, so it cannot claim work that did\n-- not happen, and `v_chat_alerts_pending` (019) lists any thread judged but\n-- never alert-evaluated.\n--\n-- NO LEASE TO CARRY: `Mark evaluated` has already released it. The fence is\n-- instead `status = 'evaluated' AND claim_token IS NULL`, which is only true\n-- once, and FOR UPDATE makes the read-and-stamp atomic.\n-- lease-exempt: runs after the terminal transition, which has released the\n-- lease; the status+claim_token predicate under FOR UPDATE is the fence.\nWITH job AS MATERIALIZED (\n  SELECT j.interaction_id\n    FROM chat_eval_jobs j\n   WHERE j.interaction_id = $1::uuid\n     AND j.status         = 'evaluated'\n     AND j.claim_token IS NULL\n   FOR UPDATE\n),\nfired AS (\n  SELECT o.*\n    FROM job\n    CROSS JOIN LATERAL evaluate_alert_rules(job.interaction_id) o\n),\nstamped AS (\n  UPDATE chat_eval_jobs j\n     SET alerts_evaluated_at = now(),\n         updated_at          = now()\n    FROM job\n   WHERE j.interaction_id = job.interaction_id\n  RETURNING j.interaction_id, j.alerts_evaluated_at\n)\nSELECT s.interaction_id,\n       s.alerts_evaluated_at,\n       o.occurrence_id,\n       o.rule_code,\n       o.rule_version,\n       o.delivery_status,\n       o.fact_snapshot,\n       o.created_at,\n       i.started_at,\n       i.customer_phone_e164,\n       coalesce(a.full_name, 'unassigned') AS agent_name\n  FROM stamped s\n  LEFT JOIN fired o        ON o.interaction_id = s.interaction_id\n                          AND o.delivery_status = 'pending'\n  LEFT JOIN interactions i ON i.interaction_id = s.interaction_id\n  LEFT JOIN agents a       ON a.agent_id = i.agent_id\n ORDER BY o.created_at, o.rule_code;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim work').item.json.interaction_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3080,
+        100
+      ],
+      "id": "f2a9c471-6b30-4e58-8d15-90c3e7a2b6d4",
+      "name": "Evaluate alert rules",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://railway-production-d648.up.railway.app/budget/preflight",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ providers: [\"deepseek\"] }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -660,
+        300
+      ],
+      "id": "b1d0c9a4-3e77-4b21-9a56-7f0e2c4d8a11",
+      "name": "Check budget",
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: pipeline-wide state, not per-job work. It claims no job, so\n-- there is no lease to carry; ON CONFLICT makes a concurrent identical probe\n-- idempotent.\n-- Persist what the probe found. ONE statement, because a parameterised query\n-- may carry only one command -- and because the verdict has to be read in a\n-- SEPARATE statement to see this write at all (a CTE would share this\n-- snapshot and read the pre-update row, which is precisely the bug workflow\n-- 03 shipped).\n--\n-- THE WORKER PROBES, N8N WRITES (rule 11). app/budget.py computes; this is the\n-- single write path into provider_status.\nINSERT INTO provider_status\n  (provider, checked_at, available, reason, balance_usd, spend_mtd_usd, raw)\nSELECT e.key,\n       now(),\n       (e.value->>'available')::boolean,\n       e.value->>'reason',\n       nullif(e.value->>'balance_usd', '')::numeric,\n       nullif(e.value->>'spend_mtd_usd', '')::numeric,\n       coalesce(e.value->'raw', '{}'::jsonb)\n  FROM jsonb_each($1::jsonb) AS e\nON CONFLICT (provider) DO UPDATE\n   SET checked_at    = EXCLUDED.checked_at,\n       available     = EXCLUDED.available,\n       reason        = EXCLUDED.reason,\n       balance_usd   = EXCLUDED.balance_usd,\n       spend_mtd_usd = EXCLUDED.spend_mtd_usd,\n       raw           = EXCLUDED.raw\nRETURNING provider, available;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.providers || {}) ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -440,
+        300
+      ],
+      "id": "c1d0c9a4-3e77-4b21-9a56-7f0e2c4d8a11",
+      "name": "Record provider status",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "gate-may-run",
+              "leftValue": "={{ $json.may_run }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -120,
+        300
+      ],
+      "id": "d1d0c9a4-3e77-4b21-9a56-7f0e2c4d8a11",
+      "name": "May we spend?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: a run log entry, not durable per-job data. Nothing was\n-- claimed, so there is no lease to carry and nothing another worker could\n-- overwrite.\n-- The run happened; it just did not spend anything. Say so, every cycle.\n--\n-- WHY A ROW AND NOT SILENCE. An automated pipeline that stops and says nothing\n-- is indistinguishable from one that is broken, and from one that had no work.\n-- This row is what /report and /spend read to tell an operator \"the pipeline\n-- is fine, the account is empty\" — with the provider's own words in `error`.\n--\n-- NOTHING WAS CLAIMED. status = 'skipped', not 'failed': no job changed state,\n-- no attempt was spent, nothing is missing. When the money returns the queue\n-- is exactly as it was, and the next tick picks it up with no backfill needed.\nINSERT INTO job_runs (job_name, status, started_at, finished_at,\n                      items_in, items_ok, items_failed, error, detail)\nSELECT $1::text,\n       'skipped'::job_status,\n       now(), now(),\n       (SELECT count(*) FROM chat_eval_jobs\n         WHERE status IN ('pending', 'judge_failed')),\n       0, 0,\n       $2::text,\n       jsonb_build_object('gate', 'provider_budget',\n                          'provider', 'deepseek',\n                          'reason', $2::text)\nRETURNING run_id, job_name, status, error;",
+        "options": {
+          "queryReplacement": "={{ [ \"chats_judge\", $json.reason || 'blocked' ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -120,
+        500
+      ],
+      "id": "e1d0c9a4-3e77-4b21-9a56-7f0e2c4d8a11",
+      "name": "Log blocked run",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- multi-item: a plain read of one row; running it per input item is harmless\n-- and the upstream write returns exactly one row anyway.\n-- The verdict. A SEPARATE statement so it sees the write above, and a read of\n-- v_pipeline_gate rather than a re-derivation, so the POLICY -- cap reached?\n-- balance gone? provider switched off? -- lives in exactly one place.\n--\n-- Fails CLOSED: the view returns may_run = false for a provider whose balance\n-- we can check and have not, so a probe that never answered stops the spend\n-- instead of waving it through.\nSELECT provider, may_run, reason, spend_mtd_usd, monthly_cap_usd, balance_usd\n  FROM v_pipeline_gate\n WHERE provider = 'deepseek';",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -330,
+        300
+      ],
+      "id": "a9f1c3d2-5b48-4e60-8c17-2d9b6e0f4a31",
+      "name": "Read budget gate",
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true
     }
   ],
   "connections": {
@@ -731,7 +921,7 @@
       "main": [
         [
           {
-            "node": "Assess deal",
+            "node": "Store metrics",
             "type": "main",
             "index": 0
           }
@@ -771,7 +961,7 @@
       "main": [
         [
           {
-            "node": "Register due threads",
+            "node": "Check budget",
             "type": "main",
             "index": 0
           }
@@ -780,7 +970,13 @@
     },
     "Mark evaluated": {
       "main": [
-        []
+        [
+          {
+            "node": "Evaluate alert rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Record model cost": {
@@ -826,6 +1022,68 @@
     "Mark prepare failed": {
       "main": [
         []
+      ]
+    },
+    "Store metrics": {
+      "main": [
+        [
+          {
+            "node": "Assess deal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check budget": {
+      "main": [
+        [
+          {
+            "node": "Record provider status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record provider status": {
+      "main": [
+        [
+          {
+            "node": "Read budget gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "May we spend?": {
+      "main": [
+        [
+          {
+            "node": "Register due threads",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log blocked run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read budget gate": {
+      "main": [
+        [
+          {
+            "node": "May we spend?",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     }
   },

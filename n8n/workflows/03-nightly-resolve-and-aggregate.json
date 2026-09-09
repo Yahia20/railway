@@ -13,7 +13,7 @@
         }
       },
       "id": "sched",
-      "name": "02:00 daily",
+      "name": "03:40 daily (after 04)",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [
@@ -25,7 +25,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- STEP 1 — resolve identity on phone (certain match).\n-- Creates a customer for any phone we have never seen, then attaches every\n-- unlinked interaction carrying that phone.\nWITH new_people AS (\n  INSERT INTO customers (primary_phone_e164, first_seen_at, last_seen_at)\n  SELECT DISTINCT i.customer_phone_e164, min(i.started_at), max(i.started_at)\n  FROM interactions i\n  WHERE i.customer_id IS NULL\n    AND i.customer_phone_e164 IS NOT NULL\n    AND NOT EXISTS (\n      SELECT 1 FROM customers c WHERE c.primary_phone_e164 = i.customer_phone_e164\n    )\n  GROUP BY i.customer_phone_e164\n  ON CONFLICT (primary_phone_e164) DO NOTHING\n  RETURNING customer_id, primary_phone_e164\n),\nident AS (\n  INSERT INTO customer_identities (customer_id, kind, value, method, confidence)\n  SELECT customer_id, 'phone'::identity_kind, primary_phone_e164,\n         'exact_phone'::match_method, 1.00\n  FROM new_people\n  ON CONFLICT (kind, value) DO NOTHING\n  RETURNING customer_id\n)\nUPDATE interactions i\nSET customer_id = c.customer_id\nFROM customers c\nWHERE i.customer_id IS NULL\n  AND i.customer_phone_e164 = c.primary_phone_e164;",
+        "query": "-- STEP 1 — resolve identity on phone (certain match).\n--\n-- THREE STATEMENTS, NOT ONE. This was a single statement with the customer\n-- INSERT in a data-modifying CTE and the interaction UPDATE as the main query.\n-- Postgres executes every sub-statement of a WITH against the SAME snapshot,\n-- so the UPDATE could not see the customers the CTE had just inserted. The\n-- observable result: the first run created 984 customers and linked 0\n-- conversations, and the link only happened the NEXT night. Identity was\n-- permanently one run behind, and on a fresh database it looked simply broken.\n--\n-- Separate statements get separate snapshots, so 1c sees 1a.\n\n-- 1a · a customer for every phone we have never seen before.\nINSERT INTO customers (primary_phone_e164, first_seen_at, last_seen_at)\nSELECT i.customer_phone_e164, min(i.started_at), max(i.started_at)\n  FROM interactions i\n WHERE i.customer_id IS NULL\n   AND i.customer_phone_e164 IS NOT NULL\n   AND NOT EXISTS (SELECT 1 FROM customers c\n                    WHERE c.primary_phone_e164 = i.customer_phone_e164)\n GROUP BY i.customer_phone_e164\nON CONFLICT (primary_phone_e164) DO NOTHING;\n\n-- 1b · the audit trail: how this phone was matched, and how sure we are.\n--\n--      ONLY PHONES THIS PIPELINE ACTUALLY MATCHED. Driving this off the whole\n--      `customers` table would stamp 'exact_phone, confidence 1.00' onto every\n--      customer with a phone, including rows created by an import or by hand —\n--      inventing a provenance record for a match that never happened. This\n--      table IS the identity-resolution audit log (002); a fabricated row in\n--      it makes a bad merge undiscoverable, which is the one job it has.\n--\n--      So: restricted to customers whose phone is carried by a conversation,\n--      which is the only evidence this step ever has. Idempotent on\n--      (kind, value), and separate from 1a for the snapshot reason above.\nINSERT INTO customer_identities (customer_id, kind, value, method, confidence)\nSELECT DISTINCT c.customer_id, 'phone'::identity_kind, c.primary_phone_e164,\n       'exact_phone'::match_method, 1.00\n  FROM customers c\n  JOIN interactions i ON i.customer_phone_e164 = c.primary_phone_e164\n WHERE c.primary_phone_e164 IS NOT NULL\nON CONFLICT (kind, value) DO NOTHING;\n\n-- 1c · attach every unlinked conversation carrying that phone.\nUPDATE interactions i\n   SET customer_id = c.customer_id, updated_at = now()\n  FROM customers c\n WHERE i.customer_id IS NULL\n   AND i.customer_phone_e164 = c.primary_phone_e164\nRETURNING i.interaction_id, i.customer_id;",
         "options": {}
       },
       "id": "resolve",
@@ -42,7 +42,8 @@
           "name": "railway-pg (api)"
         }
       },
-      "notes": "Phone match only — it is the one match that is certain. CRM-id and fuzzy-name matching are deliberately NOT automated: a wrong merge is expensive to undo and every match is written to customer_identities with its method and confidence."
+      "notes": "Phone match only — it is the one match that is certain. CRM-id and fuzzy-name matching are deliberately NOT automated: a wrong merge is expensive to undo and every match is written to customer_identities with its method and confidence.",
+      "alwaysOutputData": true
     },
     {
       "parameters": {
@@ -55,7 +56,7 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        -160,
+        20,
         300
       ],
       "credentials": {
@@ -63,7 +64,9 @@
           "id": "eYWvPxQFAwKs0bOu",
           "name": "railway-pg (api)"
         }
-      }
+      },
+      "alwaysOutputData": true,
+      "executeOnce": true
     },
     {
       "parameters": {
@@ -76,7 +79,7 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        60,
+        240,
         300
       ],
       "credentials": {
@@ -84,7 +87,9 @@
           "id": "eYWvPxQFAwKs0bOu",
           "name": "railway-pg (api)"
         }
-      }
+      },
+      "alwaysOutputData": true,
+      "executeOnce": true
     },
     {
       "parameters": {
@@ -97,7 +102,7 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        280,
+        460,
         300
       ],
       "credentials": {
@@ -106,7 +111,8 @@
           "name": "railway-pg (api)"
         }
       },
-      "notes": "Truncate and rebuild. customer_metrics is fully derived, so it can always be dropped and recomputed — which is what stops a wrong dashboard number from becoming permanent."
+      "notes": "Truncate and rebuild. customer_metrics is fully derived, so it can always be dropped and recomputed — which is what stops a wrong dashboard number from becoming permanent.",
+      "executeOnce": true
     },
     {
       "parameters": {
@@ -121,7 +127,7 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        500,
+        680,
         300
       ],
       "credentials": {
@@ -129,26 +135,39 @@
           "id": "eYWvPxQFAwKs0bOu",
           "name": "railway-pg (api)"
         }
-      }
+      },
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- STEP 2 — who handled each conversation (migration 018).\n--\n-- Runs BEFORE promises are materialised because \"Materialise promises\" filters\n-- on `i.agent_id IS NOT NULL`. While agent_id was NULL everywhere that filter\n-- matched zero rows on every run, which is the entire reason `follow_ups` sat\n-- at 0 while pass 1 had been extracting promises the whole time.\n--\n-- Idempotent and cheap: every UPDATE inside is guarded by IS DISTINCT FROM, so\n-- a night that changes nothing writes nothing.\nSELECT link_agent_attribution() AS attribution;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -270,
+        300
+      ],
+      "id": "a7c1e4d2-0b53-4f77-9c31-8d2f6b0a1e94",
+      "name": "Link agent attribution",
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      },
+      "alwaysOutputData": true,
+      "executeOnce": true
     }
   ],
   "connections": {
-    "02:00 daily": {
-      "main": [
-        [
-          {
-            "node": "Resolve identity (phone)",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Resolve identity (phone)": {
       "main": [
         [
           {
-            "node": "Materialise promises",
+            "node": "Link agent attribution",
             "type": "main",
             "index": 0
           }
@@ -182,6 +201,28 @@
         [
           {
             "node": "Log run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Link agent attribution": {
+      "main": [
+        [
+          {
+            "node": "Materialise promises",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "03:40 daily (after 04)": {
+      "main": [
+        [
+          {
+            "node": "Resolve identity (phone)",
             "type": "main",
             "index": 0
           }

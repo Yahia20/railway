@@ -41,6 +41,8 @@ GATE_TYPES = ("n8n-nodes-base.if", "n8n-nodes-base.switch")
 # write matched nothing, n8n substitutes a `{success:true}` placeholder and the
 # field the expression wanted is simply absent.
 JSON_REF_RE = re.compile(r"\$json\b")
+# Opt-out for a parameterless statement that really is meant to run per row.
+MULTI_ITEM_RE = re.compile(r"--\s*multi-item:", re.IGNORECASE)
 # A statement that can match nothing. `ON CONFLICT ... DO UPDATE` with no WHERE
 # always returns its row, so it is NOT conditional -- calling it one would
 # demand a gate on every plain upsert in the repo and teach people to ignore
@@ -404,6 +406,63 @@ def check_lease_fencing(nodes: list, rep: Report) -> None:
              % (fenced, locked, fence_exempt, exempt))
 
 
+def check_execute_once(nodes: list, connections: dict, rep: Report) -> None:
+    """A whole-table statement must not run once per upstream row.
+
+    An n8n Postgres node executes its query ONCE PER INPUT ITEM. That is right
+    for a statement parameterised per item -- `WHERE interaction_id = $1` wants
+    to run for each id. It is wrong, and invisible, for a statement that has no
+    parameters at all: those describe work over the whole table, and running
+    them N times does the same work N times.
+
+    This is not hypothetical. `job_runs` accumulated 2,630 rows, of which 2,622
+    were one nightly_health row written 2,622 times in a single night -- once
+    per row the upstream `Purge raw content` returned. The two nights before it
+    wrote 6 and 1. It scales with the data, so it looks fine until it does not,
+    and nothing in the run log says which of the 2,622 was the real one.
+
+    The rule: a Postgres node whose SQL contains no `$N` placeholder, and which
+    is not fed directly by a trigger (triggers emit exactly one item), must set
+    `executeOnce: true` -- or say why not with `-- multi-item: <reason>`, for
+    the rare statement that really is meant to run per row without taking a
+    parameter.
+    """
+    trigger_fed = set()
+    for name, conn in connections.items():
+        src = next((n for n in nodes if n["name"] == name), None)
+        if src and "trigger" in src.get("type", "").lower():
+            for _, target in outgoing(connections, name):
+                trigger_fed.add(target)
+
+    checked = exempt = 0
+    for node in nodes:
+        if node.get("type") != POSTGRES_TYPE:
+            continue
+        sql = sql_of(node)
+        if not sql:
+            continue
+        body = strip_sql_comments(sql)
+        if re.search(r"\$\d", body):
+            continue                      # parameterised: per-item is correct
+        if node["name"] in trigger_fed:
+            continue                      # a trigger emits exactly one item
+        if MULTI_ITEM_RE.search(sql):
+            exempt += 1
+            reason = MULTI_ITEM_RE.split(sql, 1)[1].strip().splitlines()[0]
+            rep.note("%s: multi-item -- %s" % (node["name"], reason.strip()))
+            continue
+        checked += 1
+        if not node.get("executeOnce"):
+            rep.error("%s takes no $-parameter, so it is a whole-table statement, "
+                      "but executeOnce is not set. n8n runs a Postgres node once "
+                      "per input item, so this runs once per row the upstream node "
+                      "returned. Set executeOnce, or declare "
+                      "'-- multi-item: <reason>' in the query."
+                      % node["name"])
+    rep.note("executeOnce: %d whole-table node(s) checked, %d declared multi-item"
+             % (checked, exempt))
+
+
 def check_query_replacement(nodes: list, rep: Report) -> None:
     """queryReplacement must use the ARRAY form.
 
@@ -597,6 +656,7 @@ def check_file(path: str, args) -> bool:
     check_returning(nodes, connections, rep)
     check_returning_gates(nodes, connections, rep)
     check_lease_fencing(nodes, rep)
+    check_execute_once(nodes, connections, rep)
     check_query_replacement(nodes, rep)
     check_branch_isolation(nodes, connections, rep)
     check_always_output_data(nodes, connections, rep)

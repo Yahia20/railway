@@ -83,31 +83,146 @@ call.
 | health check | `job_runs.status` is an enum; an unqualified CASE yields text. The node that reports whether anything got judged was the only one that could not run. |
 | timeouts became verdicts | `Prepare chat input` is `continueRegularOutput`, so a timeout left `should_evaluate` undefined and `Scoreable?` routed to **terminal** `unscoreable`. 20 threads written off permanently by a slow HTTP call. Gated; the 20 were revived (5 genuine ones left alone). |
 
+### 2026-09-07, second pass — the judge bug found, agents attributed
+
+**THE JUDGE WAS RETURNING AN EMPTY STRING, and one variable caused it.**
+`DEEPSEEK_THINKING=omit` on the worker **deletes** the `thinking` field from
+the request instead of sending `{"type":"disabled"}`. `deepseek-v4-flash`
+defaults to thinking ON, so every judge call burned its whole 8,000-token
+budget on hidden reasoning and returned `''`. Measured on the real pass-1
+prompt:
+
+```
+omit      57.4s  finish_reason=length  content=''            8000 reasoning tokens
+disabled   4.0s  finish_reason=stop    2621 chars of JSON     837 completion tokens
+```
+
+That is 82 of the 135 chat dead-letters directly ("model did not return valid
+JSON … got `''`"), plus the 18 × `timeout of 300000ms` and 28 × `socket hang
+up` that 57-second calls produce. It is also **6× the cost**: 1,953 output
+tokens per conversation with thinking off against 11,863 with it on, so
+$0.0013/conversation not $0.0080. `DEFAULT_THINKING` in `judge.py` has always
+been `"disabled"` — the env var was overriding the correct default with a value
+that means "send nothing".
+
+**Fixed in the repo, applied to the database, NOT yet deployed** (the deploy and
+the Railway variable were both blocked by a permission classifier — run them by
+hand):
+
+| | what |
+|---|---|
+| **018** | agent roster + attribution. Applied. |
+| 03 | resolver split into 3 statements; `link_agent_attribution()` added; `alwaysOutputData` on the nightly mutations |
+| 04 | `deals.assigned_by_id` written from `ASSIGNED_BY_ID` |
+| 01d | new fenced `Store metrics` node — `interaction_metrics` had no writer at all |
+
+```bash
+railway variables --service railway --set DEEPSEEK_THINKING=disabled
+python scripts/n8n_deploy.py 03 04 01d --activate
+python scripts/revive_chat_dead_letters.py --apply      # AFTER the variable is live
+```
+
+### 2026-09-09, third pass — production hardening
+
+**Nothing from the second pass was deployed**, so the empty-judge bug ran two
+more nights: chat dead-letters went **135 → 332**. The three commands below are
+still the whole unblock.
+
+**`executeOnce` was missing on every whole-table node, and that is systemic.**
+An n8n Postgres node runs its query **once per input item**. A statement with
+no `$N` placeholder is whole-table work, so it ran once per row the upstream
+node returned. Measured: `job_runs` holds 2,630 rows, of which **2,622 are one
+`nightly_health` row written 2,622 times in a single night**. The night before
+it was 6, the night before that 1 — it scales with the data.
+
+Worst instance: 01d's `Claim work` has `LIMIT 10` and is third in a
+Register → Recover → Claim chain, so it claimed **ten jobs per registered
+thread** instead of ten per tick. Hundreds of concurrent judge calls against a
+0.5 GB worker is where the `socket hang up` and `timeout of 300000ms` dead
+letters came from — a second, independent cause alongside the thinking bug.
+Workflow 02 always had this right; 01d lost it when it was derived from 02.
+
+`check_workflow_json.py` now has a `check_execute_once` rule so this cannot
+regress, and it found the two 01d cases on its first run.
+
+**An automation was being graded as a salesperson, and injecting into the judge.**
+Bitrix user 1 has 1,157 turns stored as `sender = 'agent'`: 294 copies of the
+PROMPT it sends its own model ("generate a short, natural follow-up message in
+Saudi Arabic …") and 863 bare 👍 reactions. Neither was ever sent to a
+customer. That text went into pass 1 and pass 2 as agent speech — rule 8's
+prompt-injection failure through a door nobody was watching — and the account
+sat top of `v_agent_scorecard` with the worst average in the company (21.9).
+
+Fixed by one flag: `agents.is_bot`. 01d's `Load thread` relabels such turns to
+`bot` **and withholds the body** — relabelling alone was not enough, because
+`transcript_text()` renders bot turns verbatim. The turn is kept, not deleted,
+so the response gap it sits in stays the length it really was.
+
+**Silencing the next automation is one line, no deploy:**
+```sql
+UPDATE agents SET is_bot = true WHERE bitrix_user_id = '<id>';
+```
+
+**Alerts only ever ran for calls.** `evaluate_alert_rules(uuid)` was always
+channel-agnostic but only 02 called it, so all 25 occurrences were
+`phone_call`. With calls paused the follow-up queue was completely dark. 01d
+now evaluates them with the same stamp-and-fence discipline, the 40 already-
+judged threads were backfilled (5 occurrences fired), and
+`v_chat_alerts_pending` + a `/report` panel make a dropped tick visible.
+
+**Also fixed:** 03's step 1b was stamping `exact_phone, confidence 1.00` onto
+every customer with a phone rather than only those it matched — fabricated rows
+in the one table that makes a bad merge discoverable. `deals.source_channel`
+and `deals.assigned_by_id` now get written from fields that were already being
+fetched and dropped. `Store metrics` fails soft, because a failure there would
+cost a second paid judge run for an answer already stored.
+
+**The roster is out of the repo.** 018 no longer inlines 48 real names (rule
+7). `local-reports/agent_roster.json` is gitignored; `scripts/build_roster.py`
+rebuilds it from REST ⋈ CSV and `scripts/seed_agents.py` applies it. The seed
+turns `is_bot` **on but never off**, so a rebuild cannot un-flag an automation.
+Onboarding someone is now one line of JSON, not a migration.
+
+**Agent attribution now exists.** `user.get` really is refused
+(`insufficient_scope`), but `crm.deal.list` returns `ASSIGNED_BY_ID` and the
+manual `DEAL_*.csv` export renders the same deal's owner as a NAME. Joining the
+two on the deal id recovered **48 users, every one at confidence 1.00** —
+17,708 deals from REST against 17,707 from the export, 17,575 joined. `scripts/seed_agents.py` seeds them from the gitignored roster;
+`link_agent_attribution()` then attributes threads from
+`chat_messages.sender_external_id` (who actually typed) and falls back to the
+deal owner. Result: **970 of 987 chat threads and 673 deals** carry an agent.
+`scripts/backfill_deal_owners.py` replays the whole thing.
+
+Ids **30 and 20114** are both "Travelgate AI" — flagged `is_bot`, which is the
+only thing keeping the bot out of `v_agent_scorecard`. Id **1** is "Cultiv
+Developer", the integration account: `is_active = false`, and the attribution
+rule ranks it last so it only wins a thread no human touched.
+
 **Still open**
 
-1. **The judge is timing out, and that is now the biggest problem.** Of the
-   first night: 28 `judge_failed` and 8 `dead_letter` on `timeout of 300000ms`,
-   18 `dead_letter` on `socket hang up`, 27 `dead_letter` on "pass 1 could not
-   be produced". 68 threads are dead-lettered and 389 still pending. The
-   classification is now correct — these are retryable and backed off — but the
-   root cause is not fixed. Look at `DEEPSEEK_MODEL=deepseek-v4-flash`, the
-   `batchSize: 2 / batchInterval: 1500` on `Two AI passes`, and whether 10 jobs
-   a tick is simply more than the worker can hold open at once.
-2. **RTFx is still unmeasured.** Modal is deployed and its first run wrote an
-   `asr_runs` row, but it claimed 0 recordings so `rtfx` came back 0. Every
-   Modal cost figure still assumes 120; the first batch with real work settles
-   it, because `rtfx` is a generated column over `audio_seconds / gpu_seconds`.
-   Useful datum meanwhile: a run with **nothing to do costs 0.7 GPU-seconds**,
-   so the nightly schedule is effectively free on quiet nights.
-3. **`customers` is 0 and `follow_ups` is 0.** 04 has never completed a real
-   write and 03 depends on the phones 04 backfills. Both should change on the
-   03:20/03:40 run — that is the first thing to check.
-4. **`user.get` is not in the webhook's scope** (only `crm` is). Nothing uses
-   it today; agent names would.
-5. **DPA / PDPL** before customer audio leaves for any processor.
+1. **The calls source has been dry since 2026-08-19.** Drive holds 1,119 files
+   / 1,064 unique recordings and the newest is 19 days old. All 1,064 are
+   already registered and terminal, so nothing is stranded — this is upstream.
+   Ask whether the PBX stopped uploading or the folder/credential changed.
+2. **Calls cannot be scored per agent, at all.** All 1,119 filenames decode to
+   `agent_extension = 3009` — a queue, not a person. 616 of the 623 promises
+   pass 1 has extracted sit in call transcripts and can never become
+   `follow_ups` rows. The PBX must record the answering extension; two channels
+   would fix diarization at the same time (gotcha 10). Until then **chats carry
+   the sales-quality numbers and calls do not**.
+3. **Modal has $0.99 left of its $30/month free credit** and no *scheduled* run
+   has fired yet (the one `asr_runs` row is a manual run: claimed 0, 0.7
+   GPU-seconds). Add a payment method or ASR stops the moment calls resume.
+4. **RTFx is still unmeasured** — blocked on 1.
+5. **DPA / PDPL** before customer audio leaves for any processor. `consents` is
+   still empty and call recordings are voice data.
 6. **Drive's own retention** — `purge_raw_content` blanks call text after a
    year. If Drive deletes the WAV sooner, that conversation is gone from the
    world.
+7. **Live n8n holds far more than this repo**: a WhatsApp/Gupshup platform, a
+   popup-form → CRM flow, and `vbttYDc7KoYBgaTW "Bitrix24 - Store Chat
+   Messages"` (active, writes its own `messages` table, not ours). None of them
+   touch `customer360`, but do not assume this repo is the whole portal.
 
 **Bitrix, as it actually is.** Portal `travelgate.bitrix24.ae`, webhook user
 128 (`ADMIN: true`), scope `crm` only. 17,651 deals and 23,754 contacts;
@@ -288,7 +403,7 @@ python scripts/simulate_conversation.py <id> --webhook  # POST at live n8n
 ## Layout
 
 ```
-db/migrations/         001-016 applied to Railway; 017 written, NOT yet applied
+db/migrations/         001-019 all applied to Railway (018 attribution, 019 bots+alerts)
 services/worker/app/
   serve.py             entrypoint — see gotcha 1 and 2 below
   main.py              FastAPI
