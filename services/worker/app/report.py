@@ -284,6 +284,98 @@ CROSS JOIN LATERAL (VALUES
 GROUP BY m.module ORDER BY m.module
 """
 
+# ---------------------------------------------------------------------------
+# 5 · One conversation at a time — what the judge actually said
+#
+# Every other panel here is an aggregate. There was no way to open a single
+# conversation and read the verdict on it, which makes a low mean impossible to
+# argue with: an agent shown 23.8 cannot see WHICH conversation earned it or
+# what the judge objected to, and neither can the person reviewing them.
+#
+# NULL IS NOT ZERO, AND THIS PANEL IS WHERE IT MATTERS MOST (rule 2). A module
+# is null when the situation never arose and 0 when it arose and was handled
+# badly. The columns are emitted raw, exactly as stored, and the page renders
+# the two differently — a null module must never appear as a zero, because that
+# is the failure the whole rubric was rebuilt to remove. `weight_applied` comes
+# with them so a reader can see which weights the score was actually computed
+# over rather than assuming all five.
+#
+# NO AVERAGE IS COMPUTED HERE. `final_score` is a single observation on one
+# conversation, not a mean, so it needs no sample size beside it. Averaging
+# these rows into a new headline figure would reintroduce exactly the bare,
+# unlabelled number that 0533b2f removed — if this panel ever needs an
+# aggregate, it goes through `score_display` from the display views.
+#
+# WINDOWED ON THE CONVERSATION'S OWN DATE, not on when it was judged: "the last
+# 30 days" means the last 30 days of business to the person reading it. When it
+# was judged is a column, because a conversation from August judged yesterday
+# is a normal and uninteresting thing for a backlog to do.
+SQL_CONVERSATIONS = """
+SELECT i.external_id,
+       i.channel::text                            AS channel,
+       e.input_type::text                         AS input_type,
+       i.started_at,
+       i.ended_at,
+       i.message_count,
+       i.customer_message_count,
+       i.agent_message_count,
+       i.external_deal_id,
+       coalesce(ag.full_name, 'unassigned')       AS agent_name,
+
+       a.summary_ar,
+       a.intent,
+       a.lead_temp::text                          AS lead_temp,
+       a.buying_stage::text                       AS buying_stage,
+
+       e.final_score,
+       e.performance_level,
+       e.weight_applied,
+       e.m1_reception,
+       e.m2_offer,
+       e.m3_objections,
+       e.m4_followup,
+       e.m5_closing,
+       e.top_strength,
+       e.top_weakness,
+       e.top_recommendation,
+       e.contract_status,
+       e.gradeable,
+       e.model                                    AS judge_model,
+       e.prompt_version,
+       e.updated_at                               AS evaluated_at,
+
+       -- The cap, carried by the rows it caps. A truncated list that does not
+       -- say it is truncated reads as "these are all of them".
+       count(*) OVER ()                           AS total_in_window
+FROM agent_evaluations e
+JOIN interactions i          ON i.interaction_id = e.interaction_id
+LEFT JOIN interaction_analysis a ON a.interaction_id = e.interaction_id
+LEFT JOIN agents ag          ON ag.agent_id = e.agent_id
+WHERE i.started_at >= now() - make_interval(days => %(days)s)
+ORDER BY i.started_at DESC
+LIMIT %(limit)s
+"""
+
+
+def _conversations(p: dict) -> dict:
+    """The drill-down rows, plus how many the cap hid.
+
+    Returns a dict rather than a bare list so `total_in_window` and
+    `truncated` travel WITH the rows. A caller that renders the list cannot
+    then present 50 of 800 conversations as though it were all of them.
+    """
+    rows = db.rows(SQL_CONVERSATIONS, p)
+    total = int(rows[0]["total_in_window"]) if rows else 0
+    for r in rows:
+        r.pop("total_in_window", None)
+    return {
+        "rows": rows,
+        "total_in_window": total,
+        "limit": p["limit"],
+        "truncated": total > len(rows),
+    }
+
+
 SQL_TOTALS = """
 SELECT
   (SELECT count(*) FROM interactions)                             AS interactions,
@@ -371,6 +463,7 @@ def build(days: int = 30, limit: int = SAMPLE_LIMIT) -> dict:
     _panel("scorecard", lambda: db.rows(SQL_SCORECARD), data, errors)
     _panel("quality_by_input", lambda: db.rows(SQL_QUALITY_BY_INPUT), data, errors)
     _panel("null_vs_zero", lambda: db.rows(SQL_NULL_VS_ZERO), data, errors)
+    _panel("conversations", lambda: _conversations(p), data, errors)
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),

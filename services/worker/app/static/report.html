@@ -219,6 +219,11 @@ tbody tr:hover{background:var(--panel-2)}
     <h2>جودة المدخل <span class="hint">الموديل بيدّي المكالمات درجات أقل، ولا التفريغ نفسه وحش؟</span></h2>
     <div class="tw" id="quality"></div>
   </section>
+
+  <section>
+    <h2>محادثة محادثة <span class="hint" id="convHint">افتح أي محادثة وشوف الحكم نفسه — الملخص، الخمس موديولات، ونقطة القوة والضعف. الموديول اللي موقفه ماحصلش بيتكتب «لم تنشأ» مش صفر</span></h2>
+    <div class="tw" id="conversations"></div>
+  </section>
 </div>
 
 <script>
@@ -498,6 +503,118 @@ function render(rep) {
     { h: "التشتت", cls: "num", f: (r) => num(r.score_spread, 1) },
     { h: "طريقة التقييم", cls: "id", f: (r) => '<span class="c mute">' + esc(r.method_label || "?") + "</span>" },
   ], "مفيش تقييمات");
+
+  conversations(d.conversations);
+}
+
+/* ---------- drill-down: one conversation at a time ----------
+   Not built on table() because that helper renders one <tr> per row and this
+   needs a second, hidden <tr> beneath each one. Everything it draws uses
+   classes that already exist in this file — no new colour, radius or shadow,
+   and the toggle is a real <button> because that is the only element here that
+   already carries cursor:pointer and a focus-visible ring. */
+
+/* RULE 2, RENDERED. A module is null when the situation never arose and 0 when
+   it arose and was handled badly. They must not look alike: a null shows an
+   em-dash and the words «لم تنشأ», a zero shows 0 and is NOT muted, because a
+   zero is a real and bad score. Collapsing the two is what made a discovery
+   call that never reached an offer score as though it had made a bad one. */
+function modCell(label, v) {
+  const isNull = (v === null || v === undefined || v === "");
+  return '<div class="s' + (isNull ? " zero" : "") + '">'
+       + "<b>" + (isNull ? "—" : num(v, 1)) + "</b>"
+       + "<span>" + esc(label) + (isNull ? " · لم تنشأ" : "") + "</span></div>";
+}
+
+function convDetail(r) {
+  const modules = [
+    ["استقبال", r.m1_reception], ["عرض", r.m2_offer],
+    ["اعتراضات", r.m3_objections], ["متابعة", r.m4_followup],
+    ["إغلاق", r.m5_closing],
+  ].map(([l, v]) => modCell(l, v)).join("");
+
+  /* weight_applied sits with the modules on purpose: it is the denominator the
+     final score was actually computed over, and without it a reader assumes
+     all five weights were in play. */
+  const strip = '<div class="strip">' + modules
+    + '<div class="s"><b>' + num(r.weight_applied, 3) + "</b><span>الوزن المستخدم</span></div>"
+    + "</div>";
+
+  const said = [
+    ["الملخص", r.summary_ar],
+    ["أقوى نقطة", r.top_strength],
+    ["أضعف نقطة", r.top_weakness],
+    ["التوصية", r.top_recommendation],
+  ].filter(([, v]) => v).map(([l, v]) =>
+    '<p class="note"><b>' + esc(l) + ":</b> " + esc(v) + "</p>").join("");
+
+  const meta = [
+    ["النية", r.intent], ["حرارة العميل", r.lead_temp],
+    ["مرحلة الشراء", r.buying_stage], ["الحالة", r.contract_status],
+    ["قابل للتقييم", r.gradeable === null ? null : (r.gradeable ? "نعم" : "لا")],
+    ["الموديل", r.judge_model], ["البرومبت", r.prompt_version],
+    ["اتقيّم", when(r.evaluated_at)], ["بدأت", when(r.started_at)],
+    ["انتهت", when(r.ended_at)], ["صفقة بيتركس", r.external_deal_id],
+  ].filter(([, v]) => v != null && v !== "")
+   .map(([l, v]) => '<span class="c mute">' + esc(l) + ": " + esc(v) + "</span>")
+   .join(" ");
+
+  return strip + said + '<p class="note">' + meta + "</p>";
+}
+
+function conversations(c) {
+  const el = $("conversations");
+  const rows = (c && c.rows) || [];
+  if (!rows.length) {
+    el.innerHTML = '<div class="empty">مفيش محادثات متقيّمة في الفترة دي</div>';
+    return;
+  }
+
+  const head = ["", "بدأت", "القناة", "الموظف", "رسائل", "الدرجة", "المستوى", "صفقة"]
+    .map((h) => "<th>" + esc(h) + "</th>").join("");
+
+  const body = rows.map((r, i) => {
+    const lvl = r.final_score == null ? "mute"
+              : Number(r.final_score) >= 80 ? "ok"
+              : Number(r.final_score) >= 60 ? "warn" : "bad";
+    const main = "<tr>"
+      + '<td><button type="button" data-conv="' + i + '" aria-expanded="false">افتح</button></td>'
+      + '<td class="id">' + esc(when(r.started_at)) + "</td>"
+      + '<td><span class="c mute">' + esc(r.input_type || r.channel || "?") + "</span></td>"
+      + "<td>" + esc(r.agent_name) + "</td>"
+      + '<td class="num">' + num(r.message_count) + " / " + num(r.customer_message_count)
+        + " / " + num(r.agent_message_count) + "</td>"
+      + '<td class="num"><span class="c ' + lvl + '">' + num(r.final_score, 1) + "</span></td>"
+      + "<td>" + esc(r.performance_level || "—") + "</td>"
+      + '<td class="id">' + esc(r.external_deal_id || "—") + "</td>"
+      + "</tr>";
+    const detail = '<tr id="convd' + i + '" hidden><td class="q" colspan="8">'
+      + convDetail(r) + "</td></tr>";
+    return main + detail;
+  }).join("");
+
+  el.innerHTML = "<table><thead><tr>" + head + "</tr></thead><tbody>"
+               + body + "</tbody></table>";
+
+  el.querySelectorAll("button[data-conv]").forEach((b) => {
+    b.addEventListener("click", () => {
+      const row = $("convd" + b.dataset.conv);
+      const open = !row.hidden;
+      row.hidden = open;
+      b.setAttribute("aria-expanded", String(!open));
+      b.textContent = open ? "افتح" : "اقفل";
+    });
+  });
+
+  /* The cap, said out loud. 50 of 504 presented as a plain list reads as "this
+     is all of them", which is how somebody concludes the pipeline judged 50
+     conversations this month. */
+  if (c.truncated) {
+    $("convHint").textContent =
+      "بيعرض " + num(rows.length) + " من " + num(c.total_in_window)
+      + " محادثة في الفترة دي — زوّد الفترة أو الـlimit عشان تشوف الباقي. "
+      + "الموديول اللي موقفه ماحصلش بيتكتب «لم تنشأ» مش صفر";
+  }
 }
 
 /* ---------- wiring ---------- */

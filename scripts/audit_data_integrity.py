@@ -249,6 +249,37 @@ CHECKS: list[tuple[str, str, str, str]] = [
      """SELECT count(*) FROM v_agent_scorecard_display
          WHERE coalesce(method_label, '') = ''"""),
 
+    # ---------------------------------------- the drill-down shows both halves
+    #
+    # The per-conversation panel prints the five module scores and
+    # `weight_applied` side by side, which makes this checkable by eye for the
+    # first time. `final_score` is a weighted mean over the modules that were
+    # not null, so if the stored denominator disagrees with which modules are
+    # actually null, the score on screen cannot be reproduced from the numbers
+    # printed beside it — and a reader recomputing it by hand gets a different
+    # answer with no way to tell which one is wrong.
+    ("weight-does-not-match-modules", "FAIL",
+     "weight_applied must be the sum of the weights of the non-null modules "
+     "(0.15 / 0.25 / 0.25 / 0.20 / 0.15). A mismatch makes final_score "
+     "unreproducible from the modules displayed next to it.",
+     """SELECT count(*) FROM agent_evaluations
+         WHERE final_score IS NOT NULL
+           AND round(weight_applied, 3) IS DISTINCT FROM round((
+                 (CASE WHEN m1_reception  IS NOT NULL THEN 0.15 ELSE 0 END)
+               + (CASE WHEN m2_offer      IS NOT NULL THEN 0.25 ELSE 0 END)
+               + (CASE WHEN m3_objections IS NOT NULL THEN 0.25 ELSE 0 END)
+               + (CASE WHEN m4_followup   IS NOT NULL THEN 0.20 ELSE 0 END)
+               + (CASE WHEN m5_closing    IS NOT NULL THEN 0.15 ELSE 0 END)
+             )::numeric, 3)"""),
+
+    ("scored-below-minimum-weight", "FAIL",
+     "Below MIN_WEIGHT_APPLIED (0.40) too little of the rubric survived to "
+     "average into anything meaningful; scoring.py reports ungradeable rather "
+     "than a confident number built from one module. A scored row under it "
+     "means that gate was bypassed.",
+     """SELECT count(*) FROM agent_evaluations
+         WHERE final_score IS NOT NULL AND weight_applied < 0.40"""),
+
     ("published-without-measured-noise", "FAIL",
      "Nothing may be labelled 'published' while its band rests on no measured "
      "judge noise. This is the assertion that catches somebody 'fixing' the "
