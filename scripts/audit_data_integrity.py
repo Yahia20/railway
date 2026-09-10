@@ -192,6 +192,69 @@ CHECKS: list[tuple[str, str, str, str]] = [
     ("deal-without-owner", "WARN",
      "A deal with no agent cannot appear in any per-agent revenue view.",
      "SELECT count(*) FROM deals WHERE agent_id IS NULL AND origin = 'bitrix'"),
+
+    # ------------------------------------------------- a score is never naked
+    #
+    # The owner's rule: a score is ALWAYS shown, and always with the number of
+    # evaluations it rests on plus the fact that the method is interim. These
+    # assert the rule holds in the DATA, not just in the renderer — a template
+    # can be edited, a view cannot be edited by accident.
+
+    ("mean-without-sample-size", "FAIL",
+     "A mean with no n_usable beside it is the number somebody acts on at n=1. "
+     "Every display row exposing a value must expose its denominator.",
+     """SELECT count(*) FROM v_agent_scorecard_display
+         WHERE score_display->>'value' IS NOT NULL
+           AND score_display->>'n_usable' IS NULL"""),
+
+    ("mean-without-label", "FAIL",
+     "The confidence label is what makes a provisional number honest rather "
+     "than misleading. It must never be absent where a value is present.",
+     """SELECT count(*) FROM v_agent_scorecard_display
+         WHERE score_display->>'value' IS NOT NULL
+           AND coalesce(score_display->>'label', '') = ''"""),
+
+    ("quality-mean-without-label", "FAIL",
+     "Same rule for the input-quality panel, which is also read by a person.",
+     """SELECT count(*) FROM v_quality_by_input_display
+         WHERE score_display->>'value' IS NOT NULL
+           AND (coalesce(score_display->>'label', '') = ''
+                OR score_display->>'n_usable' IS NULL)"""),
+
+    ("mean-suppressed", "FAIL",
+     "The owner decided a score is ALWAYS visible. A row with usable "
+     "evaluations and no value means something started hiding it again.",
+     """SELECT count(*) FROM v_agent_scorecard_display
+         WHERE n_usable > 0 AND score_display->>'value' IS NULL"""),
+
+    ("label-disagrees-with-provisional", "FAIL",
+     "is_provisional is what an automated consumer gates on; the label is what "
+     "a person reads. If they can disagree, one of them is lying.",
+     """SELECT count(*) FROM v_agent_scorecard_display
+         WHERE is_provisional <> (confidence_label <> 'published')"""),
+
+    ("version-coordinate-collapsed", "FAIL",
+     "The scorecard is one row per agent PER VERSION CO-ORDINATE. Two agents "
+     "genuinely have both a v4-flash and a v4-pro row. If a co-ordinate column "
+     "were ever dropped from the grouping, those rows would silently average a "
+     "v1 score together with a v6 one.",
+     """SELECT count(*) FROM (
+          SELECT agent_id, prompt_version, rubric_version, model,
+                 model_fingerprint
+            FROM v_agent_scorecard_display
+           GROUP BY 1,2,3,4,5 HAVING count(*) > 1) d"""),
+
+    ("method-label-missing", "WARN",
+     "Without it, two rows for one agent read as duplicates and get compared.",
+     """SELECT count(*) FROM v_agent_scorecard_display
+         WHERE coalesce(method_label, '') = ''"""),
+
+    ("published-without-measured-noise", "FAIL",
+     "Nothing may be labelled 'published' while its band rests on no measured "
+     "judge noise. This is the assertion that catches somebody 'fixing' the "
+     "blank scorecard by inserting a fabricated eval_noise_params row.",
+     """SELECT count(*) FROM v_agent_scorecard_display
+         WHERE confidence_label = 'published' AND noise_variance IS NULL"""),
 ]
 
 

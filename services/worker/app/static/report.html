@@ -206,7 +206,7 @@ tbody tr:hover{background:var(--panel-2)}
 
   <!-- الجودة -->
   <section>
-    <h2>تقييم الموظفين</h2>
+    <h2>تقييم الموظفين <span class="hint">كل درجة ظاهرة دايمًا، وجنبها عدد التقييمات اللي اتحسبت منها. الدرجة مبدئية لحد ما يتقاس هامش الخطأ — وطريقة التقييم نفسها لسه هتتغير، فمتقارنش صفين بطريقتين مختلفتين</span></h2>
     <div class="tw" id="scorecard"></div>
   </section>
 
@@ -446,11 +446,19 @@ function render(rep) {
     { h: "محادثات", cls: "num", f: (r) => num(r.evaluated_interactions) },
     { h: "مكالمات", cls: "num", f: (r) => num(r.calls) },
     { h: "شاتات", cls: "num", f: (r) => num(r.chats) },
+    /* THE MEAN AND ITS CAVEAT ARE ONE CELL, from one payload object.
+       The API does not send a bare `avg_score` any more, so there is no way to
+       render this number without the label that qualifies it — which is the
+       whole point: the owner wants every score visible, and a visible score
+       with no sample size beside it is how somebody acts on n = 1. */
     { h: "المتوسط", cls: "num", f: (r) => {
-        if (r.avg_score == null) return "—";
-        const v = Number(r.avg_score);
+        const s = r.score_display || {};
+        if (s.value == null) return '<span class="c mute">' + esc(s.label || "لسه مفيش تقييم") + "</span>";
+        const v = Number(s.value);
         const cls = v >= 80 ? "ok" : v >= 60 ? "warn" : "bad";
-        return '<span class="c ' + cls + '">' + num(v, 1) + "</span>"; } },
+        return '<span class="c ' + cls + '">' + num(v, 1) + "</span>"
+             + '<div class="hint" style="margin-top:3px">' + esc(s.label) + "</div>"; } },
+    { h: "n", cls: "num", f: (r) => num(r.n_usable) },
     { h: "استقبال", cls: "num", f: (r) => num(r.avg_reception, 1) },
     { h: "عرض", cls: "num", f: (r) => num(r.avg_offer, 1) },
     { h: "اعتراضات", cls: "num", f: (r) => num(r.avg_objections, 1) },
@@ -459,6 +467,11 @@ function render(rep) {
     { h: "n إغلاق", cls: "num", f: (r) => num(r.n_closing_scored) },
     { h: "أول رد (ث)", cls: "num", f: (r) => num(r.avg_first_response_sec) },
     { h: "ملاحظات", cls: "num", f: (r) => num(r.flagged_conversations) },
+    /* Two rows for the SAME agent are not a bug: the view emits one row per
+       version co-ordinate, and two agents genuinely have both a v4-flash and a
+       v4-pro row. Without this column they read as duplicates and somebody
+       averages them together. */
+    { h: "طريقة التقييم", cls: "id", f: (r) => '<span class="c mute">' + esc(r.method_label || "?") + "</span>" },
   ], "مفيش تقييمات — v_agent_scorecard بيستبعد البوت، وبيحتاج agents مربوطين");
 
   table($("nullZero"), d.null_vs_zero, [
@@ -476,8 +489,14 @@ function render(rep) {
     { h: "فصل المتكلمين", f: (r) => '<span class="c mute">' + esc(r.diarization || "none") + "</span>" },
     { h: "شريحة الثقة", k: "confidence_bucket", cls: "num" },
     { h: "n", cls: "num", f: (r) => num(r.n) },
-    { h: "المتوسط", cls: "num", f: (r) => num(r.avg_score, 1) },
+    { h: "n مقيّم", cls: "num", f: (r) => num(r.n_usable) },
+    { h: "المتوسط", cls: "num", f: (r) => {
+        const s = r.score_display || {};
+        if (s.value == null) return '<span class="c mute">' + esc(s.label || "لسه مفيش تقييم") + "</span>";
+        return num(s.value, 1)
+             + '<div class="hint" style="margin-top:3px">' + esc(s.label) + "</div>"; } },
     { h: "التشتت", cls: "num", f: (r) => num(r.score_spread, 1) },
+    { h: "طريقة التقييم", cls: "id", f: (r) => '<span class="c mute">' + esc(r.method_label || "?") + "</span>" },
   ], "مفيش تقييمات");
 }
 

@@ -229,18 +229,38 @@ GROUP BY 1 ORDER BY 1
 # 4 · Quality — is the input good enough to grade?
 # ---------------------------------------------------------------------------
 
+# THE HEADLINE MEAN IS NOT A BARE KEY, ON PURPOSE.
+#
+# The owner's decision is that a score is ALWAYS shown, with its sample size
+# and the interim-method caveat beside it. `score_display` is one jsonb object
+# holding the number AND everything that qualifies it, and `avg_score` is
+# deliberately NOT selected: a sibling key can be dropped by accident in a
+# renderer, a template or a copy-paste, and the number would then appear naked.
+# Reading `.value` puts `.label` in the same object the caller already holds.
+#
+# `n_usable` is also emitted at row level because it is NOT
+# `evaluated_interactions` — the old panel showed the latter next to the mean,
+# which is the count of ALL evaluations including the ungradeable ones, so the
+# number beside the average was not the average's denominator.
+#
+# `method_label` comes out because the view emits ONE ROW PER AGENT PER VERSION
+# CO-ORDINATE and two of the live agents genuinely have two rows (v4-flash and
+# v4-pro). Without it they read as duplicates, and somebody averages them.
 SQL_SCORECARD = """
-SELECT full_name, team, evaluated_interactions, calls, chats,
-       avg_score, avg_reception, avg_offer, avg_objections,
+SELECT full_name, team, method_label, is_provisional,
+       evaluated_interactions, calls, chats, n_usable,
+       score_display,
+       avg_reception, avg_offer, avg_objections,
        avg_followup, avg_closing, n_closing_scored,
        avg_first_response_sec, flagged_conversations
-FROM v_agent_scorecard
-ORDER BY evaluated_interactions DESC
+FROM v_agent_scorecard_display
+ORDER BY n_usable DESC, (score_display->>'value')::numeric DESC NULLS LAST
 """
 
 SQL_QUALITY_BY_INPUT = """
-SELECT input_type, diarization, confidence_bucket, n, avg_score, score_spread
-FROM v_quality_by_input
+SELECT input_type, diarization, confidence_bucket, method_label, is_provisional,
+       n, n_usable, score_display, score_spread
+FROM v_quality_by_input_display
 ORDER BY input_type, confidence_bucket
 """
 
