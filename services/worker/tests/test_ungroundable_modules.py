@@ -43,7 +43,7 @@ TRANSLATED_QUOTE = "English please. I think. Can you speak English? One minute."
 
 def _run(payload, *more, conversation=SHORT_CALL):
     client = StubClient(payload, *more)
-    return judge.run_pass2(conversation, "call_transcript", client=client), client
+    return judge.run_pass2(conversation, "chat", client=client), client
 
 
 def _e5ab9937_payload():
@@ -242,7 +242,7 @@ def test_the_evaluate_response_keeps_its_keys(monkeypatch, status_field):
 
     r = TestClient(main.app).post(
         "/evaluate",
-        json={"conversation": SHORT_CALL, "input_type": "call_transcript",
+        json={"conversation": SHORT_CALL, "input_type": "chat",
               "run_pass1": False},
         headers={"X-API-Key": "k"},
     )

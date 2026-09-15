@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
-from .base import CallRecording, Conversation, Message
+from .base import Conversation, Message
 
 def _find_fixtures() -> Path:
     """Locate the fixtures directory by walking up from this file.
@@ -61,66 +61,3 @@ class MockChatSource:
 
     def fetch_one(self, external_id: str) -> Conversation | None:
         return next((c for c in self._load() if c.external_id == external_id), None)
-
-
-class MockCallSource:
-    """Serves local .wav files named with the PBX convention."""
-
-    name = "asterisk_drive"
-
-    def __init__(self, fixtures_dir: Path | None = None, tz_offset_hours: int = 3):
-        self.dir = fixtures_dir or FIXTURES / "calls"
-        self.tz_offset_hours = tz_offset_hours
-
-    def list_since(self, since: datetime, limit: int = 500) -> Iterator[CallRecording]:
-        from .drive_calls import RecordingNameError, parse_recording_name
-
-        if not self.dir.exists():
-            return
-        for path in sorted(self.dir.glob("*.wav"))[:limit]:
-            try:
-                meta = parse_recording_name(path.name, self.tz_offset_hours)
-            except RecordingNameError:
-                continue
-            if meta["started_at"] < since:
-                continue
-            yield CallRecording(
-                external_id=meta["uniqueid"],
-                external_source=self.name,
-                audio_uri=f"file://{path}",
-                started_at=meta["started_at"],
-                customer_phone_raw=meta["customer_phone_raw"],
-                agent_extension=meta["agent_extension"],
-                size_bytes=path.stat().st_size,
-                raw={"parsed_name": meta, "local_path": str(path)},
-            )
-
-    def download(self, rec: CallRecording, dest_dir: str) -> str:
-        src = rec.raw["local_path"]
-        os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, f"{rec.external_id}.wav")
-        if os.path.abspath(src) != os.path.abspath(dest):
-            shutil.copyfile(src, dest)
-        rec.raw["local_path"] = dest
-        return dest
-
-
-def synthetic_conversation(messages: list[tuple[str, str, int]],
-                           start: datetime | None = None) -> Conversation:
-    """Build a conversation from (sender, body, minutes_offset) tuples.
-
-    For testing scoring behaviour against hand-built cases — an agent who never
-    greets, one who ignores an objection — without needing a real payload.
-    """
-    start = start or datetime(2026, 7, 1, 10, 0, tzinfo=timezone.utc)
-    return Conversation(
-        external_id="synthetic",
-        external_source="mock",
-        channel="whatsapp",
-        started_at=start,
-        messages=[
-            Message(seq=i, sender=sender, body=body,
-                    sent_at=start + timedelta(minutes=offset))
-            for i, (sender, body, offset) in enumerate(messages, start=1)
-        ],
-    )

@@ -78,7 +78,7 @@ def _payload(modules=None, evidence=(), **extra):
 
 def _run(payload, *more, conversation=CONVERSATION):
     client = StubClient(payload, *more)
-    return judge.run_pass2(conversation, "call_transcript", client=client), client
+    return judge.run_pass2(conversation, "chat", client=client), client
 
 
 # ── the decision table ──────────────────────────────────────────────────────

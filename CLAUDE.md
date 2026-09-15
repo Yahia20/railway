@@ -12,50 +12,109 @@ making decisions, not after.
 
 ## Status in one line
 
-**Everything is deployed and correct. It is stopped, on purpose, because
-DeepSeek has no credit.** Balance −0.10 USD, `is_available: false`. Top the
-account up and the pipeline resumes on its own — 599 threads are waiting,
-`judge_attempts = 0`, nothing lost. **There is no command to run afterwards.**
+**Chats only. The calls lane is gone, and the judge reports facts instead of
+scores.** Both landed 2026-09-14. Neither is deployed.
 
-Check it in one call:
+### Calls were REMOVED, not paused — and the archive is the only copy
 
-```bash
-curl -s https://railway-production-d648.up.railway.app/spend        # the page
-```
+`../travelgate-calls-archive/` (its own git repo, commit `8b24085`) holds the
+workflows, the Modal batch, the ASR chunker, `drive_calls.py`, `asr_jobs.py`,
+the 02 SQL, migrations 008/010/012, the call channel-rules prompt, and
+`shared-before/` — pre-edit copies of every shared file that was cut down
+rather than deleted. Its README has the restore order.
 
-**Calls are paused by you, not broken.** Drive's newest recording is
-2026-08-19; all 1,064 are processed and terminal. Nothing is stranded. The
-lane needs no code change to resume — but see the two things to insist on with
-the new recorder in `docs/CHANGING_THE_CALL_SOURCE.md`, because **calls cannot
-currently be scored per agent at all**: every recording decodes to extension
-`3009`, which is a queue and not a person.
+**Why.** Not volume and not cost: **calls were never scoreable per agent.** All
+1,119 recordings decode to extension `3009`, a QUEUE, so `agent_id` was NULL on
+every call and ~800 of the 834 stored evaluations could not be attributed to
+anybody — and every one of them was being aggregated under a heading that said
+"agent performance". Shelving the schedule would not have fixed that; the rows
+and the views stay. **It comes back when the PBX records the answering
+extension, and not before.**
 
-**Modal is deployed** (`travelgate-asr`, cron 23:30) and capped at a hard
-30 USD/month enforced in the worker, not in the batch. It has $0.99 of free
-credit left, so add a payment method before calls resume.
-
-**The judging queue is production-only and honest**: 599 pending, 27 evaluated,
-6 unscoreable. It said 40 evaluated until `021` removed 13 rows belonging to
-the retired workflow-01 namespace, four of which claimed success while holding
-no evaluation.
-
-Before trusting any number on `/report`, run:
+**The database half is written and NOT RUN** — no tunnel was available:
 
 ```bash
-python scripts/audit_data_integrity.py --port 55432   # 0 failures as of 2026-09-09
+python scripts/dump_calls.py --out ../travelgate-calls-archive/data   # FIRST
+psql ... -v ON_ERROR_STOP=1 -f db/migrations/023_remove_calls.sql
+python scripts/dump_calls.py --out ../travelgate-calls-archive/data --verify
+python scripts/audit_data_integrity.py --port 55432
 ```
+
+`023` rebuilds `v_usable_evaluations`, `v_agent_scorecard` and
+`v_quality_by_input` without the `transcripts` join, drops
+`eval_asr_input_is_eligible()`, re-creates 022's display layer on top, patches
+`evaluate_alert_rules()` in place from `pg_get_functiondef`, deletes the
+`asterisk_drive` rows, then drops `transcripts`, `call_ingest_jobs` and
+`asr_runs`. **The enum values `phone_call` and `call_transcript` survive** —
+removing them would rewrite two large tables under a lock — so three CHECK
+constraints make them unusable instead.
+
+`v_agent_scorecard.calls` is kept and hard-wired to `0`, and
+`v_quality_by_input.diarization` is kept and always NULL, so the display layer
+and `app/report.py` need no edit.
+
+**Workflow 02 is still ACTIVE in live n8n.** Deactivating it needs an
+`N8N_API_KEY`, which is not in Railway and not in this repo.
+
+**A gap this surfaced, and FIXED: Module 4 had never been sent its input.**
+01d never had a node that builds the follow-up-history block, so the judge was
+never given one and correctly answered `null` — `m4_followup` was
+not-applicable on **822 of 834** rows. Because `weight_applied` renormalises,
+it did not look like a hole; it looked like conversations that needed no
+follow-up. 20% of the rubric, silently absent.
+
+The chain now runs end to end, and every link has a test:
+
+```
+01d "Load thread"      selects `later_interactions` — the customer's own
+                       timeline, 14-day window, matched on customer_id and
+                       falling back to the phone. ROWS, never a rendered string
+/chats/prepare         renders them with `metrics.later_contact_line`
+01d "Two AI passes"    forwards `followup_history` to /evaluate
+build_pass2_prompt     substitutes it into {{FOLLOWUP_HISTORY}}
+```
+
+**Rule 2 reaches the block itself.** `later_interactions = []` means we searched
+the whole timeline and found nothing — an agent who did not come back, which
+SCORES zero. A *missing* field means nobody searched, which NULLS. Collapsing
+the two is how the module went missing in the first place.
+
+**The worker no longer writes to the database at all.** `writer()`/`write()`
+and the write pool existed for one caller, `asr_jobs.py`, because Modal ran
+outside Railway. Rule 11's exception went with the calls lane: n8n is now the
+only writer, which is the property the split was always supposed to have.
+
+### The judge reports observations, not scores — `pass2-agent-quality-v7`
+
+v6 asked for a number per criterion and got `{"greeting": 18}` on a criterion
+that is 10 + 10 + 5 — a score the rubric cannot produce, and nothing rejected
+it. Measured: `v_quality_by_input` records a spread of **8.1 points over 5
+chats and 17.4 over 10**, at temperature 0 on one prompt; and v4-flash and
+v4-pro returned different numbers for conversations they agreed about.
+
+v7 removes the judgement rather than the noise. The model answers booleans and
+closed labels; `app/evaluate/rubric_items.py` turns them into points.
+
+| | |
+|---|---|
+| **Not one criterion, weight or cap changed** | `rubric_version` stays `1.0.0` — a different ENCODING of the same rubric |
+| **Every v2–v6 calibration carried over verbatim** | trigger gates, the Module-3 exclusion list, the counterweight, the polite/sarcastic catalogue |
+| **The tie-break is one rule** | what was not observed did not happen: a missing check is `false`, never full marks |
+| **`validate_legal_values`** | rejects any total the rubric's own items cannot add up to, with or without `checks` |
+| **Backwards compatible** | a response with no `checks` scores exactly as before, so v6 rows and replays are untouched |
+
+`tests/test_rubric_items.py` pins the item table to `CRITERION_MAX` and to the
+prompt text, in both directions — a check renamed in one and not the other
+fails the suite rather than silently zeroing a criterion.
 
 ### What runs, and when (all times Asia/Riyadh — n8n's GENERIC_TIMEZONE)
 
 | | workflow | n8n id | when |
 |---|---|---|---|
 | live | **01c** chats store-only | `H7r5YWGJ3nNVA99Z` | every Bitrix message, ~1,300/day |
-| live | **02** Calls v2 — discovery | `Q3ARdzVsO3Z8bcWr` | 23:00 daily |
 | live | **01d** chat scoring | `P1zSFsw16wmV28YF` | every 10 min, 23:00–03:59 |
-| live | **02** Calls v2 — judging | (same workflow) | every 10 min, 23:00–03:59 |
 | live | **04** housekeeping | `z60SxzoYmKOLsH4S` | 03:20 daily |
 | live | **03** identity + promises | `sUnNPv6Ucye6Gsii` | 03:40 daily |
-| live | **Modal** ASR batch | `travelgate-asr` | 23:30 daily |
 
 The night window is a discount, not a preference — see gotcha 14. 03 runs
 *after* 04 because 04 is what fetches the phones 03 matches on.
@@ -381,14 +440,16 @@ numbers that look fine and are wrong.
     finding this project exists to produce. Never "fix" a disagreement by
     overwriting our answer with the CRM's.
 
-11. **The worker reads; n8n writes — with one named exception.** `app/db.py`
-    exposes `cursor`/`rows`/`one`, which set `default_transaction_read_only`,
-    and `writer`/`write`, which do not. Only `app/asr_jobs.py` may use the
-    second pair, and a test enforces that. The exception exists because Modal
-    runs outside Railway and cannot reach `postgres.railway.internal` at all;
-    the alternative was putting the database on the public internet. Do not
-    widen it, and do not merge the two pools into one with a flag — a flag can
-    be defaulted wrong and reads identically at the call site.
+11. **The worker reads. n8n writes. There is no exception any more.** `app/db.py`
+    exposes `cursor`/`rows`/`one` and every connection sets
+    `default_transaction_read_only`. `writer`/`write` and the write pool existed
+    for exactly one caller — `app/asr_jobs.py`, because Modal ran outside
+    Railway and could not reach `postgres.railway.internal`, and the only
+    alternative was putting the database on the public internet. Calls were
+    removed on 2026-09-14 and that exception went with them. A bug in this
+    service now cannot corrupt a score, because this service cannot change a
+    row. If you ever need it back, read `shared-before/services/worker/app/db.py`
+    in the calls archive rather than re-deriving it, and restore the test too.
 
 12. **Every judge call must land in `model_calls`.** It is the only measurement
     of what this system costs, and its `UNIQUE (purpose, input_hash,
@@ -459,14 +520,6 @@ python scripts/n8n_deploy.py --list          # what is live, and its id
 python scripts/n8n_deploy.py 01d 04          # deploy, leave switched off
 python scripts/n8n_deploy.py 01d --activate
 
-# the Modal transcription batch — DEPLOYED, cron 23:30 Riyadh. It reaches the
-# database through the WORKER, not directly: Modal runs outside Railway and
-# postgres.railway.internal is Railway's private network. Secrets:
-# travelgate-worker (WORKER_URL + WORKER_API_KEY), travelgate-drive, travelgate-hf.
-modal profile activate dstravelgate
-modal run modal/transcribe_job.py::main --limit 5 --dry-run   # claims + releases
-modal deploy modal/transcribe_job.py                          # installs the cron
-
 # does the Bitrix webhook let workflow 04 do its job? (the older
 # `app.sources.bitrix_chats --probe` tests the chat-pull methods, which 04
 # does not use — this one tests crm.deal.list and crm.contact.list)
@@ -487,9 +540,6 @@ python scripts/chat_api_smoke_test.py             # posts the same batch TWICE
 # end-to-end: posts a synthetic sale to the live webhook, verifies every node
 python scripts/n8n_smoke_test.py
 
-# score a stored transcript directly
-DEEPSEEK_API_KEY=... python scripts/evaluate_call.py docs/samples/<file>.json
-
 # drive the pipeline from the conversation simulator API
 export SIM_BASE_URL=https://<tunnel>.trycloudflare.com SIM_API_KEY=tg_...
 python scripts/simulate_conversation.py --list          # what is in there
@@ -503,23 +553,21 @@ python scripts/simulate_conversation.py <id> --webhook  # POST at live n8n
 ## Layout
 
 ```
-db/migrations/         001-021 all applied to Railway (018 attribution, 019 bots+alerts,
-                       020 spend governance, 021 queue hygiene)
+db/migrations/         001-022 applied to Railway. 023_remove_calls.sql is
+                       WRITTEN AND NOT RUN — read its header first.
 services/worker/app/
   serve.py             entrypoint — see gotcha 1 and 2 below
   main.py              FastAPI
   sources/base.py      Conversation / CallRecording — the seam the APIs plug into
   sources/bitrix_chats.py   webhook parser, verified against the real payload
-  sources/drive_calls.py    PBX filename decoding
-  asr/cohere_arabic.py      silence-aligned chunking, 3 backends
   evaluate/judge.py         the two DeepSeek passes
   evaluate/scoring.py       weights, null handling, evidence validation
+  evaluate/rubric_items.py  v7: the rubric as closed sets — observations to points
   prompts/                  THE RUBRIC — treat as source code, version it
 n8n/workflows/         01 chats (live), 01c store-only chat API (live),
-                       01d chat scoring (off), 02-calls-v2-state-machine
-                       (the colleague's, discovery live), 03 nightly (off),
-                       04 nightly housekeeping (new)
-modal/transcribe_job.py  the nightly ASR batch — replaces ASR in the worker
+                       01d chat scoring (off), 03 nightly (off),
+                       04 nightly housekeeping. 02 (calls) is in the archive
+                       and STILL ACTIVE in live n8n — needs N8N_API_KEY to stop
 scripts/               railway_api, railway_configure, n8n_setup, n8n_smoke_test
 docs/HANDOFF.md        full context
 docs/bitrix-integration-spec.md   forward to the client's IT team
@@ -586,10 +634,6 @@ hours — came back as *within* business hours. `metrics.is_after_hours` now
 converts to `PORTAL_TZ_OFFSET_HOURS` (default 3) first. Any new source that
 sends UTC would have hit this.
 
-**10 · Call recordings are mono.** Nothing separates agent from customer, so
-speaker attribution is inferred from content and the prompt suppresses the
-absolute rules when `diarization = none`. The fix is free and not ours: ask the
-PBX team to record two channels.
 
 **12 · A `respondToWebhook` node is not a guarantee — a Wait node outranks it.**
 With `executionOrder: v1`, n8n runs sibling branches in canvas order, topmost
@@ -603,16 +647,6 @@ Fixed by moving the acknowledgement into the webhook node itself —
 **For any fire-and-forget ingest webhook, use `onReceived`, not a responder
 node.** Workflow 01b already did.
 
-**13 · Two systems must never claim the same job.** Transcription moved out of
-the worker into a Modal batch (017). Modal owns `call_ingest_jobs` rows in
-`discovered`/`asr_failed` and leaves them `transcribed`; workflow 02 claims them
-back only from `transcribed`/`judge_failed`. That boundary lives in exactly two
-places — the `WHERE` in 02's `Claim work` and the `WHERE` in `CLAIM_SQL` in
-`modal/transcribe_job.py`. Widen either one and the same call is transcribed
-twice and paid for twice, which is the bug the lease was added to stop in the
-first place. Modal also writes `external_source = 'asterisk_drive'`, the same
-namespace 02 uses; a different one would turn one call into two half-filled
-rows.
 
 **14 · The judging window is a discount, not a preference.** DeepSeek peak is
 01:00–04:00 and 06:00–10:00 UTC Mon–Fri, where every rate doubles. n8n runs on

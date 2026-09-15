@@ -1,11 +1,11 @@
 """The seam between us and the two APIs we do not have yet.
 
-Everything downstream — normalisation, ASR, both AI passes, scoring — consumes
-`Conversation` and `CallRecording` only. Nothing downstream imports Bitrix or
+Everything downstream — normalisation, both AI passes, scoring — consumes
+`Conversation` only. Nothing downstream imports Bitrix or
 Google Drive. The day the real APIs arrive, one file in `sources/` changes and
 the pipeline is untouched.
 
-To add a source: implement `ChatSource` or `CallSource`, register it in
+To add a source: implement `ChatSource`, register it in
 `sources/__init__.py`, and set the matching env var. That is the whole contract.
 """
 from __future__ import annotations
@@ -80,26 +80,6 @@ class Conversation:
         )
 
 
-@dataclass
-class CallRecording:
-    """A call recording, before transcription."""
-
-    external_id: str                  # asterisk uniqueid, or the Drive file id
-    external_source: str              # 'asterisk_drive'
-    audio_uri: str                    # 'drive://<fileId>'
-    started_at: datetime
-
-    customer_phone_raw: str | None = None
-    agent_extension: str | None = None
-    duration_seconds: float | None = None
-    size_bytes: int | None = None
-    raw: dict[str, Any] = field(default_factory=dict)
-
-    def local_path(self) -> str:
-        """Path to the downloaded audio. Set by the fetcher, not the lister."""
-        return self.raw["local_path"]
-
-
 @runtime_checkable
 class ChatSource(Protocol):
     """Where chat conversations come from."""
@@ -116,19 +96,4 @@ class ChatSource(Protocol):
         ...
 
     def fetch_one(self, external_id: str) -> Conversation | None:
-        ...
-
-
-@runtime_checkable
-class CallSource(Protocol):
-    """Where call recordings come from."""
-
-    name: str
-
-    def list_since(self, since: datetime, limit: int = 500) -> Iterator[CallRecording]:
-        ...
-
-    def download(self, rec: CallRecording, dest_dir: str) -> str:
-        """Fetch the audio to local disk. Returns the path, and sets it on
-        `rec.raw['local_path']`."""
         ...

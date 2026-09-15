@@ -53,7 +53,6 @@ class ComputedMetrics:
     conversation_span_seconds: int | None = None
     after_hours: bool | None = None
     language_matched: bool | None = None
-    agent_talk_ratio: float | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -106,31 +105,6 @@ def compute_chat_metrics(conv: Conversation) -> ComputedMetrics:
     )
 
 
-def compute_call_metrics(started_at: datetime, duration_seconds: float,
-                         segments: list[dict] | None = None) -> ComputedMetrics:
-    """Call metrics.
-
-    `agent_talk_ratio` stays None unless the segments carry real speaker labels.
-    With a mono recording and no diarization there is nothing to measure, and a
-    fabricated ratio would be worse than a blank: it would look like data.
-    """
-    talk_ratio = None
-    if segments:
-        labelled = [s for s in segments if s.get("speaker") in ("agent", "customer")]
-        if labelled:
-            agent_time = sum(s["end_sec"] - s["start_sec"]
-                             for s in labelled if s["speaker"] == "agent")
-            total = sum(s["end_sec"] - s["start_sec"] for s in labelled)
-            if total > 0:
-                talk_ratio = round(agent_time / total, 3)
-
-    return ComputedMetrics(
-        conversation_span_seconds=int(duration_seconds),
-        after_hours=is_after_hours(started_at),
-        agent_talk_ratio=talk_ratio,
-    )
-
-
 def later_contact_line(entry: dict) -> str:
     """One `Subsequent contact` bullet, in the format production actually sends.
 
@@ -143,27 +117,26 @@ def later_contact_line(entry: dict) -> str:
     `test_followup_history_block.py` fails if the two ever disagree.
 
     Every field here is load-bearing and each one fixes a measured defect. On
-    day 13 four calls had later same-phone interactions in the database and all
-    of them still scored Module 4 = null, because the old bullet
-    (`{channel} by {by}`) rendered "phone_call by unknown" for essentially the
+    day 13 four conversations had later same-phone contacts in the database and
+    all of them still scored Module 4 = null, because the old bullet
+    (`{channel} by {by}`) rendered "<channel> by unknown" for essentially the
     whole corpus:
 
-      * DIRECTION. A customer calling back in is not the agent following up, and
-        Module 4 grades only what the AGENT did. With the direction unstated,
-        `null` is the honest answer, and the model gave it.
-      * THE HANDLER. Queue recordings deliberately carry `agent_id = NULL` - the
-        extension in a queue filename is the QUEUE, not a person - so "no
-        individual agent recorded (queue recording)" has to be distinguishable
-        from "we do not know".
+      * DIRECTION. An inbound contact from the customer is not the agent
+        following up, and Module 4 grades only what the AGENT did. With the
+        direction unstated, `null` is the honest answer, and the model gave it.
+      * THE HANDLER. "the qualification bot, not a human agent" has to be
+        distinguishable from "we do not know", or a bot's message earns a human
+        the follow-up points.
       * THE MESSAGE TEXT. Criterion 3 is follow-up MESSAGE QUALITY, 30 of the
         module's 100 points, and is unanswerable from a bullet without it.
-    """
-    channel = str(entry.get("channel") or "phone_call")
 
-    if channel == "phone_call" and str(entry.get("kind") or "") == "q":
-        direction = ("INBOUND: the customer called in, this is not an agent "
-                     "follow-up")
-    elif entry.get("direction"):
+    The queue-recording branch (`kind == 'q'`, an inbound call answered by a
+    queue rather than a person) went with the calls lane on 2026-09-14.
+    """
+    channel = str(entry.get("channel") or "chat")
+
+    if entry.get("direction"):
         direction = f"direction {entry['direction']}"
     else:
         direction = "direction not recorded"
@@ -172,8 +145,6 @@ def later_contact_line(entry: dict) -> str:
         handler = str(entry["agent_name"])
     elif entry.get("is_bot_handled"):
         handler = "the qualification bot, not a human agent"
-    elif str(entry.get("kind") or "") == "q":
-        handler = "no individual agent recorded (queue recording)"
     else:
         handler = "not recorded"
 
@@ -186,21 +157,33 @@ def later_contact_line(entry: dict) -> str:
             f"{hours_text}h after this conversation, handled by {handler}{message}")
 
 
-def followup_history_block(promises: list[dict], later_contacts: list[dict]) -> str:
+def followup_history_block(promises: list[dict] | None = None,
+                           later_contacts: list[dict] | None = None) -> str:
     """Render the FOLLOW-UP HISTORY block for the judge prompt.
 
-    Returns the literal string 'unavailable' when we genuinely do not know, which
-    the prompt reads as "score Module 4 null". That is the honest answer before
-    the chats integration lands: for a call alone, we cannot see whether the
-    agent followed up on WhatsApp afterwards.
+    RULE 2, APPLIED TO THE BLOCK ITSELF. `None` and `[]` are different answers
+    and the whole module turns on which one arrives:
+
+      * `later_contacts=None` — nobody looked. The block is the literal word
+        'unavailable', the prompt reads that as "score Module 4 null", and the
+        agent is neither credited nor punished for a question never asked.
+      * `later_contacts=[]` — we looked at the customer's whole timeline and
+        there is nothing after this conversation. That is not an absent
+        situation, it is an agent who did not come back, and the module scores
+        it: timing 'never', frequency 'none'.
+
+    Collapsing the two is how 20% of the rubric goes quietly missing — which is
+    exactly what happened to every chat this pipeline has ever scored, because
+    01d never sent the field at all.
 
     The `Subsequent contact` lines are rendered by `later_contact_line`, so this
-    block and the SQL production actually runs cannot drift apart. The promises
-    section has no SQL counterpart: it is derived from the conversation itself
-    rather than from the customer's timeline.
+    block and every other renderer of it cannot drift apart. The promises
+    section is derived from the conversation itself rather than the timeline.
     """
-    if not promises and not later_contacts:
+    if later_contacts is None and not promises:
         return "unavailable"
+    promises = promises or []
+    later_contacts = later_contacts or []
 
     lines = []
     if promises:

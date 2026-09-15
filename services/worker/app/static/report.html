@@ -175,7 +175,6 @@ tbody tr:hover{background:var(--panel-2)}
     <h2>حالة المسار <span class="hint">هل الأرقام فوق محدّثة أصلاً</span></h2>
     <div class="strip" id="totals"></div>
     <div class="body">
-      <div id="stranded"></div>
       <div class="tw" id="ingest"></div>
       <div class="tw" id="identity"></div>
     </div>
@@ -185,7 +184,6 @@ tbody tr:hover{background:var(--panel-2)}
     <h2>الطوابير</h2>
     <div class="body">
       <div class="tw" id="chatJobs"></div>
-      <div class="tw" id="callJobs"></div>
     </div>
   </section>
 
@@ -354,26 +352,17 @@ function render(rep) {
   /* --- pipeline --- */
   const t = d.totals || {};
   $("totals").innerHTML = [
-    ["محادثات", t.interactions], ["رسايل", t.chat_messages], ["تفريغات", t.transcripts],
+    ["محادثات", t.interactions], ["رسايل", t.chat_messages],
     ["اتحللت", t.analysed], ["طلبات", t.requests], ["تقييمات", t.evaluations],
     ["نداءات موديل", t.model_calls], ["عملاء", t.customers], ["صفقات", t.deals],
-    ["متابعات", t.follow_ups],
-    ["ثقة التفريغ", t.avg_asr_confidence], ["تليفون مش متطبّع", t.phones_unnormalised],
+    ["متابعات", t.follow_ups], ["تليفون مش متطبّع", t.phones_unnormalised],
   ].map(([l, v]) => {
     const zero = !Number(v);
     const alarm = l === "تليفون مش متطبّع" && Number(v) > 0;
     return '<div class="s ' + (alarm ? "alarm" : zero ? "zero" : "") + '"><b>' +
-      (v == null ? "—" : num(v, l === "ثقة التفريغ" ? 2 : 0)) +
+      (v == null ? "—" : num(v, 0)) +
       "</b><span>" + esc(l) + "</span></div>";
   }).join("");
-
-  const s = d.stranded_calls || {};
-  const stranded = Number(s.stranded || 0);
-  $("stranded").innerHTML = stranded
-    ? '<div class="errbox">' + stranded + " مكالمة واقفة في discovered/asr_failed — " +
-      "محدش شايلها. أقدم واحدة " + esc(when(s.oldest)) + " (" + esc(ago(s.oldest)) + "). " +
-      "دي بتاعة Modal، ولو Modal مش مترفعة يبقى مفيش حاجة هتفرّغها.</div>"
-    : '<p class="note"><span class="c ok">مفيش مكالمات واقفة</span> كل تسجيل متكشّف اتفرّغ.</p>';
 
   table($("ingest"), d.ingest, [
     { h: "المصدر", k: "external_source", cls: "id" },
@@ -397,15 +386,14 @@ function render(rep) {
   const jobCols = (label) => [
     { h: label, f: (r) => {
         const cls = { evaluated: "ok", transcribed: "cool", pending: "cool",
-                      dead_letter: "bad", asr_failed: "bad", judge_failed: "warn",
-                      unscoreable: "mute", discovered: "warn" }[r.status] || "mute";
+                      dead_letter: "bad", judge_failed: "warn",
+                      unscoreable: "mute" }[r.status] || "mute";
         return '<span class="c ' + cls + '">' + esc(r.status) + "</span>"; } },
     { h: "عدد", cls: "num", f: (r) => num(r.n) },
     { h: "بخطأ", cls: "num", f: (r) => num(r.with_error) },
     { h: "آخر حركة", cls: "num", f: (r) => when(r.last_moved) + " · " + ago(r.last_moved) },
   ];
   table($("chatJobs"), d.chat_jobs, jobCols("طابور الشاتات"), "الطابور فاضي");
-  table($("callJobs"), d.call_jobs, jobCols("طابور المكالمات"), "الطابور فاضي");
 
   /* --- cost --- */
   table($("cost"), d.cost, [
@@ -491,8 +479,6 @@ function render(rep) {
 
   table($("quality"), d.quality_by_input, [
     { h: "نوع المدخل", k: "input_type", cls: "id" },
-    { h: "فصل المتكلمين", f: (r) => '<span class="c mute">' + esc(r.diarization || "none") + "</span>" },
-    { h: "شريحة الثقة", k: "confidence_bucket", cls: "num" },
     { h: "n", cls: "num", f: (r) => num(r.n) },
     { h: "n مقيّم", cls: "num", f: (r) => num(r.n_usable) },
     { h: "المتوسط", cls: "num", f: (r) => {

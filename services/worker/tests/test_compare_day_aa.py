@@ -131,7 +131,7 @@ def test_a_missing_prompt_is_refused():
 # ── follow-up history format ────────────────────────────────────────────────
 
 LATER = [{
-    "started_at": "2026-08-13 14:52", "channel": "phone_call", "kind": "q",
+    "started_at": "2026-08-13 14:52", "channel": "chat", "direction": "inbound",
     "hours_after": 6.4, "first_message": None,
 }, {
     "started_at": "2026-08-14 09:10", "channel": "whatsapp", "direction": "outbound",
@@ -143,8 +143,8 @@ def test_the_current_format_names_direction_and_handler():
     """The three things day 13 proved the old block could not say."""
     block = cd.render_current_history(LATER)
     assert block.startswith("Subsequent contact with this customer:")
-    assert "INBOUND: the customer called in, this is not an agent follow-up" in block
-    assert "no individual agent recorded (queue recording)" in block
+    assert "direction inbound" in block
+    assert "handled by not recorded" in block
     assert "handled by خالد" in block
     assert '"أرسلت لك العرض"' in block
 
@@ -162,7 +162,7 @@ def test_current_format_falls_back_and_says_so():
     Silently sending the old block under a flag that promises the new one is
     how Module 4 comes to look tested when it was not.
     """
-    stored = "  - [2026-08-13T14:52:55+00:00] phone_call by unknown, 6.4h after"
+    stored = "  - [2026-08-13T14:52:55+00:00] chat by unknown, 6.4h after"
     text, source = cd.followup_source_for(
         _item(followup_history=stored, followup_history_now=stored), "current")
     assert source == "fallback-stored"

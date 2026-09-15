@@ -14,6 +14,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .rubric_items import ITEMS, ChecksError, legal_values, score_criterion
+
 RUBRIC_VERSION = "1.0.0"
 
 WEIGHTS: dict[str, float] = {
@@ -148,6 +150,102 @@ def module_score(module_key: str, breakdown: dict[str, Any]) -> float | None:
     return round(earned / possible * 100, 2)
 
 
+def resolve_checks(module_key: str, block: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Turn a module's `checks` block into its numeric breakdown.
+
+    THE POINT OF THE WHOLE EXERCISE (v7). When the model reports observations
+    rather than scores, THESE are the scores — the `breakdown` numbers it also
+    emitted are advisory and are overwritten. Two models that saw the same
+    facts now produce the same number, because neither of them produced a
+    number at all.
+
+    A criterion whose checks are absent keeps whatever `breakdown` holds, so a
+    v6 response still scores exactly as it did. A criterion whose checks are
+    present but MALFORMED is a contract violation, not a silent fallback: the
+    fallback would be the model's own free-typed number, which is the thing
+    being removed.
+
+    `null` survives untouched. A criterion the situation never exercised has no
+    observations to report, and `checks: null` is how the model says so — it
+    must not become a zero here, which is rule 2 at its narrowest point.
+    """
+    checks = block.get("checks")
+    if not isinstance(checks, dict):
+        return dict(block.get("breakdown") or {}), []
+
+    breakdown = dict(block.get("breakdown") or {})
+    problems: list[str] = []
+
+    for criterion in ITEMS[module_key]:
+        if criterion not in checks:
+            continue
+        observed = checks[criterion]
+        if observed is None:
+            breakdown[criterion] = None
+            continue
+        try:
+            breakdown[criterion] = score_criterion(module_key, criterion, observed)
+        except ChecksError as exc:
+            problems.append(str(exc))
+
+    return breakdown, problems
+
+
+def materialise_checks(modules: dict[str, Any]) -> list[str]:
+    """Fill every module's `breakdown` from its `checks`, IN PLACE, before any
+    validation runs.
+
+    THE BUG THIS EXISTS TO STOP, found on the first real v7 run. The prompt
+    tells the model not to emit `breakdown` — the numbers are not its to
+    produce. `validate_completeness` was written for v6 and demands one. So a
+    PERFECT v7 response, with all thirty observations answered and every quote
+    valid, was rejected five times over as "breakdown is missing", re-asked
+    once, rejected again, and stored as `contract_failed` with a null score.
+
+    The response was right and the validator was reading the wrong field. So
+    the checks are resolved here, first, and everything downstream keeps seeing
+    exactly what it saw in v6: a `breakdown` of numbers per criterion.
+
+    Returns the malformed-check problems, which the caller adds to the
+    contract violations so the model is asked about them in the same re-ask as
+    everything else.
+    """
+    problems: list[str] = []
+    for key in WEIGHTS:
+        block = modules.get(key)
+        if not isinstance(block, dict) or "checks" not in block:
+            continue
+        breakdown, trouble = resolve_checks(key, block)
+        block["breakdown"] = breakdown
+        problems.extend(trouble)
+    return problems
+
+
+def validate_legal_values(modules: dict[str, Any]) -> list[str]:
+    """Reject a criterion score the rubric's own items cannot add up to.
+
+    `greeting` is 10 + 10 + 5, so it can be 0, 5, 10, 15, 20 or 25 and nothing
+    else. An 18 is not a strict reading of the rubric — it is the model
+    splitting a difference the rubric never offered, and it is exactly the
+    judgement that moves between runs. This catches it whether or not the
+    response carried `checks`.
+    """
+    problems: list[str] = []
+    for module_key, criteria in ITEMS.items():
+        breakdown = (modules.get(module_key) or {}).get("breakdown") or {}
+        for criterion in criteria:
+            value = breakdown.get(criterion)
+            if value is None:
+                continue
+            if not isinstance(value, (int, float)):
+                continue            # validate_ranges reports the type problem
+            if float(value) not in {float(v) for v in legal_values(module_key, criterion)}:
+                problems.append(
+                    f"{module_key}.{criterion} = {value}, which the rubric cannot "
+                    f"produce (legal: {sorted(legal_values(module_key, criterion))})")
+    return problems
+
+
 def compute(modules: dict[str, dict[str, Any]],
             ungradeable_modules: Any = ()) -> ScoreResult:
     """Recompute every module score and the weighted final from the breakdowns.
@@ -165,7 +263,13 @@ def compute(modules: dict[str, dict[str, Any]],
 
     for key in WEIGHTS:
         block = modules.get(key) or {}
-        breakdown = block.get("breakdown") or {}
+        breakdown, check_problems = resolve_checks(key, block)
+        warnings.extend(check_problems)
+        # The resolved numbers are written BACK so every later reader — the
+        # evidence enforcement, the stored row, the report — sees the score the
+        # checks produced rather than the one the model typed beside them.
+        if block:
+            block["breakdown"] = breakdown
         if key in ungradeable:
             scores[key] = None
             continue
@@ -537,6 +641,7 @@ def hard_violations(payload: dict, modules: dict[str, Any]) -> list[str]:
     return (validate_completeness(modules)
             + validate_nullability(modules)
             + validate_ranges(modules)
+            + validate_legal_values(modules)
             + validate_stage_consistency(payload, modules)
             + validate_refusal_link(modules))
 

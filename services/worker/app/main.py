@@ -1,8 +1,8 @@
 """HTTP surface for the worker. n8n orchestrates; this service does the work.
 
 The split is deliberate. n8n is good at scheduling, retries, branching and
-showing a business user what ran. It is bad at 400 lines of ASR chunking and
-rubric arithmetic, which belong in tested Python. So every n8n node here is a
+showing a business user what ran. It is bad at rubric
+arithmetic and evidence validation, which belong in tested Python. So every n8n node here is a
 single HTTP call to one of these endpoints.
 """
 from __future__ import annotations
@@ -10,8 +10,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
-import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,15 +19,12 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from . import asr_jobs, budget, db, report
-from .asr import cohere_arabic
+from . import budget, db, report
 from .config import settings
 from .evaluate import judge, metrics, scoring
 from .normalize.phone import try_normalize
-from .sources import CallRecording, get_call_source
 from .sources.base import Conversation, Message
 from .sources.bitrix_chats import BitrixWebhookSource
-from .sources.drive_calls import RecordingNameError, parse_recording_name
 
 log = logging.getLogger("worker")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -85,25 +80,25 @@ class PrepareChatRequest(BaseModel):
     external_id: str
     channel: str = "other"
     messages: list[StoredMessage]
-
-
-class TranscribeRequest(BaseModel):
-    audio_path: str = Field(description="local path, or drive://<fileId>")
-    filename: str | None = Field(default=None, description="for PBX metadata parsing")
-
-
-class ListCallsRequest(BaseModel):
-    since: str | None = Field(
-        default=None,
-        description="ISO-8601 instant. Recordings modified after this are returned. "
-                    "Omit for the last 2 days.",
-    )
-    limit: int = Field(default=500, ge=1, le=2000)
+    # Every later contact with the same customer, oldest first, straight out of
+    # `interactions`. Module 4 is 20% of the grade and asks a question this
+    # conversation cannot answer — did the agent come back? — so the judge is
+    # given the customer's timeline alongside the thread.
+    #
+    # Sent as ROWS, rendered here. The bullet format is a rule and rules live in
+    # `evaluate/metrics.py`; rendering it in the workflow's SQL instead would be
+    # a second copy of the format to keep in step with the first, which is
+    # exactly how Module 4 came to be unanswerable on day 13.
+    # `None` means the caller did not look; `[]` means it looked and found
+    # nothing. Module 4 scores null for the first and zero for the second, and
+    # a default of [] here would turn every caller that forgot the field into a
+    # silent claim that the agent never followed up.
+    later_interactions: list[dict[str, Any]] | None = None
 
 
 class EvaluateRequest(BaseModel):
     conversation: str
-    input_type: Literal["chat", "call_transcript"]
+    input_type: Literal["chat"] = "chat"
     metadata: dict[str, Any] = Field(default_factory=dict)
     followup_history: str | None = None
     run_pass1: bool = True
@@ -135,8 +130,6 @@ def ready() -> dict:
         "database": state("db"),
         "judge": state("judge"),
         "chats_source": state("chats"),
-        "calls_source": state("calls"),
-        "asr_backend": settings.asr_backend,
         "rubric_version": scoring.RUBRIC_VERSION,
         "prompt_versions": {"pass1": judge.PASS1_VERSION, "pass2": judge.PASS2_VERSION},
         "prompt_files": {"pass1": judge.PASS1_PROMPT_FILE, "pass2": judge.PASS2_PROMPT_FILE},
@@ -302,6 +295,13 @@ def prepare_chat(req: PrepareChatRequest) -> dict:
         ),
         "transcript_text": conv.transcript_text(),
         "metrics": computed.as_dict(),
+        # `None`, not "", when there is nothing to send. `build_pass2_prompt`
+        # turns None into the literal word "unavailable", which is what the
+        # rubric branches on — an empty string would render as a header with no
+        # bullets under it, and the model would have to guess whether that means
+        # "we looked and there was nothing" or "we did not look".
+        "followup_history": metrics.followup_history_block(
+            later_contacts=req.later_interactions),
     }
 
 
@@ -342,144 +342,6 @@ def normalize_phones(req: NormalizePhonesRequest) -> dict:
         "results": out,
         "normalised": sum(1 for r in out if r["e164"]),
         "failed": sum(1 for r in out if r["e164"] is None and r["raw"]),
-    }
-
-
-@app.post("/calls/parse-name", dependencies=[Depends(require_api_key)])
-def parse_call_name(filename: str) -> dict:
-    try:
-        meta = parse_recording_name(filename, settings.pbx_tz_offset_hours)
-    except RecordingNameError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-
-    phone, phone_error = try_normalize(meta["customer_phone_raw"], settings.default_phone_region)
-    meta["started_at"] = meta["started_at"].isoformat()
-    meta["customer_phone_e164"] = phone
-    meta["phone_error"] = phone_error
-    return meta
-
-
-def _call_source_or_503():
-    """The Drive source, or a 503 that names the missing variable.
-
-    Without this the first request after a half-finished setup dies on a raw
-    KeyError and returns a 500 with no clue which of the two variables is
-    absent — the same question /ready already answers precisely.
-    """
-    try:
-        settings.validate_for("calls")
-    except RuntimeError as exc:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
-    # Default to 'drive', not to get_call_source()'s 'mock'. These two endpoints
-    # only mean anything against Drive, and the Drive variables have just been
-    # confirmed present — falling back to the mock here would answer a request
-    # for real recordings with invented ones and look entirely successful.
-    return get_call_source(os.getenv("CALL_SOURCE") or "drive")
-
-
-@app.post("/calls/list", dependencies=[Depends(require_api_key)])
-def list_calls(req: ListCallsRequest) -> dict:
-    """New recordings in the Drive folder, already decoded from their filenames.
-
-    Listing lives here rather than in an n8n Google Drive node so the service
-    account exists in exactly one place. Two copies of a credential is two
-    things to rotate and one to forget, and n8n binds credentials by internal
-    id, so an exported workflow cannot carry it anyway.
-    """
-    since = (
-        datetime.fromisoformat(req.since)
-        if req.since
-        else datetime.now(timezone.utc) - timedelta(days=2)
-    )
-    if since.tzinfo is None:
-        since = since.replace(tzinfo=timezone.utc)
-
-    source = _call_source_or_503()
-    items = []
-    for rec in source.list_since(since, limit=req.limit):
-        phone, phone_error = try_normalize(rec.customer_phone_raw, settings.default_phone_region)
-        # Every field /calls/parse-name returns, plus where the audio lives, so a
-        # caller needs one round trip per batch instead of one per recording.
-        meta = dict(rec.raw.get("parsed_name") or {})
-        meta["started_at"] = rec.started_at.isoformat()
-        meta.update({
-            "external_id": rec.external_id,
-            "audio_uri": rec.audio_uri,
-            "filename": (rec.raw.get("drive_file") or {}).get("name"),
-            "customer_phone_e164": phone,
-            "phone_error": phone_error,
-            "size_bytes": rec.size_bytes,
-        })
-        items.append(meta)
-    return {"since": since.isoformat(), "count": len(items), "recordings": items}
-
-
-@app.post("/calls/transcribe", dependencies=[Depends(require_api_key)])
-def transcribe(req: TranscribeRequest) -> dict:
-    """Transcribe a local file, or a Drive object given as drive://<fileId>.
-
-    The Drive form matters: n8n and this worker are separate Railway services
-    with separate filesystems, so a path written by n8n is not a path this
-    process can open. Downloading here keeps the audio on one machine and off
-    the wire between them.
-    """
-    # Everything this request writes (downloaded audio, silence chunks) lives in
-    # one per-request directory and is deleted on the way out. The disk here is
-    # ephemeral and small; without this, each call leaks its full audio size and
-    # the service eventually dies with opaque 500s on every download.
-    os.makedirs(settings.work_dir, exist_ok=True)
-    scratch = tempfile.mkdtemp(prefix="asr_req_", dir=settings.work_dir)
-    try:
-        path = req.audio_path
-        if path.startswith("drive://"):
-            source = _call_source_or_503()
-            rec = CallRecording(
-                external_id=(req.filename or path.removeprefix("drive://")).removesuffix(".wav"),
-                external_source=getattr(source, "name", "asterisk_drive"),
-                audio_uri=path,
-                started_at=datetime.now(timezone.utc),
-            )
-            path = source.download(rec, scratch)
-
-        if not os.path.exists(path):
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"audio not found: {path}")
-
-        result = cohere_arabic.transcribe_call(
-            path, work_dir=scratch, target_sec=settings.asr_chunk_seconds
-        )
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-    return {
-        "full_text": result.full_text,
-        "dialogue": result.as_dialogue(),
-        "language": result.language,
-        "provider": result.provider,
-        "model_version": result.model_version,
-        "duration_seconds": result.duration_seconds,
-        "sample_rate_hz": result.sample_rate_hz,
-        "channels": result.channels,
-        "confidence": result.confidence,
-        "asr_metrics": result.metrics,
-        # Top-level so the n8n IF node can branch on it without digging into
-        # the metrics blob. red = do not evaluate: too much audio is
-        # unaccounted for (failed chunks, decoder loops, contamination-
-        # dominated text) to score an agent on what remains.
-        "asr_quality_status": result.metrics.get("asr_quality_status", "green"),
-        "diarization": result.diarization,
-        "segments": [
-            {"seq": s.seq, "start_sec": s.start_sec, "end_sec": s.end_sec,
-             "speaker": s.speaker, "text": s.text}
-            for s in result.segments
-        ],
-        # Loud, structured, and carried all the way to the evaluation row.
-        # Without diarization every agent score rests on the judge inferring who
-        # spoke, and that must never become an invisible assumption.
-        "warnings": (
-            ["no speaker diarization: agent/customer attribution is inferred by the "
-             "judge from content, not measured. Absolute rules (anger, ignoring the "
-             "customer, defeatist language) are suppressed in this mode."]
-            if result.diarization == "none" else []
-        ),
     }
 
 
@@ -873,155 +735,6 @@ def bitrix_contacts(req: BitrixContactsRequest) -> dict:
     return {"result": rows, "total": total, "fetched": len(rows),
             "truncated": len(rows) < total, "requests": requests,
             "requested_ids": len(ids)}
-
-
-# ---------------------------------------------------------------------------
-# ASR batch
-#
-# The Modal transcription batch used to open its own psycopg connection. Modal
-# runs outside Railway, `postgres.railway.internal` is Railway's private
-# network, and the connection never resolved. Opening the database to the
-# public internet would have fixed it and is the thing this project forbids, so
-# Modal calls these instead: the API key is the only credential that leaves
-# Modal, and the database stays private.
-#
-# Modal still owns the GPU, the audio and the chunking. It owns none of the
-# SQL — see app/asr_jobs.py, where the statements were moved verbatim.
-# ---------------------------------------------------------------------------
-
-class AsrRunStart(BaseModel):
-    run_id: str = Field(min_length=1, max_length=200)
-    gpu: str | None = None
-    model_version: str | None = None
-
-
-class AsrClaim(BaseModel):
-    run_id: str = Field(min_length=1, max_length=200)
-    claim_token: str
-    limit: int = Field(default=500, ge=1, le=2000)
-    max_attempts: int = Field(default=3, ge=1, le=10)
-
-
-class AsrStore(BaseModel):
-    uniqueid: str
-    claim_token: str
-    # Sent as objects and re-serialised here, so the caller cannot decide how
-    # this database's jsonb columns get encoded.
-    meta: dict[str, Any]
-    transcript: dict[str, Any]
-
-
-class AsrFail(BaseModel):
-    uniqueid: str
-    claim_token: str
-    error: str = ""
-    max_attempts: int = Field(default=3, ge=1, le=10)
-
-
-class AsrRelease(BaseModel):
-    claim_token: str
-
-
-class AsrRunFinish(BaseModel):
-    run_id: str
-    status: Literal["succeeded", "failed", "partial"]
-    processed: int = 0
-    failed: int = 0
-    audio_seconds: float = 0
-    gpu_seconds: float = 0
-    est_cost_usd: float | None = None
-    error: str | None = None
-
-
-def _asr(fn, *args, **kwargs):
-    """Run one asr_jobs call, turning a missing database into a 503 rather than
-    a 500 — the batch runs unattended at 23:30 and the difference is whether
-    tomorrow starts with a diagnosis or a log dig."""
-    try:
-        return fn(*args, **kwargs)
-    except db.DatabaseUnavailable as exc:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
-
-
-@app.post("/asr/run/start", dependencies=[Depends(require_api_key)])
-def asr_run_start(req: AsrRunStart) -> dict:
-    """Open the asr_runs row and mint this batch's lease token.
-
-    The token is minted HERE, not by the caller: it is the fence every later
-    write is checked against, and a caller that could choose it could also
-    reuse another run's."""
-    return _asr(asr_jobs.start_run, req.run_id, req.gpu, req.model_version)
-
-
-@app.post("/asr/claim", dependencies=[Depends(require_api_key)])
-def asr_claim(req: AsrClaim) -> dict:
-    """Claim a bounded batch of untranscribed calls.
-
-    Only `discovered` and `asr_failed` — the other half of gotcha 13's boundary
-    is the WHERE in workflow 02's `Claim work`, which takes `transcribed` and
-    `judge_failed`. Widen either and the same call is paid for twice.
-
-    THE MONEY GATE LIVES HERE, not in Modal. Modal reaches the database only
-    through this worker, so this is the one chokepoint every batch must pass:
-    a cap enforced in `modal/transcribe_job.py` would be advisory, and a
-    redeploy or a hand-run `modal run --limit 500` would walk straight past it.
-    Claiming nothing is the correct way to stop — an unclaimed recording keeps
-    its status and its attempt count, so a batch that is refused costs nothing
-    and loses nothing.
-    """
-    # Through _asr for the same reason every other statement here is: a missing
-    # database must be a 503, not a 500. The batch runs unattended at 23:30 and
-    # the difference is whether tomorrow starts with a diagnosis or a log dig.
-    allowed, note = _asr(budget.asr_claim_allowance, req.limit)
-    if allowed <= 0:
-        log.warning("asr claim refused: %s", note)
-        return {"claimed": 0, "recordings": [], "budget_blocked": True,
-                "reason": note}
-    rows = _asr(asr_jobs.claim, req.run_id, req.claim_token,
-                allowed, req.max_attempts)
-    return {"claimed": len(rows), "recordings": rows,
-            "budget_blocked": False, "reason": note}
-
-
-@app.post("/asr/store", dependencies=[Depends(require_api_key)])
-def asr_store(req: AsrStore) -> dict:
-    """Store the transcript and release the lease as `transcribed`.
-
-    An empty `updated` means the lease fence rejected the write — expired,
-    or the row was reclaimed by another run. That is not an error, and it must
-    not be reported as success either: the caller has to know its work was
-    discarded."""
-    rows = _asr(asr_jobs.store, req.uniqueid, req.claim_token,
-                json.dumps(req.meta, ensure_ascii=False),
-                json.dumps(req.transcript, ensure_ascii=False))
-    return {"stored": bool(rows), "updated": rows}
-
-
-@app.post("/asr/fail", dependencies=[Depends(require_api_key)])
-def asr_fail(req: AsrFail) -> dict:
-    rows = _asr(asr_jobs.fail, req.uniqueid, req.claim_token,
-                req.error, req.max_attempts)
-    return {"updated": rows}
-
-
-@app.post("/asr/release", dependencies=[Depends(require_api_key)])
-def asr_release(req: AsrRelease) -> dict:
-    """Give back everything this token holds, and the attempt it spent.
-
-    `--dry-run` uses this. Without it a dry run slowly dead-letters the backlog
-    it exists to inspect safely."""
-    rows = _asr(asr_jobs.release, req.claim_token)
-    return {"released": len(rows), "recordings": rows}
-
-
-@app.post("/asr/run/finish", dependencies=[Depends(require_api_key)])
-def asr_run_finish(req: AsrRunFinish) -> dict:
-    """Close the run. `rtfx` comes back computed — it is a generated column, so
-    the first real batch measures what every cost estimate has assumed."""
-    rows = _asr(asr_jobs.finish_run, req.run_id, req.status, req.processed,
-                req.failed, req.audio_seconds, req.gpu_seconds,
-                req.est_cost_usd, req.error)
-    return {"run": rows[0] if rows else None}
 
 
 # ---------------------------------------------------------------------------

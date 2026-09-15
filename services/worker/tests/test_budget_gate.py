@@ -18,7 +18,9 @@ REPO = Path(__file__).resolve().parents[3]
 WF = REPO / "n8n" / "workflows"
 POSTGRES = "n8n-nodes-base.postgres"
 
-SPENDERS = ["01d-chats-evaluate.json", "02-calls-v2-state-machine.json"]
+# One spender left. The list stays a list because the gate is a property of
+# "any workflow that costs money", not of this particular workflow.
+SPENDERS = ["01d-chats-evaluate.json"]
 
 
 def load(name: str) -> dict:
@@ -178,52 +180,10 @@ def test_status_write_and_gate_read_are_separate_statements(wf_name):
 # The Modal cap is enforced where it cannot be bypassed
 # ---------------------------------------------------------------------------
 
-def test_asr_claim_is_gated_in_the_worker_not_in_modal():
-    """Modal reaches the database only through the worker, so the worker is the
-    one chokepoint. A cap in `modal/transcribe_job.py` would be advisory: a
-    redeploy or a hand-run `modal run --limit 500` steps straight past it."""
-    main = py_body((REPO / "services" / "worker" / "app" / "main.py")
-                   .read_text(encoding="utf-8"))
-    claim = main.split("def asr_claim(", 1)[1].split("\ndef ", 1)[0]
-    assert "budget.asr_claim_allowance" in claim, (
-        "/asr/claim must ask the budget before handing out work")
-    assert "allowed" in claim and "req.limit" in claim, (
-        "the claim must be trimmed to what the remaining budget can pay for")
-
-
-def test_modal_job_does_not_enforce_its_own_cap():
-    """Belt and braces is fine; a cap that exists ONLY in Modal is not.
-
-    This asserts the enforcement is not silently moved back into the batch,
-    where a `--limit` override would defeat it.
-    """
-    job = py_body((REPO / "modal" / "transcribe_job.py").read_text(encoding="utf-8"))
-    assert "provider_budgets" not in job, (
-        "the cap belongs in the worker; Modal must not be the only enforcer")
-
-
-def test_audio_fetch_is_scheme_dispatched():
-    """The call source is going to change. `audio_uri` has always been
-    scheme-prefixed, but the batch used to strip 'drive://' and call Drive
-    unconditionally — which silently made Drive the only possible source."""
-    raw = (REPO / "modal" / "transcribe_job.py").read_text(encoding="utf-8")
-    assert "FETCHERS" in raw and "def fetch_audio(" in raw
-    code = py_body(raw)
-    assert "replace('drive://'" not in code, "stripping the scheme hardcodes Drive"
-    assert 'replace("drive://"' not in code, "stripping the scheme hardcodes Drive"
-    for scheme in ("drive", "https", "s3"):
-        assert f"'{scheme}'" in code or f'"{scheme}"' in code, (
-            f"no fetcher registered for {scheme}")
-
-
-# ---------------------------------------------------------------------------
-# The policy itself
-# ---------------------------------------------------------------------------
-
-def test_migration_declares_the_modal_hard_cap():
+def test_migration_declares_the_deepseek_cap():
     sql = (REPO / "db" / "migrations" / "020_spend_governance.sql").read_text(
         encoding="utf-8")
-    assert "'modal'" in sql and "30.00" in sql, "the 30 USD Modal cap must be seeded"
+    assert "'deepseek'" in sql, "deepseek must have a provider_budgets row"
     assert "hard_stop" in sql
 
 

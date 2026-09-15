@@ -26,7 +26,7 @@ from . import scoring
 PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 PASS1_VERSION = "pass1-customer-v6"
-PASS2_VERSION = "pass2-agent-quality-v6"
+PASS2_VERSION = "pass2-agent-quality-v7"
 
 # Version and file are kept together on purpose: bumping one and not the other
 # stamps a version string on a score the other prompt produced, and every
@@ -44,7 +44,7 @@ PASS2_VERSION = "pass2-agent-quality-v6"
 # it was — it is the text every score stamped `pass2-agent-quality-v5` came
 # from, and the round-3 audit is a record of what it does.
 PASS1_PROMPT_FILE = "pass1_customer_v6.md"
-PASS2_PROMPT_FILE = "pass2_agent_quality_v6.md"
+PASS2_PROMPT_FILE = "pass2_agent_quality_v7.md"
 
 # The explicit model id, not the `deepseek-chat` alias.
 #
@@ -343,13 +343,14 @@ class DeepSeekClient:
         raise JudgeError(f"DeepSeek call failed after {retries} attempts: {last}")
 
 
-def build_pass2_prompt(conversation: str, input_type: Literal["chat", "call_transcript"],
+def build_pass2_prompt(conversation: str, input_type: Literal["chat"] = "chat",
                        metadata: dict | None = None,
                        followup_history: str | None = None) -> str:
-    channel_rules = _load(
-        "channel_rules_call_v1.md" if input_type == "call_transcript"
-        else "channel_rules_chat_v1.md"
-    )
+    # One channel, one rules file. The branch that chose between them went with
+    # the calls lane; `input_type` survives because it is stamped on every
+    # stored evaluation and on the `model_calls` input hash, and dropping it
+    # would silently collide a chat hash with an archived call one.
+    channel_rules = _load("channel_rules_chat_v1.md")
     return (
         _load(PASS2_PROMPT_FILE)
         .replace("{{CHANNEL_RULES}}", channel_rules)
@@ -769,7 +770,7 @@ def _merge_usage(*usages: dict[str, Any]) -> dict[str, Any]:
     return total
 
 
-def run_pass2(conversation: str, input_type: Literal["chat", "call_transcript"],
+def run_pass2(conversation: str, input_type: Literal["chat"] = "chat",
               metadata: dict | None = None, followup_history: str | None = None,
               client: DeepSeekClient | None = None) -> Pass2Result:
     """Score the agent against the rubric, then recompute the arithmetic locally.
@@ -824,9 +825,15 @@ def run_pass2(conversation: str, input_type: Literal["chat", "call_transcript"],
     if not isinstance(modules, dict):
         raise JudgeError("response has no 'modules' object")
 
+    # v7 sends observations, not scores. Turn them into the `breakdown` every
+    # validator below was written to read, BEFORE any of them run — otherwise a
+    # correct v7 response fails `validate_completeness` for not carrying a field
+    # the prompt forbids it to send.
+    check_problems = scoring.materialise_checks(modules)
+
     # Both classes of problem go into the ONE correction: structural contract
     # violations, and every below-cap criterion that cites no usable quote.
-    violations = scoring.contract_violations(payload, modules)
+    violations = check_problems + scoring.contract_violations(payload, modules)
     evidence_problems = scoring.criterion_evidence_problems(payload, modules, conversation)
 
     retried = False
@@ -842,7 +849,8 @@ def run_pass2(conversation: str, input_type: Literal["chat", "call_transcript"],
         modules = payload.get("modules")
         if not isinstance(modules, dict):
             raise JudgeError("response has no 'modules' object after correction")
-        violations = scoring.contract_violations(payload, modules)
+        check_problems = scoring.materialise_checks(modules)
+        violations = check_problems + scoring.contract_violations(payload, modules)
 
     warnings: list[str] = []
     if retried:

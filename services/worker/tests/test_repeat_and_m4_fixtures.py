@@ -10,7 +10,7 @@ Two instruments, both of which report a verdict a decision gets made on:
   cannot be observed inside one call, so it is scored from a follow-up-history
   block built by SQL. On day 13 all five calls that HAD a timeline scored
   Module 4 null, because the block that reached the prompt said only
-  "phone_call by unknown". These fixtures check the rebuilt block is readable —
+  "<channel> by unknown". These fixtures check the rebuilt block is readable —
   and, more importantly, that an INBOUND callback from the customer is NOT
   credited to the agent.
 
@@ -206,14 +206,13 @@ def test_the_m4_blocks_are_in_the_current_production_format():
     # the message text, which is why the SQL now carries it
     assert 'قررتم شي؟"' in outbound["followup_history"]
 
-    # The label the SQL emits verbatim for a queue recording, which is what the
-    # judge has to read to know this was not the agent's doing.
-    assert ("INBOUND: the customer called in, this is not an agent follow-up"
-            in inbound["followup_history"])
-    assert ("no individual agent recorded (queue recording)"
-            in inbound["followup_history"])
-    assert "direction" not in inbound["followup_history"].replace(
-        "INBOUND: the customer called in, this is not an agent follow-up", "")
+    # The signal the judge has to read to know this was not the agent's doing.
+    # It used to be the sentence the renderer built for an inbound QUEUE CALL;
+    # with calls gone it is the direction field itself, which the chat side has
+    # always carried.
+    assert "direction inbound" in inbound["followup_history"]
+    assert "handled by not recorded" in inbound["followup_history"]
+    assert "direction outbound" not in inbound["followup_history"]
 
 
 def test_the_m4_call_clears_the_speech_gate():

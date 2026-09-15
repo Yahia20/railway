@@ -151,7 +151,7 @@ def _run(monkeypatch, history, quarantine):
         monkeypatch.delenv("JUDGE_M4_QUARANTINE", raising=False)
     payload = _clean_payload()
     client = StubClient(payload, payload)
-    return judge.run_pass2(CONVERSATION, "call_transcript",
+    return judge.run_pass2(CONVERSATION, "chat",
                            followup_history=history, client=client)
 
 

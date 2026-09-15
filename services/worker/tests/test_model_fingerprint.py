@@ -242,7 +242,7 @@ def test_pass2_carries_the_fingerprint_out():
     payload = {"schema_version": "1.0", "stage_reached": "closing",
                "modules": modules, "evidence": []}
     client = _StubClient(payload, payload)
-    result = judge.run_pass2(CONVERSATION, "call_transcript", client=client)
+    result = judge.run_pass2(CONVERSATION, "chat", client=client)
     assert result.usage["system_fingerprint"] == "fp_live"
     assert result.usage["model"] == "deepseek-v4-flash"
     assert result.usage["api_calls"] >= 1
@@ -272,7 +272,7 @@ def test_evaluate_exposes_the_fingerprint_on_both_passes(monkeypatch):
             {"real_ask": {"is_real_inquiry": False, "evidence": []}},
             payload, payload))
 
-    body = {"conversation": CONVERSATION * 3, "input_type": "call_transcript"}
+    body = {"conversation": CONVERSATION * 3, "input_type": "chat"}
     response = TestClient(main.app).post(
         "/evaluate", json=body, headers={"X-API-Key": "k"})
     assert response.status_code == 200, response.text

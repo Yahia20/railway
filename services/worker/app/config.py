@@ -51,11 +51,6 @@ class Settings:
     # tuning knob.
     deepseek_thinking: str | None = field(default_factory=lambda: _env("DEEPSEEK_THINKING"))
 
-    # --- ASR --------------------------------------------------------------
-    asr_backend: str = field(default_factory=lambda: _env("ASR_BACKEND", "space"))
-    cohere_api_key: str | None = field(default_factory=lambda: _env("COHERE_API_KEY"))
-    asr_chunk_seconds: float = field(default_factory=lambda: float(_env("ASR_CHUNK_SECONDS", "40")))
-
     # --- Sources ----------------------------------------------------------
     bitrix_portal_domain: str | None = field(default_factory=lambda: _env("BITRIX_PORTAL_DOMAIN"))
     bitrix_webhook_token: str | None = field(default_factory=lambda: _env("BITRIX_WEBHOOK_TOKEN"))
@@ -64,9 +59,6 @@ class Settings:
     # part of the REST path. Bitrix's own examples use 1, which is why that was
     # the old default; the working webhook here belongs to user 128.
     bitrix_webhook_user_id: str = field(default_factory=lambda: _env("BITRIX_WEBHOOK_USER_ID", "1"))
-
-    drive_folder_id: str | None = field(default_factory=lambda: _env("DRIVE_CALLS_FOLDER_ID"))
-    drive_credentials_json: str | None = field(default_factory=lambda: _env("GOOGLE_SERVICE_ACCOUNT_JSON"))
 
     # --- Regional ---------------------------------------------------------
     # Not guessable: 0500000000 is a valid Saudi mobile and meaningless in Egypt.
@@ -95,8 +87,6 @@ class Settings:
             "db": [("DATABASE_URL", self.database_url)],
             "judge": [("DEEPSEEK_API_KEY", self.deepseek_api_key)],
             "api": [("WORKER_API_KEY", self.worker_api_key)],
-            "calls": [("DRIVE_CALLS_FOLDER_ID", self.drive_folder_id),
-                      ("GOOGLE_SERVICE_ACCOUNT_JSON", self.drive_credentials_json)],
             "chats": [("BITRIX_PORTAL_DOMAIN", self.bitrix_portal_domain),
                       ("BITRIX_WEBHOOK_TOKEN", self.bitrix_webhook_token)],
         }
@@ -106,8 +96,6 @@ class Settings:
             for name, value in required.get(cap, [])
             if not value
         ]
-        if self.asr_backend == "cohere_api" and not self.cohere_api_key:
-            missing.append("COHERE_API_KEY")
         if missing:
             raise RuntimeError(
                 "missing required environment variables: " + ", ".join(sorted(set(missing)))

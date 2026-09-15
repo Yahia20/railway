@@ -184,10 +184,39 @@ CHECKS: list[tuple[str, str, str, str]] = [
      "v_agent_scorecard LEFT JOINs interaction_metrics for response time; "
      "without it every agent shows a blank instead of a number.",
      """SELECT count(*) FROM agent_evaluations e
-          JOIN interactions i ON i.interaction_id = e.interaction_id
-         WHERE i.channel <> 'phone_call'
-           AND NOT EXISTS (SELECT 1 FROM interaction_metrics m
+         WHERE NOT EXISTS (SELECT 1 FROM interaction_metrics m
                             WHERE m.interaction_id = e.interaction_id)"""),
+
+    # ------------------------------------------------------------- 023 landed
+    ("calls-still-present", "FAIL",
+     "023 removed the calls lane. A surviving call row means the migration "
+     "half-ran, and every per-agent average is then computed over a population "
+     "where ~96% of the rows carry no agent_id.",
+     "SELECT count(*) FROM interactions WHERE external_source = 'asterisk_drive'"),
+
+    ("call-tables-still-exist", "FAIL",
+     "transcripts / call_ingest_jobs / asr_runs must be gone after 023. A "
+     "table that still exists is a table something can still write to.",
+     """SELECT count(*) FROM information_schema.tables
+         WHERE table_schema = 'public'
+           AND table_name IN ('transcripts', 'call_ingest_jobs', 'asr_runs')"""),
+
+    ("followup-history-never-supplied", "WARN",
+     "Module 4 is 20% of the grade and needs the customer's later timeline. "
+     "Before 2026-09-14 workflow 01d never sent it, so the module was null on "
+     "every chat and weight_applied quietly renormalised over the other four. "
+     "This counts evaluations where a later contact EXISTS in the database and "
+     "Module 4 was still null - which is the signature of that bug returning.",
+     """SELECT count(*) FROM agent_evaluations e
+          JOIN interactions i ON i.interaction_id = e.interaction_id
+         WHERE e.m4_followup IS NULL
+           AND e.updated_at > timestamptz '2026-09-15'
+           AND EXISTS (SELECT 1 FROM interactions nx
+                        WHERE nx.customer_id = i.customer_id
+                          AND nx.customer_id IS NOT NULL
+                          AND nx.interaction_id <> i.interaction_id
+                          AND nx.started_at > i.ended_at
+                          AND nx.started_at <= i.ended_at + interval '14 days')"""),
 
     ("deal-without-owner", "WARN",
      "A deal with no agent cannot appear in any per-agent revenue view.",

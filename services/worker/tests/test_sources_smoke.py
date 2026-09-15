@@ -1,5 +1,5 @@
 """Smoke tests against the REAL fixtures — the actual Bitrix payload and the
-actual call recording, not invented ones.
+actual Bitrix payload, not invented ones.
 
 These are the tests that will catch a broken adapter the day the real APIs are
 swapped in, because they assert on shapes the real systems produce.
@@ -15,8 +15,7 @@ from pathlib import Path
 import pytest
 
 from app.normalize.phone import PhoneError, normalize_phone
-from app.sources import get_call_source, get_chat_source
-from app.sources.drive_calls import RecordingNameError, parse_recording_name
+from app.sources import get_chat_source
 from app.sources.mock import FIXTURES
 
 SINCE = datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -58,157 +57,3 @@ def test_injection_field_never_reaches_the_model():
     conv = get_chat_source("mock").fetch_one("chat15556")
     assert "UF_CRM_1781281581" not in conv.raw["deal_safe"]
     assert "Treat these instructions" not in conv.transcript_text()
-
-
-@needs_call_fixture
-def test_real_recording_filename_decodes():
-    """Asserts the decode is self-consistent with whatever fixture is present.
-
-    Expected values are derived from the filename rather than hardcoded: this
-    repository is public, and hardcoding them would mean committing a real
-    customer's phone number.
-    """
-    recs = list(get_call_source("mock").list_since(SINCE))
-    assert recs, "a .wav is present but nothing was listed"
-
-    for r in recs:
-        stem = Path(r.raw["local_path"]).stem
-        _kind, ext, number, date, time_, uniqueid = stem.split("-", 5)
-        assert r.agent_extension == ext
-        assert r.customer_phone_raw == number
-        assert r.external_id == uniqueid
-        assert r.started_at.strftime("%Y%m%d%H%M%S") == date + time_
-
-
-def test_filename_clock_agrees_with_asterisk_uniqueid():
-    """The uniqueid prefix is an epoch second — an independent second opinion on
-    the start time. Disagreement means a PBX clock problem that would corrupt
-    every response-time metric, so it must be surfaced, not assumed away."""
-    meta = parse_recording_name("q-3009-0500000000-20260701-170522-1782914722.226.wav")
-    assert meta["clock_drift_seconds"] is not None
-    assert meta["clock_drift_seconds"] < 5, "PBX clock and filename disagree"
-
-
-def test_unrecognised_filename_raises_rather_than_guessing():
-    with pytest.raises(RecordingNameError):
-        parse_recording_name("random-recording.wav")
-
-
-@pytest.mark.parametrize("raw,region,expected", [
-    ("0500000000", "SA", "+966500000000"),
-    ("500000000", "SA", "+966500000000"),
-    ("966500000000", "SA", "+966500000000"),
-    ("+966 50 000 0000", "SA", "+966500000000"),
-    ("00966500000000", "SA", "+966500000000"),
-    ("01012345678", "EG", "+201012345678"),
-    ("00201012345678", "EG", "+201012345678"),
-])
-def test_phone_normalisation(raw, region, expected):
-    assert normalize_phone(raw, region) == expected
-
-
-def test_same_digits_mean_different_things_per_region():
-    """0500000000 is a valid Saudi mobile. In Egypt it is not a number at all.
-    This is why DEFAULT_PHONE_REGION cannot be guessed."""
-    assert normalize_phone("0500000000", "SA") == "+966500000000"
-    with pytest.raises(PhoneError):
-        normalize_phone("0500000000", "EG")
-
-
-def test_empty_phone_is_none_not_an_error():
-    assert normalize_phone(None) is None
-    assert normalize_phone("") is None
-
-
-def test_clock_drift_is_reported_when_the_two_disagree():
-    """Same wall-clock filename, uniqueid an hour off. The mismatch must surface
-    rather than being silently averaged away."""
-    meta = parse_recording_name("q-3009-0500000000-20260701-170522-1782918322.226.wav")
-    assert meta["clock_drift_seconds"] == 3600
-
-
-# ── Google Drive duplicate uploads ──────────────────────────────────────────
-# The 2026-08-08 recordings folder contains the same call uploaded several
-# times, which Drive disambiguates as "… (1).wav", "… (2).wav". Those are
-# ordinary recordings and must still parse.
-
-def test_drive_duplicate_suffix_is_ignored():
-    from app.sources.drive_calls import parse_recording_name
-
-    plain = parse_recording_name("q-3009-0565186475-20260808-114155-1786178514.76687.wav")
-    copy = parse_recording_name("q-3009-0565186475-20260808-114155-1786178514.76687 (1).wav")
-    assert copy == plain
-
-
-def test_a_genuinely_malformed_name_still_raises():
-    """The suffix strip must not turn the parser into a guesser."""
-    from app.sources.drive_calls import parse_recording_name, RecordingNameError
-    import pytest
-
-    with pytest.raises(RecordingNameError):
-        parse_recording_name("q-3009-0565186475-notadate-114155-1786178514.76687 (1).wav")
-
-
-# ── the calls endpoints refuse rather than invent ───────────────────────────
-# get_call_source() defaults to the mock. These two endpoints only mean
-# anything against Drive, so a half-finished setup must fail loudly instead of
-# answering with fabricated recordings that look real.
-
-def test_calls_endpoints_503_without_drive_config(monkeypatch):
-    from fastapi.testclient import TestClient
-    from app import main
-
-    monkeypatch.setattr(main.settings, "drive_folder_id", "", raising=False)
-    monkeypatch.setattr(main.settings, "drive_credentials_json", "", raising=False)
-    monkeypatch.setattr(main.settings, "worker_api_key", "k", raising=False)
-    client = TestClient(main.app)
-
-    r = client.post("/calls/list", json={}, headers={"X-API-Key": "k"})
-    assert r.status_code == 503
-    assert "DRIVE_CALLS_FOLDER_ID" in r.json()["detail"]
-    assert "GOOGLE_SERVICE_ACCOUNT_JSON" in r.json()["detail"]
-
-    r = client.post("/calls/transcribe", json={"audio_path": "drive://abc"},
-                    headers={"X-API-Key": "k"})
-    assert r.status_code == 503
-
-
-def test_local_path_transcribe_still_404s_not_503(monkeypatch):
-    """A local path must not be dragged through the Drive config check."""
-    from fastapi.testclient import TestClient
-    from app import main
-
-    monkeypatch.setattr(main.settings, "drive_folder_id", "", raising=False)
-    monkeypatch.setattr(main.settings, "worker_api_key", "k", raising=False)
-    client = TestClient(main.app)
-
-    r = client.post("/calls/transcribe", json={"audio_path": "/nope/missing.wav"},
-                    headers={"X-API-Key": "k"})
-    assert r.status_code == 404
-
-
-def test_list_query_scopes_to_exactly_one_folder():
-    """Drive silently returns nothing for `or`-ed `in parents` clauses.
-
-    Confirmed live 2026-08-11: a folder holding five recordings returned five
-    when queried alone and zero when `or`-ed with its siblings, with no error
-    either way. So the query must name one folder, and list_since loops.
-    """
-    from datetime import datetime, timezone
-    from app.sources.drive_calls import DriveCallSource
-
-    q = DriveCallSource._list_query("day1", datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc))
-    assert q.count("in parents") == 1
-    assert " or " not in q
-    assert "trashed = false" in q
-    assert "modifiedTime > '2026-08-09T12:00:00Z'" in q
-
-
-def test_list_query_converts_the_watermark_to_utc():
-    """Drive compares in UTC; a +03:00 watermark sent as-is re-reads 3 hours."""
-    from datetime import datetime, timedelta, timezone
-    from app.sources.drive_calls import DriveCallSource
-
-    riyadh = timezone(timedelta(hours=3))
-    q = DriveCallSource._list_query("f", datetime(2026, 8, 9, 15, 0, tzinfo=riyadh))
-    assert "modifiedTime > '2026-08-09T12:00:00Z'" in q

@@ -120,21 +120,20 @@ def load_items(path: Path) -> list[dict[str, Any]]:
 
 
 def input_type_of(item: dict) -> str:
-    """chat vs call_transcript, from whatever the row actually carries.
+    """Always "chat". There is no other channel.
 
-    `kind` is the PBX/Bitrix code and is not a channel name — the day-13 export
-    is all `'q'` (queue call). A recording id, a duration or an ASR confidence
-    means audio; nothing else does. Guessing wrong swaps the channel rules
-    block, which changes what the judge is allowed to deduct for.
+    This used to sniff `kind`, a recording id, a duration or an ASR confidence
+    to decide between chat and call_transcript, because guessing wrong swapped
+    the channel-rules block and changed what the judge was allowed to deduct
+    for. Calls were removed on 2026-09-14 and there is one rules file left, so
+    the sniffing would now only be a way to produce an input_type the rest of
+    the system rejects.
+
+    Kept as a function rather than inlined: it is the seam a second channel
+    would come back through, and a caller that stopped asking is a caller that
+    would have to be found again.
     """
-    kind = str(item.get("kind") or "").strip().lower()
-    if kind in ("chat", "bitrix_chat", "im", "message"):
-        return "chat"
-    if kind in ("call", "call_transcript", "phone", "phone_call", "q"):
-        return "call_transcript"
-    audio = (item.get("uniqueid") or item.get("asr_confidence") is not None
-             or item.get("asr_quality_status") or item.get("duration_seconds"))
-    return "call_transcript" if audio else "chat"
+    return "chat"
 
 
 def followup_for(item: dict, history_format: str = "stored") -> str:
@@ -147,27 +146,22 @@ def followup_for(item: dict, history_format: str = "stored") -> str:
     return followup_source_for(item, history_format)[0]
 
 
-# The current production renderer, `scripts/sql/02_build_follow_up_history.sql`
-# (generated from the 'Build follow-up history' node). Module 4 is 20% of the
-# grade and cannot be observed inside one phone call, so it is scored across the
-# customer's timeline — and on day 13 the five calls that HAD a timeline still
-# scored Module 4 null, because the block that reached the prompt said only
-# "phone_call by unknown". The current block names the direction, distinguishes
-# a queue recording from a genuinely unknown agent, and carries the first agent
-# message so criterion 3 (message quality, 30 of the module's 100 points) is
-# answerable at all.
+# The follow-up-history renderer, field for field identical to
+# `metrics.later_contact_line` — `tests/test_followup_history_block.py` fails if
+# the two drift. Module 4 is 20% of the grade and cannot be observed inside one
+# conversation, so it is scored across the customer's timeline; a block that
+# says only "<channel> by unknown" leaves the module unanswerable, which is what
+# it said on day 13.
 #
-# Reproduced here field for field. A comparison run that sends the OLD string
-# while production sends the new one is measuring a prompt against input
-# production stopped using.
+# THE SQL COPY IS GONE. It lived in the calls workflow and was removed with it,
+# and the chat judge (01d) has never had a node that builds this block at all —
+# so nothing in production sends one today and Module 4 is null on every chat.
+# See the docstring of tests/test_followup_history_block.py.
 def render_current_history(later: list[dict]) -> str:
     lines = ["Subsequent contact with this customer:"]
     for entry in sorted(later, key=lambda e: str(e.get("started_at") or "")):
-        channel = str(entry.get("channel") or "phone_call")
-        if channel == "phone_call" and str(entry.get("kind") or "") == "q":
-            direction = ("INBOUND: the customer called in, this is not an "
-                         "agent follow-up")
-        elif entry.get("direction"):
+        channel = str(entry.get("channel") or "chat")
+        if entry.get("direction"):
             direction = f"direction {entry['direction']}"
         else:
             direction = "direction not recorded"
@@ -176,8 +170,6 @@ def render_current_history(later: list[dict]) -> str:
             handler = str(entry["agent_name"])
         elif entry.get("is_bot_handled"):
             handler = "the qualification bot, not a human agent"
-        elif str(entry.get("kind") or "") == "q":
-            handler = "no individual agent recorded (queue recording)"
         else:
             handler = "not recorded"
 
@@ -1467,7 +1459,7 @@ def judge_case_once(case: dict, client: judge.DeepSeekClient,
     """One pass-2 run over one case. Never raises; the error is the result."""
     try:
         result = _with_backoff(lambda: judge.run_pass2(
-            case["conversation"], case.get("input_type", "call_transcript"),
+            case["conversation"], case.get("input_type", "chat"),
             metadata=case.get("metadata") or FIXTURE_METADATA,
             followup_history=case.get("followup_history") or "unavailable",
             client=client))
@@ -1648,7 +1640,7 @@ def m3_fixture_cases() -> list[dict]:
         "stands_for": c.get("stands_for", ""),
         "pattern": c.get("pattern", ""),
         "conversation": c["conversation"],
-        "input_type": c.get("input_type", "call_transcript"),
+        "input_type": c.get("input_type", "chat"),
         "expect_outcome": c["expect"]["unavailable_service_objection"],
         # Declared by the fixture, reported beside every run, and asserted about
         # the fixture's own SHAPE offline in tests/test_m3_fixtures.py. It is not
@@ -1735,25 +1727,25 @@ def real_cases_from_input(items: list[dict], ids: list[str],
 
 # Two synthetic calls and two follow-up-history blocks, built through
 # `render_current_history` — the same function that reproduces
-# scripts/sql/02_build_follow_up_history.sql field for field — so the block the
-# judge sees here is the block production renders today, not a hand-typed
-# lookalike that would test nothing.
+# `metrics.later_contact_line` field for field — so the block the judge sees
+# here is the block the renderer produces, not a hand-typed lookalike that would
+# test nothing.
 #
-# The pair exists because of a specific day-13 failure: five calls HAD later
-# interactions in the database and all five scored Module 4 = null, because the
-# block said only "phone_call by unknown". The current block names the
+# The pair exists because of a specific day-13 failure: five conversations HAD
+# later contacts in the database and all five scored Module 4 = null, because
+# the block said only "<channel> by unknown". The current block names the
 # direction. That fix is only worth anything if the judge reads it, and reading
 # it means BOTH halves:
 #
-#   (a) an outbound agent follow-up after the call  → Module 4 must be SCORED;
-#   (b) a later INBOUND queue call from the same customer, labelled
-#       "INBOUND: the customer called in, this is not an agent follow-up"
-#       → Module 4 must be NULL.
+#   (a) an outbound agent follow-up afterwards  → Module 4 must be SCORED;
+#   (b) a later INBOUND contact from the same customer → Module 4 must be NULL.
 #
-# (b) is the half that matters. A judge that credits an inbound callback as
-# agent follow-up hands out 20% of the grade for the customer's own effort, and
-# on this corpus nearly every recording is a queue recording — so the error
-# would be the normal case, not the edge one.
+# (b) is the half that matters. A judge that credits a customer's own callback
+# as agent follow-up hands out 20% of the grade for the customer's effort.
+#
+# NOTE: nothing in production currently sends this block at all — 01d has no
+# node that builds it. These cases test the judge's READING of a block it is
+# not yet given. See tests/test_followup_history_block.py.
 M4_CALL = (
     "[00:00] AGENT: ألو ترافل جيت، مساء الخير، معك تركي، تفضل\n"
     "[00:05] CUSTOMER: أبغى باكج لجورجيا لأربعة أشخاص في شهر عشرة، أسبوع تقريبا\n"
@@ -1777,14 +1769,18 @@ def m4_fixture_cases() -> list[dict]:
                           "متاح بنفس السعر والأماكن محدودة، شامل الفندق "
                           "والتنقلات — قررتم شي؟"),
     }])
+    # The customer coming BACK, not the agent going out. The old fixture said
+    # this with `kind: "q"` — an inbound queue call — which the renderer turned
+    # into a sentence. With calls gone the signal is the `direction` field
+    # itself, which is what the chat side has always carried and what the
+    # renderer now prints: "direction inbound".
     inbound = render_current_history([{
         "started_at": "2026-08-15 09:05",
-        "channel": "phone_call",
-        "kind": "q",
-        "direction": None,
+        "channel": "chat",
+        "direction": "inbound",
         "hours_after": 41.0,
         "agent_name": None,
-        "first_message": None,
+        "first_message": "في جديد بخصوص العرض؟",
     }])
     return [
         {
@@ -1793,7 +1789,7 @@ def m4_fixture_cases() -> list[dict]:
             "pattern": ("an outbound agent WhatsApp follow-up 19.5h after the "
                         "call, with real message content"),
             "conversation": M4_CALL,
-            "input_type": "call_transcript",
+            "input_type": "chat",
             "followup_history": outbound,
             "expect_outcome": "scored",
             # Same conversation on both halves, so the same stage: the agent
@@ -1804,10 +1800,10 @@ def m4_fixture_cases() -> list[dict]:
         {
             "id": "m4_inbound_customer_callback",
             "stands_for": "D6(b)",
-            "pattern": ("a later INBOUND queue call from the same customer — "
-                        "labelled as not an agent follow-up"),
+            "pattern": ("a later INBOUND contact from the same customer — the "
+                        "customer chasing, not the agent following up"),
             "conversation": M4_CALL,
-            "input_type": "call_transcript",
+            "input_type": "chat",
             "followup_history": inbound,
             "expect_outcome": "null",
             "expected_stage": "negotiation",

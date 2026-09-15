@@ -143,8 +143,8 @@ def test_the_fixtures_run_against_the_prompt_the_judge_actually_uses(prompt):
     prompt through `judge.PASS2_PROMPT_FILE` makes that impossible: point the
     judge somewhere else and these tests follow it.
     """
-    assert judge.PASS2_PROMPT_FILE == "pass2_agent_quality_v6.md"
-    assert judge.PASS2_VERSION == "pass2-agent-quality-v6"
+    assert judge.PASS2_PROMPT_FILE == "pass2_agent_quality_v7.md"
+    assert judge.PASS2_VERSION == "pass2-agent-quality-v7"
     # The label a row is stamped with must be derivable from the filename, or
     # the two drift and nothing downstream can tell which text produced a score.
     assert judge.PASS2_VERSION == Path(judge.PASS2_PROMPT_FILE).stem.replace("_", "-")
@@ -152,7 +152,11 @@ def test_the_fixtures_run_against_the_prompt_the_judge_actually_uses(prompt):
 
 
 def test_the_prompt_carries_the_revision_the_fixtures_were_written_for(prompt):
-    assert "revision: v6" in prompt
+    # v7 changed the SHAPE of the answer, not the Module-3 calibration these
+    # fixtures test: the trigger gates, the exclusion list, the counterweight
+    # and the refusal tests were carried over character for character. The
+    # other tests in this file are what prove that, and they still pass.
+    assert "revision: v7" in prompt
     assert "EXCLUSION LIST" in prompt
 
 

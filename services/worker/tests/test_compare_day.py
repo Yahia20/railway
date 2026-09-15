@@ -62,7 +62,11 @@ def test_the_cache_key_covers_every_effective_input():
                         only_pass2=False) != base
     assert cd.cache_key(_item(followup_history="Subsequent contact: ..."),
                         only_pass2=False) != base
-    assert cd.cache_key(_item(kind="chat"), only_pass2=False) != base
+    # `kind` USED to pick between the chat and call rules blocks, which changed
+    # what the judge could deduct for, so it belonged in the key. With calls
+    # gone there is one rules block and `kind` reaches no prompt — a key that
+    # still varied on it would miss every cache hit for no reason.
+    assert cd.cache_key(_item(kind="chat"), only_pass2=False) == base
     # A pass2-only smoke run must not poison a later full run: the cached entry
     # has no pass 1 in it, and reading it back reports pass-1 validation as
     # absent for the whole day.

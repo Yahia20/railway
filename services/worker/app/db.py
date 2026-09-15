@@ -1,31 +1,23 @@
 """Read-only database access for the worker.
 
-WHY THIS DID NOT EXIST BEFORE. Every write in this system goes through an n8n
-Postgres node: n8n owns the transaction, the retry and the lease, and the worker
-is a pure function it calls.
+THE WORKER DOES NOT WRITE. NOT "MOSTLY". AT ALL.
 
-THERE IS NOW EXACTLY ONE EXCEPTION, AND IT IS NAMED. The Modal transcription
-batch runs outside Railway and cannot reach `postgres.railway.internal` at all;
-the alternative was opening the database to the public internet, which this
-project forbids. So Modal calls the worker over HTTPS with the API key, and the
-worker performs the writes — the same statements workflow 02 was audited on,
-moved rather than rewritten (see app/asr_jobs.py).
+It used to have exactly one exception. Modal ran the transcription batch from
+outside Railway, could not reach `postgres.railway.internal`, and the only
+alternative to a writer here was putting the database on the public internet —
+so `writer()`/`write()` existed for `app/asr_jobs.py` and a test enforced that
+nothing else touched them.
 
-That exception lives behind `writer()`. `cursor()`, `rows()` and `one()` stay
-read-only, and a test still asserts every report query starts with SELECT. Two
-pools, two names, so "which one is this" is never a question you have to answer
-by reading the SQL.
+Calls were removed from the pipeline on 2026-09-14 and that exception went with
+them. n8n is now the only writer in the system, which is the property the split
+was supposed to have in the first place: a bug in this service cannot corrupt a
+score, because this service cannot change a row. Restoring the writer means
+restoring the reason — read `shared-before/services/worker/app/db.py` in the
+calls archive rather than re-deriving it, and put the test back with it.
 
-WHAT IT IS FOR. The reporting endpoint needs to read thirteen views that already
-exist in the database. Shipping those numbers back through n8n would mean a
-workflow whose only job is to forward SELECT results to a browser.
-
-THREE GUARANTEES, EACH ENFORCED HERE RATHER THAN TRUSTED:
-
-  read-only    every READER connection sets `default_transaction_read_only`,
-               so a typo in a report query fails instead of writing. The report
-               path can never be the thing that corrupts a score. The writer
-               pool is separate, small, and used by the ASR endpoints only.
+  read-only    every connection sets `default_transaction_read_only`, so a
+               typo in a query fails instead of writing. Nothing in this
+               service can be the thing that corrupts a score.
   bounded      `statement_timeout` caps a query that hits a bad plan, and the
                pool caps concurrency. A report someone reloads impatiently must
                not starve the judge of connections.
@@ -54,7 +46,6 @@ STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "10000"))
 CONNECT_TIMEOUT_S = float(os.getenv("DB_CONNECT_TIMEOUT_S", "10"))
 
 _pool: Any = None
-_write_pool: Any = None
 _lock = threading.Lock()
 
 
@@ -113,7 +104,7 @@ def _build_pool(read_only: bool = True) -> Any:
         # Do not connect at construction time. A database that is briefly down
         # must not stop the worker from starting and serving /health.
         open=False,
-        name="worker-readonly" if read_only else "worker-writer",
+        name="worker-readonly",
     )
     pool.open()
     return pool
@@ -126,20 +117,6 @@ def get_pool() -> Any:
             if _pool is None:
                 _pool = _build_pool(read_only=True)
     return _pool
-
-
-def get_write_pool() -> Any:
-    """The writer. Used by app/asr_jobs.py and nothing else.
-
-    Kept small on purpose: the ASR batch is one caller doing one row at a time,
-    and a wide writer pool against a database whose other writer is n8n is a way
-    to discover lock contention at 03:00."""
-    global _write_pool
-    if _write_pool is None:
-        with _lock:
-            if _write_pool is None:
-                _write_pool = _build_pool(read_only=False)
-    return _write_pool
 
 
 @contextmanager
@@ -183,47 +160,11 @@ def one(sql: str, params: Any = None) -> dict:
     return result[0] if result else {}
 
 
-@contextmanager
-def writer() -> Iterator[Any]:
-    """A READ-WRITE cursor. The one exception to this module's read-only rule.
-
-    Deliberately not called `cursor(read_only=False)`: a flag can be defaulted
-    wrong and reads the same at the call site either way. A different name
-    cannot be reached by accident.
-    """
-    try:
-        from psycopg_pool import PoolTimeout
-    except ImportError:  # pragma: no cover - psycopg is a hard dependency
-        PoolTimeout = ()  # type: ignore[assignment]
-
-    pool = get_write_pool()
-    try:
-        with pool.connection() as conn:
-            with conn.cursor() as cur:
-                yield cur
-    except PoolTimeout as exc:
-        raise DatabaseUnavailable(f"no database connection: {exc}") from exc
-
-
-def write(sql: str, params: Any = None) -> list[dict]:
-    """Run one writing statement and return its RETURNING rows.
-
-    Every statement these endpoints run has a RETURNING clause, because "did it
-    change anything" and "did it succeed" are different questions and a lease
-    fence answers only the first one by returning no rows.
-    """
-    with writer() as cur:
-        cur.execute(sql, params)
-        if cur.description is None:
-            return []
-        return [dict(r) for r in cur.fetchall()]
-
-
 def close() -> None:
-    """Release both pools. Called from the FastAPI shutdown hook."""
-    global _pool, _write_pool
+    """Release the pool. Called from the FastAPI shutdown hook."""
+    global _pool
     with _lock:
-        for name in ("_pool", "_write_pool"):
+        for name in ("_pool",):
             pool = globals()[name]
             if pool is not None:
                 try:

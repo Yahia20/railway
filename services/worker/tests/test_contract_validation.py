@@ -215,7 +215,13 @@ def test_out_of_range_criterion_is_a_contract_violation():
     })
     problems = scoring.validate_ranges(modules)
     assert any("price_objection" in p for p in problems)
-    assert problems == scoring.contract_violations({"stage_reached": "negotiation"}, modules)
+    # Every range problem must reach the re-ask. `contract_violations` may now
+    # report MORE than validate_ranges did — 50 is also a total the rubric's own
+    # items cannot add up to (v7's legal-values check) — so this asserts
+    # containment, not equality. A new guard on the same bad value is not a
+    # regression, and this test must not turn one into a failure.
+    violations = scoring.contract_violations({"stage_reached": "negotiation"}, modules)
+    assert set(problems) <= set(violations)
 
 
 def test_ranges_accept_the_boundaries_and_nulls():
@@ -302,7 +308,7 @@ def test_short_or_empty_transcripts_are_refused_not_scored(text, monkeypatch):
     monkeypatch.setattr(main.settings, "deepseek_api_key", "sk-test", raising=False)
     r = TestClient(main.app).post(
         "/evaluate",
-        json={"conversation": text, "input_type": "call_transcript"},
+        json={"conversation": text, "input_type": "chat"},
         headers={"X-API-Key": "k"},
     )
     assert r.status_code == 200
@@ -331,7 +337,7 @@ def test_every_pass2_path_carries_the_same_status_keys(monkeypatch):
     client = TestClient(main.app)
 
     refused = client.post(
-        "/evaluate", json={"conversation": "ألو", "input_type": "call_transcript"},
+        "/evaluate", json={"conversation": "ألو", "input_type": "chat"},
         headers={"X-API-Key": "k"}).json()["pass2"]
     assert refused["contract_status"] == "unscoreable"
 
@@ -343,7 +349,7 @@ def test_every_pass2_path_carries_the_same_status_keys(monkeypatch):
                         lambda *a, **kw: _Stub(payload, payload))
     scored = client.post(
         "/evaluate",
-        json={"conversation": REAL_SHORT_CALL, "input_type": "call_transcript",
+        json={"conversation": REAL_SHORT_CALL, "input_type": "chat",
               "run_pass1": False},
         headers={"X-API-Key": "k"}).json()["pass2"]
     assert scored["contract_status"] == "ok"
@@ -377,33 +383,6 @@ def test_a_real_short_call_still_reaches_the_judge(monkeypatch):
     assert len(spoken_content(REAL_SHORT_CALL)) >= MIN_SCOREABLE_CHARS
 
 
-def test_failed_chunk_is_distinct_from_a_silent_one():
-    """None means nobody read the chunk; '' means it was read and was silent."""
-    from app.asr.cohere_arabic import _transcribe_with_retry
-
-    class Silent:
-        def transcribe_file(self, p): return ""
-
-    class Broken:
-        def transcribe_file(self, p): raise RuntimeError("429 rate limited")
-
-    assert _transcribe_with_retry(Silent(), "x") == ""
-    assert _transcribe_with_retry(Broken(), "x") is None
-
-
-def test_retry_recovers_a_chunk_that_fails_once():
-    from app.asr.cohere_arabic import _transcribe_with_retry
-
-    class Flaky:
-        def __init__(self): self.n = 0
-        def transcribe_file(self, p):
-            self.n += 1
-            if self.n < 2: raise RuntimeError("429")
-            return "نعم تفضل"
-
-    assert _transcribe_with_retry(Flaky(), "x") == "نعم تفضل"
-
-
 # ── the floor must measure speech, not scaffolding ──────────────────────────
 # Live 2026-08-11: "[00:00] ألو السلام عليكم" — a hangup, sixteen characters of
 # Arabic — cleared a twenty character floor because the timestamp counted
@@ -427,7 +406,7 @@ def test_a_hangup_is_refused_not_scored(monkeypatch):
     monkeypatch.setattr(main.settings, "deepseek_api_key", "sk-test", raising=False)
     r = TestClient(main.app).post(
         "/evaluate",
-        json={"conversation": "[00:00] ألو السلام عليكم", "input_type": "call_transcript"},
+        json={"conversation": "[00:00] ألو السلام عليكم", "input_type": "chat"},
         headers={"X-API-Key": "k"},
     )
     p2 = r.json()["pass2"]
@@ -458,7 +437,7 @@ def test_the_gate_reason_says_the_count_is_normalised(monkeypatch):
     monkeypatch.setattr(main.settings, "deepseek_api_key", "sk-test", raising=False)
     p2 = TestClient(main.app).post(
         "/evaluate",
-        json={"conversation": "[00:00] AGENT: هلا", "input_type": "call_transcript"},
+        json={"conversation": "[00:00] AGENT: هلا", "input_type": "chat"},
         headers={"X-API-Key": "k"},
     ).json()["pass2"]
     assert "normalised characters of speech" in p2["warnings"][0]
@@ -473,7 +452,7 @@ def test_a_refusal_still_fills_the_not_null_columns(monkeypatch):
     monkeypatch.setattr(main.settings, "worker_api_key", "k", raising=False)
     monkeypatch.setattr(main.settings, "deepseek_api_key", "sk-test", raising=False)
     p2 = TestClient(main.app).post(
-        "/evaluate", json={"conversation": "", "input_type": "call_transcript"},
+        "/evaluate", json={"conversation": "", "input_type": "chat"},
         headers={"X-API-Key": "k"},
     ).json()["pass2"]
 
@@ -566,7 +545,7 @@ def test_an_unresolved_contradiction_is_returned_not_raised():
 
     payload = _contradictory()
     client = _Stub(payload, payload)
-    result = judge.run_pass2("[00:01] AGENT: ما عندنا رحلات إلى عدن", "call_transcript",
+    result = judge.run_pass2("[00:01] AGENT: ما عندنا رحلات إلى عدن", "chat",
                              client=client)
 
     assert len(client.prompts) == 2                  # asked again, once
@@ -593,7 +572,7 @@ def test_a_contract_failure_is_http_200_with_a_status(monkeypatch):
     r = TestClient(main.app).post(
         "/evaluate",
         json={"conversation": REFUSAL_CALL,
-              "input_type": "call_transcript", "run_pass1": False},
+              "input_type": "chat", "run_pass1": False},
         headers={"X-API-Key": "k"},
     )
     assert r.status_code == 200
@@ -618,7 +597,7 @@ def test_structurally_unusable_json_is_still_a_422(monkeypatch):
     r = TestClient(main.app).post(
         "/evaluate",
         json={"conversation": REAL_SHORT_CALL,
-              "input_type": "call_transcript", "run_pass1": False},
+              "input_type": "chat", "run_pass1": False},
         headers={"X-API-Key": "k"},
     )
     assert r.status_code == 422

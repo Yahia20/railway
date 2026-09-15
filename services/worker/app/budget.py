@@ -96,28 +96,13 @@ def _probe_deepseek() -> ProviderProbe:
     return ProviderProbe("deepseek", available, reason, balance, data)
 
 
-def _probe_modal() -> ProviderProbe:
-    """Modal exposes no balance API, so our own meter is the only signal.
-
-    That is why `provider_budgets.monthly_cap_usd` is the whole control for
-    Modal and `require_positive_balance` is false: the 30 USD free credit is
-    enforced by `v_pipeline_gate` reading `v_spend_mtd`, not by asking Modal.
-    A probe that returned "available" from no evidence would be a lie, so this
-    one says exactly what it knows.
-    """
-    return ProviderProbe("modal", True,
-                         "no balance API; the monthly cap is the only control")
-
-
-def _probe_cohere() -> ProviderProbe:
-    return ProviderProbe("cohere", True,
-                         "no balance API; the monthly cap is the only control")
-
-
+# One entry, and that is the whole point of the shape: adding a provider is a
+# `_probe_<name>()` here and a row in `provider_budgets`, never a new gate.
+# Modal and Cohere were removed with the calls lane on 2026-09-14 — their
+# probes are in the calls archive, and their `provider_budgets` rows go with
+# the drop migration.
 PROBES: dict[str, Callable[[], ProviderProbe]] = {
     "deepseek": _probe_deepseek,
-    "modal": _probe_modal,
-    "cohere": _probe_cohere,
 }
 
 
@@ -165,71 +150,6 @@ def preflight(providers: list[str] | None = None) -> dict:
 
     return {"providers": probes,
             "checked_at": db.one("SELECT now() AS now")["now"].isoformat()}
-
-
-# A batch that has never run leaves nothing to measure, so the first one needs
-# a number. 0.9 GPU-seconds of A10G per recording is the conservative end of
-# what the cost model assumed (RTFx 120 over a ~2 minute average call); once
-# `asr_runs` holds a real batch this constant stops being used at all.
-DEFAULT_GPU_SECONDS_PER_RECORDING = 0.9
-A10G_HOURLY_USD = 1.10
-
-
-def asr_claim_allowance(requested: int) -> tuple[int, str | None]:
-    """How many recordings Modal may claim right now, and why not more.
-
-    ENFORCED HERE, NOT IN MODAL. Modal reaches the database only through this
-    worker, so the worker is the one chokepoint every batch must pass. A cap
-    living in `modal/transcribe_job.py` would be advisory — a redeploy, a
-    `--limit` override or a hand-run `modal run` would step straight past it.
-    Here it holds whatever calls in.
-
-    TWO GATES, NOT ONE:
-      * over the cap, claim nothing at all;
-      * under it, claim only as many recordings as the REMAINING budget can
-        pay for, so a single large batch cannot vault over the ceiling in one
-        go. Without the second gate a 500-recording batch could spend far past
-        30 USD before anything got the chance to say stop.
-    """
-    gate = db.rows("SELECT * FROM v_pipeline_gate WHERE provider = 'modal'")
-    if not gate:
-        return 0, "no budget row for provider 'modal'"
-    g = gate[0]
-    if not g["may_run"]:
-        return 0, g["reason"] or "modal is blocked by its budget"
-
-    remaining = g.get("remaining_usd")
-    if remaining is None:
-        return requested, None                      # no cap configured
-
-    remaining = float(remaining)
-    if remaining <= 0:
-        return 0, (f"monthly cap reached: {float(g['spend_mtd_usd']):.2f} of "
-                   f"{float(g['monthly_cap_usd']):.2f} USD spent")
-
-    # What one recording has actually cost us, measured where possible.
-    seen = db.one("""
-        SELECT coalesce(sum(gpu_seconds), 0) AS gpu, coalesce(sum(processed), 0) AS n
-          FROM asr_runs WHERE processed > 0
-    """)
-    per_recording_gpu = (float(seen["gpu"]) / float(seen["n"])
-                         if seen and float(seen["n"]) > 0
-                         else DEFAULT_GPU_SECONDS_PER_RECORDING)
-    per_recording_usd = per_recording_gpu / 3600.0 * A10G_HOURLY_USD
-    if per_recording_usd <= 0:
-        return requested, None
-
-    affordable = int(remaining / per_recording_usd)
-    if affordable <= 0:
-        return 0, (f"only {remaining:.4f} USD left of the "
-                   f"{float(g['monthly_cap_usd']):.2f} USD cap, which does not "
-                   f"cover one recording")
-    if affordable < requested:
-        return affordable, (
-            f"trimmed to {affordable} recordings: {remaining:.4f} USD left of "
-            f"the {float(g['monthly_cap_usd']):.2f} USD cap at "
-            f"~{per_recording_usd:.5f} USD each")
-    return requested, None
 
 
 def spend_report() -> dict:

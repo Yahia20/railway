@@ -34,6 +34,22 @@ log = logging.getLogger("worker.report")
 # ten thousand rows to make the point.
 SAMPLE_LIMIT = 50
 
+# THIS REPORT DESCRIBES CHATS. THERE IS NOTHING ELSE LEFT TO DESCRIBE.
+#
+# Calls were removed from the pipeline on 2026-09-14 — the lane, its tables and
+# its 830 transcripts. It was never the volume that made them unusable: it was
+# that all 1,119 recordings decoded to extension 3009, a QUEUE, so no call ever
+# carried an `agent_id` and none ever could. 834 evaluations of which ~800 were
+# unattributable sat under a headline about agent performance, describing a
+# population nobody could act on.
+#
+# The `input_type = 'chat'` predicates below therefore look redundant, and today
+# they are. They stay because they are cheap and because the day a second
+# channel arrives is the day someone needs them to already be there — the
+# earlier version of this file had no predicate at all, and that is exactly how
+# 800 calls got counted as agent performance for a month.
+_CHAT_ONLY = " AND e.input_type = 'chat'"
+
 
 # ---------------------------------------------------------------------------
 # 1 · Reconciliation — the finding
@@ -102,26 +118,6 @@ SELECT status,
        max(updated_at)                            AS last_moved,
        count(*) FILTER (WHERE last_error IS NOT NULL) AS with_error
 FROM chat_eval_jobs GROUP BY status ORDER BY n DESC
-"""
-
-SQL_CALL_JOBS = """
-SELECT status,
-       count(*)                                   AS n,
-       max(updated_at)                            AS last_moved,
-       count(*) FILTER (WHERE last_error IS NOT NULL) AS with_error
-FROM call_ingest_jobs GROUP BY status ORDER BY n DESC
-"""
-
-# The one predicate that says whether the calls lane is whole. Rows sitting in
-# 'discovered' are owned by the Modal batch; if Modal is not deployed, nothing
-# claims them and they age forever while every other panel looks healthy.
-SQL_STRANDED = """
-SELECT count(*)                                   AS stranded,
-       min(discovered_at)                         AS oldest,
-       max(discovered_at)                         AS newest
-FROM call_ingest_jobs
-WHERE status IN ('discovered', 'asr_failed')
-  AND claim_until IS NULL
 """
 
 # Alert evaluation runs AFTER the job is terminal, and a terminal job is never
@@ -261,8 +257,9 @@ SQL_QUALITY_BY_INPUT = """
 SELECT input_type, diarization, confidence_bucket, method_label, is_provisional,
        n, n_usable, score_display, score_spread
 FROM v_quality_by_input_display
+WHERE true{chat_only}
 ORDER BY input_type, confidence_bucket
-"""
+""".format(chat_only=" AND input_type = 'chat'")
 
 # Rule 2 made visible: a module scored `null` never arose, `0` arose and was
 # handled badly. If those two ever get merged again, this panel is where the
@@ -281,8 +278,9 @@ CROSS JOIN LATERAL (VALUES
   ('m4_followup',   e.m4_followup),
   ('m5_closing',    e.m5_closing)
 ) AS m(module, score)
+WHERE true{chat_only}
 GROUP BY m.module ORDER BY m.module
-"""
+""".format(chat_only=_CHAT_ONLY)
 
 # ---------------------------------------------------------------------------
 # 5 · One conversation at a time — what the judge actually said
@@ -351,10 +349,10 @@ FROM agent_evaluations e
 JOIN interactions i          ON i.interaction_id = e.interaction_id
 LEFT JOIN interaction_analysis a ON a.interaction_id = e.interaction_id
 LEFT JOIN agents ag          ON ag.agent_id = e.agent_id
-WHERE i.started_at >= now() - make_interval(days => %(days)s)
+WHERE i.started_at >= now() - make_interval(days => %(days)s){chat_only}
 ORDER BY i.started_at DESC
 LIMIT %(limit)s
-"""
+""".format(chat_only=_CHAT_ONLY)
 
 
 def _conversations(p: dict) -> dict:
@@ -380,7 +378,6 @@ SQL_TOTALS = """
 SELECT
   (SELECT count(*) FROM interactions)                             AS interactions,
   (SELECT count(*) FROM chat_messages)                            AS chat_messages,
-  (SELECT count(*) FROM transcripts)                              AS transcripts,
   (SELECT count(*) FROM interaction_analysis)                     AS analysed,
   (SELECT count(*) FROM interaction_requests)                     AS requests,
   (SELECT count(*) FROM agent_evaluations)                        AS evaluations,
@@ -388,7 +385,6 @@ SELECT
   (SELECT count(*) FROM customers)                                AS customers,
   (SELECT count(*) FROM deals)                                    AS deals,
   (SELECT count(*) FROM follow_ups)                               AS follow_ups,
-  (SELECT round(avg(asr_confidence), 3) FROM transcripts)         AS avg_asr_confidence,
   (SELECT count(*) FROM interactions
     WHERE customer_phone_e164 IS NULL AND customer_phone_raw IS NOT NULL)
                                                                   AS phones_unnormalised
@@ -446,8 +442,6 @@ def build(days: int = 30, limit: int = SAMPLE_LIMIT) -> dict:
     _panel("unlogged_requests", lambda: db.rows(SQL_UNLOGGED_REQUESTS, p), data, errors)
 
     _panel("chat_jobs", lambda: db.rows(SQL_CHAT_JOBS), data, errors)
-    _panel("call_jobs", lambda: db.rows(SQL_CALL_JOBS), data, errors)
-    _panel("stranded_calls", lambda: db.one(SQL_STRANDED), data, errors)
     _panel("threads_due", lambda: db.one(SQL_DUE_NOW), data, errors)
     _panel("alerts_pending", lambda: db.one(SQL_ALERTS_NOT_EVALUATED), data, errors)
     _panel("budget_gate", lambda: db.rows(SQL_BUDGET_GATE), data, errors)
@@ -469,6 +463,10 @@ def build(days: int = 30, limit: int = SAMPLE_LIMIT) -> dict:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "window_days": days,
         "sample_limit": limit,
+        # Which channels this payload describes. The page prints it, and a
+        # second entry here is the signal that every "chats" label on it needs
+        # rewriting.
+        "channels": ["chat"],
         "data": data,
         # Present and empty on a healthy report. The page renders this, so a
         # panel that silently stopped working cannot look like a panel with no

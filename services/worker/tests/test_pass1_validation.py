@@ -207,7 +207,7 @@ def test_the_evaluate_endpoint_exposes_the_flags(monkeypatch):
 
     body = TestClient(main.app).post(
         "/evaluate",
-        json={"conversation": CONVERSATION, "input_type": "call_transcript",
+        json={"conversation": CONVERSATION, "input_type": "chat",
               "run_pass1": True, "run_pass2": False},
         headers={"X-API-Key": "k"},
     ).json()

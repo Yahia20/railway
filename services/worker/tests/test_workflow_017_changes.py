@@ -38,7 +38,6 @@ def crons(wf: dict) -> list[str]:
 
 
 CHATS = "01d-chats-evaluate.json"
-CALLS = "02-calls-v2-state-machine.json"
 HOUSE = "04-nightly-housekeeping.json"
 
 
@@ -67,7 +66,7 @@ def local_hours(expr: str) -> set[int]:
     return out
 
 
-@pytest.mark.parametrize("wf_name", [CHATS, CALLS, HOUSE])
+@pytest.mark.parametrize("wf_name", [CHATS, HOUSE])
 def test_nothing_is_scheduled_inside_deepseek_peak(wf_name):
     for expr in crons(load(wf_name)):
         assert not (local_hours(expr) & PEAK_LOCAL_HOURS), (
@@ -84,13 +83,6 @@ def test_judging_finishes_before_peak_starts():
     """
     hours = local_hours(crons(load(CHATS))[0])
     assert hours == {23, 0, 1, 2, 3}, hours
-
-
-def test_calls_workflow_lists_drive_once_a_day():
-    """Every */15 tick listed 611 recordings and stored 530 KB of execution
-    data — 51 MB a day to discover nothing new."""
-    discovery = [e for e in crons(load(CALLS)) if e.startswith("0 ")]
-    assert discovery == ["0 23 * * *"]
 
 
 # ---------------------------------------------------------------------------
@@ -121,65 +113,23 @@ def test_judge_runs_is_counted_where_a_judge_is_known_to_have_finished():
 def test_judge_calls_are_paced():
     """Ten simultaneous evaluations turn a claimed batch into ten 429s and ten
     spent attempts."""
-    for wf_name in (CHATS, CALLS):
+    for wf_name in (CHATS,):
         opts = nodes(load(wf_name))["Two AI passes"]["parameters"]["options"]
         assert opts["batching"]["batch"]["batchSize"] <= 3
-
-
-# ---------------------------------------------------------------------------
-# the Modal boundary
-# ---------------------------------------------------------------------------
-
-def test_n8n_no_longer_claims_transcription():
-    """Two systems that both claim a job both transcribe it and both pay."""
-    q = query(load(CALLS), "Claim work")
-    assert "'transcribed', 'judge_failed'" in q
-    assert "'discovered', 'asr_failed'" not in q.split("WHERE")[1].split("LIMIT")[0]
-
-
-def test_the_asr_node_is_disabled_not_deleted():
-    """Left in place as the rollback: re-enable it and add the 'discovered'
-    clause back, and the old path works again."""
-    node = nodes(load(CALLS))["Cohere Arabic ASR"]
-    assert node.get("disabled") is True
-
-
-def test_modal_writes_the_same_namespace_as_n8n():
-    """A different external_source turns one call into two half-filled rows —
-    the split-namespace bug the chat side already had to migrate out of.
-
-    The statement moved from modal/transcribe_job.py into the worker when Modal
-    stopped connecting to Postgres directly; the assertion did not change."""
-    from app import asr_jobs
-
-    assert "'asterisk_drive'" in asr_jobs.STORE_SQL
-    assert "'pbx_drive'" not in asr_jobs.STORE_SQL
-
-
-def test_modal_releases_the_lease_on_handoff():
-    """n8n renews the lease because its next node is the judge; Modal is
-    finished, so it must set 'transcribed' AND drop the token, or n8n's claim
-    will never see the row."""
-    from app import asr_jobs
-
-    sql = asr_jobs.STORE_SQL
-    tail = sql[sql.index("UPDATE call_ingest_jobs j"):]
-    assert "status         = 'transcribed'" in tail
-    assert "claim_token    = NULL" in tail
 
 
 # ---------------------------------------------------------------------------
 # cost telemetry and the budget guard
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("wf_name", [CHATS, CALLS])
+@pytest.mark.parametrize("wf_name", [CHATS])
 def test_every_judge_call_is_recorded_with_its_idempotency_key(wf_name):
     q = query(load(wf_name), "Record model cost")
     assert "INSERT INTO model_calls" in q
     assert "ON CONFLICT (purpose, input_hash, prompt_version) DO NOTHING" in q
 
 
-@pytest.mark.parametrize("wf_name", [CHATS, CALLS])
+@pytest.mark.parametrize("wf_name", [CHATS])
 def test_requests_are_written_under_a_live_lease(wf_name):
     """An upsert keyed on (interaction_id, seq): a stale execution holding an
     older reading of the thread would overwrite a newer one."""
@@ -256,8 +206,12 @@ def scheduled_workflows() -> list[str]:
 
 
 def test_there_are_scheduled_workflows_to_check():
-    """Keeps the parametrised test below from passing on an empty list."""
-    assert len(scheduled_workflows()) >= 4
+    """Keeps the parametrised test below from passing on an empty list.
+
+    Three since the calls workflow was deleted on 2026-09-14: 01d judges,
+    04 does housekeeping, 03 resolves identity. 01c is a webhook and has no
+    cron, so it is not in this list and must not be added to it."""
+    assert len(scheduled_workflows()) >= 3
 
 
 @pytest.mark.parametrize("wf_name", scheduled_workflows())
