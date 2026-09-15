@@ -174,14 +174,40 @@ def main() -> int:
         if not manifest_path.exists():
             sys.exit("no manifest to verify against; run without --verify first")
         old = json.loads(manifest_path.read_text(encoding="utf-8"))["counts"]
-        drift = {t: (old.get(t), counts.get(t)) for t in counts if old.get(t) != counts.get(t)}
-        if drift:
-            print("\nCOUNTS MOVED SINCE THE ARCHIVE WAS TAKEN:")
-            for table, (was, now) in drift.items():
+        drift = {t: (old.get(t), counts.get(t))
+                 for t in counts if old.get(t) != counts.get(t)}
+
+        if not drift:
+            print("\nverified: every count matches the manifest. 023 has NOT "
+                  "run yet, and the archive is current.")
+            return 0
+
+        # TWO VERY DIFFERENT KINDS OF DRIFT, AND CONFLATING THEM IS USELESS.
+        #
+        # This check was written to answer "did anything write to the database
+        # between the dump and the migration". But it is the same command you
+        # reach for AFTERWARDS, to confirm the migration did what it said — and
+        # run then, every count is zero or the table is gone. An unqualified
+        # "something wrote, re-dump before running 023" is both alarming and
+        # exactly backwards, which is what it printed on the real run.
+        removed = {t: v for t, v in drift.items()
+                   if v[1] in (0, None) and (v[0] or 0) > 0}
+        unexpected = {t: v for t, v in drift.items() if t not in removed}
+
+        if unexpected:
+            print("\nCOUNTS MOVED IN A WAY 023 DOES NOT EXPLAIN:")
+            for table, (was, now) in unexpected.items():
                 print(f"  {table}: archived {was}, database now has {now}")
-            sys.exit("something wrote to the database after the dump. Re-dump "
-                     "before running 023.")
-        print("\nverified: every count matches the manifest")
+            sys.exit("something else wrote to the database. Re-dump before "
+                     "running 023.")
+
+        print("\n023 HAS RUN. Every archived table is now empty or dropped:")
+        for table, (was, now) in sorted(removed.items()):
+            print(f"  {table:26} {was:>6} archived  ->  "
+                  + ("table dropped" if now is None else f"{now} rows left"))
+        total = sum(v[0] for v in removed.values())
+        print(f"\nThe archive is the only copy of those {total:,} rows: "
+              f"{out.resolve()}")
         return 0
 
     manifest = {

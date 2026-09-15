@@ -211,6 +211,7 @@ tbody tr:hover{background:var(--panel-2)}
   <section>
     <h2>null مش صفر <span class="hint">القاعدة رقم ٢ — الموديول بياخد null لما الموقف ماحصلش، وصفر لما حصل واتعامل معاه وحش</span></h2>
     <div class="tw" id="nullZero"></div>
+    <div id="unmeasured"></div>
   </section>
 
   <section>
@@ -466,6 +467,21 @@ function render(rep) {
        averages them together. */
     { h: "طريقة التقييم", cls: "id", f: (r) => '<span class="c mute">' + esc(r.method_label || "?") + "</span>" },
   ], "مفيش تقييمات — v_agent_scorecard بيستبعد البوت، وبيحتاج agents مربوطين");
+
+  const um = d.unmeasured || {};
+  if (Number(um.evaluated)) {
+    const share = Math.round(Number(um.followup_unmeasured) / Number(um.evaluated) * 100);
+    $("unmeasured").innerHTML =
+      '<p class="note"><b>المتابعة مش متقاسة في ' + share + "٪ من التقييمات (" +
+      num(um.followup_unmeasured) + " من " + num(um.evaluated) + ").</b> " +
+      "السبب إننا بنشوف الشات بس. لو الموظف رجع كلّم العميل بالتليفون أو من رقمه " +
+      "الشخصي، ده مش بيوصلنا — فبنسيب المحور فاضي بدل ما نديله صفر ونعاقب اللي " +
+      "بيشتغل على التليفون. " +
+      "<br>الأثر: متوسط الوزن المطبّق " + num(um.avg_weight_applied, 2) +
+      " بدل 1.00، يعني الدرجة اتحسبت على جزء من الرُبريك — " +
+      "والرقم بيطلع شكله عادي لأن الأوزان بتتعاد قسمتها. " +
+      "<br><b>اللي بيقفلها: تسجيل المتابعات التليفونية في بيتريكس.</b></p>";
+  }
 
   table($("nullZero"), d.null_vs_zero, [
     { h: "الموديول", k: "module", cls: "id" },

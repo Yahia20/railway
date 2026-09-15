@@ -553,7 +553,9 @@ FROM v_quality_by_input q;
 COMMENT ON VIEW v_quality_by_input_display IS
   'v_quality_by_input plus the same labels. READ THIS ONE FOR ANY HUMAN-FACING REPORT. Answers "does the model score calls worse than chats, or is the transcript just bad" with the sample size and the interim-method caveat attached to every mean.';
 
-COMMIT;
+-- (022's own COMMIT was removed when its text was carried in here: it would
+--  have split this migration in two, and the half that failed would have
+--  been the half that deletes rows.)
 
 
 -- ---------------------------------------------------------------------------
@@ -607,6 +609,216 @@ $patch$;
 -- subtree with them. The two things that do NOT cascade are deleted first.
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- 7a · The spend views metered ASR as well as the judge
+--
+-- `v_spend_mtd` and `v_spend_by_component` read `asr_runs`, and `v_pipeline_gate`
+-- reads `v_spend_mtd`, so the table cannot be dropped while they stand. Rebuilt
+-- here over `model_calls` alone — the only thing left that spends money.
+--
+-- THE COLUMN LISTS DO NOT CHANGE. `app/budget.py`, the /spend page and the
+-- report all select these by name, and `v_pipeline_gate` is what every workflow
+-- asks before it claims work. A column that disappears here takes the budget
+-- gate down with it, and a pipeline whose gate errors is a pipeline that stops.
+-- ---------------------------------------------------------------------------
+
+DROP VIEW IF EXISTS v_pipeline_gate;
+DROP VIEW IF EXISTS v_spend_by_component;
+DROP VIEW IF EXISTS v_spend_mtd;
+
+CREATE VIEW v_spend_mtd AS
+WITH bounds AS (
+  SELECT date_trunc('month', now() AT TIME ZONE 'Asia/Riyadh')
+           AT TIME ZONE 'Asia/Riyadh' AS month_start
+),
+judge AS (
+  SELECT 'deepseek'::text            AS provider,
+         coalesce(sum(cost_usd), 0)  AS spend_usd,
+         count(*)                    AS units
+  FROM model_calls, bounds
+  WHERE created_at >= bounds.month_start
+)
+SELECT b.provider,
+       b.display_name,
+       b.monthly_cap_usd,
+       b.hard_stop,
+       b.enabled,
+       coalesce(s.spend_usd, 0)                          AS spend_mtd_usd,
+       coalesce(s.units, 0)                              AS units_mtd,
+       CASE WHEN b.monthly_cap_usd IS NULL THEN NULL
+            ELSE greatest(b.monthly_cap_usd - coalesce(s.spend_usd, 0), 0)
+       END                                               AS remaining_usd,
+       CASE WHEN b.monthly_cap_usd IS NULL OR b.monthly_cap_usd = 0 THEN NULL
+            ELSE round(100 * coalesce(s.spend_usd, 0) / b.monthly_cap_usd, 1)
+       END                                               AS pct_of_cap,
+       (b.monthly_cap_usd IS NOT NULL
+        AND coalesce(s.spend_usd, 0) >= b.monthly_cap_usd)  AS over_cap
+FROM provider_budgets b
+LEFT JOIN judge s ON s.provider = b.provider;
+
+COMMENT ON VIEW v_spend_mtd IS
+  'Spend this calendar month per provider against its cap, metered from model_calls. The asr_runs half went with the calls lane in 023. `over_cap` is what the hard stop reads.';
+
+CREATE VIEW v_pipeline_gate AS
+SELECT s.provider,
+       s.display_name,
+       s.enabled,
+       s.spend_mtd_usd,
+       s.monthly_cap_usd,
+       s.remaining_usd,
+       st.balance_usd,
+       st.checked_at,
+       CASE
+         WHEN NOT s.enabled THEN false
+         WHEN s.hard_stop AND s.over_cap THEN false
+         WHEN b.require_positive_balance
+              AND st.available IS NOT DISTINCT FROM false THEN false
+         -- Fails CLOSED for a provider whose balance we CAN check and have not.
+         -- An unchecked DeepSeek is the state that would have emptied the queue.
+         WHEN st.provider IS NULL AND b.require_positive_balance THEN false
+         ELSE true
+       END AS may_run,
+       CASE
+         WHEN NOT s.enabled
+           THEN 'disabled in provider_budgets'
+         WHEN s.hard_stop AND s.over_cap
+           THEN format('monthly cap reached: %s of %s USD spent',
+                       round(s.spend_mtd_usd, 2), s.monthly_cap_usd)
+         WHEN b.require_positive_balance
+              AND st.available IS NOT DISTINCT FROM false
+           THEN coalesce(st.reason, 'provider reports no available balance')
+         WHEN st.provider IS NULL AND b.require_positive_balance
+           THEN 'no preflight has run yet - balance unknown'
+         ELSE NULL
+       END AS reason
+FROM v_spend_mtd s
+JOIN provider_budgets b ON b.provider = s.provider
+LEFT JOIN provider_status st ON st.provider = s.provider;
+
+COMMENT ON VIEW v_pipeline_gate IS
+  'May this provider be used right now, and if not, why. The only gate a workflow should read. Fails CLOSED for a provider whose balance we can check and have not.';
+
+CREATE VIEW v_spend_by_component AS
+WITH bounds AS (
+  SELECT date_trunc('month', now() AT TIME ZONE 'Asia/Riyadh')
+           AT TIME ZONE 'Asia/Riyadh' AS month_start
+)
+SELECT 'deepseek'                          AS provider,
+       mc.purpose                          AS component,
+       count(*)                            AS calls,
+       count(*) FILTER (WHERE NOT mc.succeeded) AS failed,
+       sum(mc.prompt_tokens)               AS prompt_tokens,
+       sum(mc.cached_tokens)               AS cached_tokens,
+       sum(mc.output_tokens)               AS output_tokens,
+       round(sum(mc.cost_usd), 4)          AS spend_usd,
+       count(*) FILTER (WHERE mc.priced_at_peak) AS at_peak_rate,
+       min(mc.created_at)                  AS first_at,
+       max(mc.created_at)                  AS last_at
+FROM model_calls mc, bounds
+WHERE mc.created_at >= bounds.month_start
+GROUP BY mc.purpose;
+
+COMMENT ON VIEW v_spend_by_component IS
+  'This month''s spend broken down by the thing that spent it. Each row is independently switchable, which is what makes the number actionable.';
+
+-- ---------------------------------------------------------------------------
+-- 7b · The alert views joined call_ingest_jobs for ONE column
+--
+-- `uniqueid` is the PBX call id, and both views LEFT JOIN the whole jobs table
+-- to fetch it. With no calls it is NULL on every row, so the join is dropped
+-- and the column is kept as an explicit NULL — same reasoning as
+-- `v_agent_scorecard.calls`: the /report page and the alert digest select these
+-- by name, and a column list that changes shape turns a schema migration into
+-- a front-end one.
+-- ---------------------------------------------------------------------------
+
+DROP VIEW IF EXISTS v_alert_digest_daily;
+DROP VIEW IF EXISTS v_alert_queue;
+
+CREATE VIEW v_alert_queue AS
+SELECT o.occurrence_id,
+       o.rule_code,
+       o.rule_version,
+       r.description                                   AS rule_description,
+       o.created_at,
+       o.delivery_status,
+       i.interaction_id,
+       i.channel,
+       i.started_at,
+       i.customer_phone_e164,
+       coalesce(a.full_name, 'unassigned')             AS agent_name,
+       NULL::text                                      AS uniqueid,
+       o.fact_snapshot ->> 'summary_ar'                AS summary_ar,
+       coalesce(o.fact_snapshot -> 'products', '[]'::jsonb) AS products,
+       o.fact_snapshot ->> 'real_ask_quote'            AS real_ask_quote,
+       o.fact_snapshot ->> 'lead_temperature'          AS lead_temperature,
+       (o.fact_snapshot ->> 'overdue')::boolean        AS promise_overdue,
+       o.fact_snapshot
+FROM alert_occurrences o
+JOIN interactions i   ON i.interaction_id = o.interaction_id
+LEFT JOIN alert_rules r ON r.rule_code = o.rule_code
+LEFT JOIN agents a    ON a.agent_id = i.agent_id
+WHERE o.delivery_status = 'pending'
+ORDER BY o.created_at DESC;
+
+COMMENT ON VIEW v_alert_queue IS
+  'Alerts nobody has acted on yet, newest first. `uniqueid` is NULL since 023 removed the calls lane; the column is kept so readers of this view need no change.';
+
+CREATE VIEW v_alert_digest_daily AS
+SELECT (o.created_at AT TIME ZONE 'Asia/Riyadh')::date  AS alert_day,
+       o.rule_code,
+       r.description                                    AS rule_description,
+       count(*)                                         AS occurrences,
+       count(*) FILTER (WHERE o.delivery_status = 'pending')      AS pending,
+       count(*) FILTER (WHERE o.delivery_status = 'acknowledged') AS acknowledged,
+       count(*) FILTER (WHERE o.delivery_status = 'suppressed')   AS suppressed,
+       coalesce(jsonb_agg(jsonb_build_object(
+           'occurrence_id',       o.occurrence_id,
+           'interaction_id',      i.interaction_id,
+           'uniqueid',            NULL,
+           'started_at',          i.started_at,
+           'customer_phone_e164', i.customer_phone_e164,
+           'agent_name',          coalesce(a.full_name, 'unassigned'),
+           'summary_ar',          o.fact_snapshot ->> 'summary_ar',
+           'products',            coalesce(o.fact_snapshot -> 'products', '[]'::jsonb),
+           'real_ask_quote',      o.fact_snapshot ->> 'real_ask_quote',
+           'lead_temperature',    o.fact_snapshot ->> 'lead_temperature',
+           'promise_text',        o.fact_snapshot ->> 'promise_text',
+           'due_at',              o.fact_snapshot ->> 'due_at',
+           'overdue',             o.fact_snapshot -> 'overdue')
+         ORDER BY i.started_at) FILTER (WHERE o.delivery_status = 'pending'),
+         '[]'::jsonb)                                   AS pending_items
+FROM alert_occurrences o
+JOIN interactions i   ON i.interaction_id = o.interaction_id
+LEFT JOIN alert_rules r ON r.rule_code = o.rule_code
+LEFT JOIN agents a    ON a.agent_id = i.agent_id
+GROUP BY 1, o.rule_code, r.description
+ORDER BY 1 DESC, o.rule_code;
+
+COMMENT ON VIEW v_alert_digest_daily IS
+  'One row per day per rule, with the pending occurrences inlined for a digest message. `uniqueid` is NULL since 023.';
+
+-- ---------------------------------------------------------------------------
+-- 7c · The rows and the tables
+-- ---------------------------------------------------------------------------
+
+-- THE TABLES GO FIRST, AND THAT ORDER IS NOT COSMETIC.
+--
+-- `call_ingest_jobs.interaction_id` references `interactions` WITHOUT
+-- ON DELETE CASCADE, so deleting the conversations while that table still
+-- exists fails on the foreign key -- measured, on the first real run of this
+-- file. Dropping the table takes the reference with it.
+--
+-- Everything else DOES cascade from `interactions`: chat_messages,
+-- interaction_analysis, agent_evaluations, interaction_requests,
+-- interaction_metrics and alert_occurrences all go with their conversation.
+-- call_ingest_jobs REFERENCES asr_runs (which batch transcribed this job), so
+-- the child goes first. Both orderings in this file were wrong on their first
+-- real run; neither is guessable from the migration that created them.
+DROP TABLE IF EXISTS call_ingest_jobs;
+DROP TABLE IF EXISTS asr_runs;
+DROP TABLE IF EXISTS transcripts;
+
 DELETE FROM follow_ups
  WHERE promised_in IN (SELECT interaction_id FROM interactions
                         WHERE external_source = 'asterisk_drive');
@@ -630,10 +842,6 @@ DELETE FROM provider_budgets WHERE provider IN ('modal', 'cohere');
 -- ---------------------------------------------------------------------------
 -- 8 · The tables, the columns, and the door
 -- ---------------------------------------------------------------------------
-
-DROP TABLE IF EXISTS asr_runs;
-DROP TABLE IF EXISTS call_ingest_jobs;
-DROP TABLE IF EXISTS transcripts;
 
 ALTER TABLE interaction_metrics DROP COLUMN IF EXISTS agent_talk_ratio;
 ALTER TABLE interactions        DROP COLUMN IF EXISTS direction;

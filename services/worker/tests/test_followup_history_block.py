@@ -172,29 +172,38 @@ def test_the_rows_reach_the_worker_and_the_block_reaches_the_judge():
     assert "followup_history" in _node("Two AI passes")["parameters"]["jsonBody"]
 
 
-def test_searched_and_empty_is_not_the_same_as_never_searched():
-    """RULE 2, at the narrowest point in this whole feature.
+def test_the_block_says_which_channels_it_searched():
+    """The correction that matters most in this feature.
 
-    `[]` is an agent who did not come back — that SCORES, and scores badly.
-    `None` is nobody having looked — that NULLS. If these ever collapse into
-    one answer, 20% of the rubric silently disappears again.
+    `[]` does NOT mean the agent never came back. It means no CHAT follow-up
+    was recorded — and chat is the only channel this system has, since the
+    telephone lane was removed from it. An agent who called the customer looks
+    identical to one who did nothing.
+
+    The block has to say that itself, in the text the model reads. Both the
+    rubric and the renderer carry the caveat, because a caveat that lives only
+    in the rubric is one a future renderer can quietly contradict.
     """
     assert metrics.followup_history_block(later_contacts=None) == "unavailable"
     searched = metrics.followup_history_block(later_contacts=[])
     assert searched != "unavailable"
-    assert "NONE recorded" in searched
+    assert "NO CHAT FOLLOW-UP RECORDED" in searched
+    assert "phone call" in searched
+    assert "may well have happened" in searched
 
 
 def test_the_prompt_separates_all_three_states_of_the_block():
-    """`unavailable` nulls; "NONE recorded" scores zero; a list scores itself.
+    """`unavailable` nulls. `NO CHAT FOLLOW-UP RECORDED` also nulls, for a
+    different and more interesting reason. A list of contacts scores.
 
-    The middle one is the whole point of this feature and is the state the
-    pipeline will be in most often — an agent who never came back. Reading it as
-    `null` gives that agent the 20% back.
+    The middle state is the one the pipeline will be in most often, and the
+    reason it nulls is the point: **only chat is searched.** An agent who phoned
+    the customer produces the same empty block as one who forgot them, so the
+    evidence cannot separate a missed follow-up from an unrecorded one.
     """
     prompt = (ROOT / "services" / "worker" / "app" / "prompts"
               / "pass2_agent_quality_v7.md").read_text(encoding="utf-8")
     assert "is the literal word `unavailable`" in prompt
-    assert "Module 4 = `null`." in prompt
-    assert "It is an agent who did not come back" in prompt
-    assert metrics.followup_history_block(later_contacts=[]).strip().splitlines()[-1] in prompt
+    assert "Module 4 = `null`" in prompt
+    assert "NO CHAT FOLLOW-UP RECORDED" in prompt
+    assert "invisible to this system" in prompt

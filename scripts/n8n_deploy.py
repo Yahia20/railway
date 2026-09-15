@@ -47,10 +47,46 @@ PG_CRED = {
 TARGETS: dict[str, str | None] = {
     "01c-chats-store-only": "H7r5YWGJ3nNVA99Z",
     "01d-chats-evaluate": "P1zSFsw16wmV28YF",
-    "02-calls-v2-state-machine": "Q3ARdzVsO3Z8bcWr",
     "03-nightly-resolve-and-aggregate": "sUnNPv6Ucye6Gsii",
     "04-nightly-housekeeping": "z60SxzoYmKOLsH4S",
 }
+
+
+# Live ids that must be SWITCHED OFF and have no file in this repo any more.
+# 02 is the calls state machine and 99 reports on it; both were removed on
+# 2026-09-14 with the rest of the calls lane. A deleted JSON file does not stop
+# a workflow — n8n keeps running the copy it already has, on its own schedule,
+# against tables that migration 023 drops. Listed here so `--deactivate` can
+# name them without anybody having to remember two opaque ids.
+RETIRED: dict[str, str] = {
+    "Q3ARdzVsO3Z8bcWr": "02 - Calls v2 - state machine",
+    "DKMgCrpTqLN4Pzox": "99 - Ops - calls pipeline report",
+}
+
+
+def deactivate(cl: httpx.Client, ids: dict[str, str]) -> int:
+    """Switch off, never delete.
+
+    Deleting would take the execution history with it, and that history is the
+    record of what the calls lane actually did — 780 evaluated, 284
+    dead-lettered. An inactive workflow keeps all of it and can be switched back
+    on in one click if the PBX ever starts recording the answering extension.
+    """
+    failed = 0
+    for wf_id, label in ids.items():
+        got = cl.get(f"{BASE}/workflows/{wf_id}")
+        if got.status_code == 404:
+            print(f"  gone     {wf_id}  {label}")
+            continue
+        if not got.json().get("active"):
+            print(f"  already  {wf_id}  {label}")
+            continue
+        r = cl.post(f"{BASE}/workflows/{wf_id}/deactivate")
+        ok = r.status_code < 300 and not r.json().get("active", True)
+        print(f"  {'OFF     ' if ok else 'FAILED  '} {wf_id}  {label}"
+              + ("" if ok else f"  {r.text[:140]}"))
+        failed += 0 if ok else 1
+    return failed
 
 
 def client() -> httpx.Client:
@@ -127,9 +163,16 @@ def main() -> int:
     ap.add_argument("--activate", action="store_true", help="switch on after deploying")
     ap.add_argument("--list", action="store_true", help="show live workflows and ids")
     ap.add_argument("--backup-only", action="store_true")
+    ap.add_argument("--deactivate", action="store_true",
+                    help="switch off the retired calls workflows (02, 99). "
+                         "Backs them up first; never deletes.")
     args = ap.parse_args()
 
     with client() as cl:
+        if args.deactivate:
+            print("backup -> " + str(backup(cl, list(RETIRED))))
+            return deactivate(cl, RETIRED)
+
         if args.list:
             for w in sorted(cl.get(f"{BASE}/workflows", params={"limit": 250}).json()["data"],
                             key=lambda x: (not x["active"], x["name"])):

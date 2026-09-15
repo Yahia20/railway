@@ -242,6 +242,31 @@ GROUP BY 1 ORDER BY 1
 # `method_label` comes out because the view emits ONE ROW PER AGENT PER VERSION
 # CO-ORDINATE and two of the live agents genuinely have two rows (v4-flash and
 # v4-pro). Without it they read as duplicates, and somebody averages them.
+# ---------------------------------------------------------------------------
+# What the rubric could NOT measure, and why
+#
+# Module 4 nulls whenever no CHAT follow-up is on record — which is honest,
+# because a phone call, a WhatsApp from the agent's own number or a walk-in are
+# all invisible here and an agent who did any of them looks identical to one who
+# forgot the customer. Scoring that as zero would punish whoever works the phone
+# hardest for a gap in our data collection.
+#
+# But an honest null is still a null: `weight_applied` renormalises over the
+# modules that DID apply, so the missing 20% never shows up as missing. It shows
+# up as a normal-looking score. This panel is the only place it is visible, and
+# it is the number to hand the client when asking for follow-up logging.
+SQL_UNMEASURED = """
+SELECT count(*)                                              AS evaluated,
+       count(*) FILTER (WHERE e.m4_followup IS NULL)         AS followup_unmeasured,
+       count(*) FILTER (WHERE e.m5_closing  IS NULL)         AS closing_not_reached,
+       round(avg(e.weight_applied), 3)                       AS avg_weight_applied,
+       round(avg(e.weight_applied) FILTER (WHERE e.m4_followup IS NULL), 3)
+                                                             AS avg_weight_when_unmeasured
+FROM agent_evaluations e
+WHERE true{chat_only}
+""".format(chat_only=_CHAT_ONLY)
+
+
 SQL_SCORECARD = """
 SELECT full_name, team, method_label, is_provisional,
        evaluated_interactions, calls, chats, n_usable,
@@ -457,6 +482,7 @@ def build(days: int = 30, limit: int = SAMPLE_LIMIT) -> dict:
     _panel("scorecard", lambda: db.rows(SQL_SCORECARD), data, errors)
     _panel("quality_by_input", lambda: db.rows(SQL_QUALITY_BY_INPUT), data, errors)
     _panel("null_vs_zero", lambda: db.rows(SQL_NULL_VS_ZERO), data, errors)
+    _panel("unmeasured", lambda: db.one(SQL_UNMEASURED), data, errors)
     _panel("conversations", lambda: _conversations(p), data, errors)
 
     return {

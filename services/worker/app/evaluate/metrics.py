@@ -198,7 +198,17 @@ def followup_history_block(promises: list[dict] | None = None,
                      sorted(later_contacts,
                             key=lambda e: str(e.get("started_at") or "")))
     else:
-        lines.append("Subsequent contact with this customer: NONE recorded.")
+        # WHAT WAS SEARCHED, AND WHAT COULD NOT BE. The judge must not read
+        # this as "the agent never followed up". Only CHAT is recorded: a phone
+        # call, a WhatsApp message from a personal number, or a walk-in are all
+        # invisible to this system, and the calls lane was removed entirely on
+        # 2026-09-14. An agent who picked up the phone would look identical to
+        # one who did nothing, and scoring them the same punishes the first.
+        lines.append("Subsequent contact with this customer: NO CHAT FOLLOW-UP "
+                     "RECORDED.")
+        lines.append("  (Only chat is searched. A phone call, a message from a "
+                     "personal number, or an in-branch visit would not appear "
+                     "here and may well have happened.)")
     return "\n".join(lines)
 
 

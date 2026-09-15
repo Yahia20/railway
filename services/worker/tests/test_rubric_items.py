@@ -355,16 +355,31 @@ def test_the_prompt_decides_when_a_followup_was_owed():
     prompt did not say so, and the model filled the gap differently each time.
     """
     assert "THREE STATES, AND ONLY THE FIRST IS `null`" in PROMPT
-    assert "A FOLLOW-UP IS ALWAYS OWED BY THE TIME YOU SEE THIS CONVERSATION" in PROMPT
+    assert "WHEN A FOLLOW-UP WAS OWED IS NOT YOUR DECISION" in PROMPT
     # the specific case that produced the split: the customer promised to return
     assert "خليني" in PROMPT
 
 
-def test_searched_and_empty_is_spelled_out_for_the_model():
-    """The renderer emits this exact sentence for "we looked, nothing there".
-    If the prompt quotes a different one, the model matches neither."""
+def test_an_empty_chat_search_is_never_scored_as_a_missed_followup():
+    """The agent may have PHONED. We would not see it.
+
+    Only chat is searched — the telephone lane was removed from this system
+    altogether — so an agent who called the customer and closed the sale
+    produces exactly the same empty block as one who forgot them. Scoring that
+    as zero punishes whoever works the phone hardest, for a gap in our data
+    collection rather than anything they did.
+    """
+    assert "NO CHAT FOLLOW-UP RECORDED" in PROMPT
+    assert "it is NOT the same as" in PROMPT or "NOT the same as" in PROMPT
+    assert "invisible to this system" in PROMPT
+
+
+def test_the_prompt_quotes_the_sentence_the_renderer_actually_emits():
+    """The model matches on this string. If the renderer and the rubric word it
+    differently, the model matches neither and falls back to guessing."""
     from app.evaluate import metrics
     rendered = metrics.followup_history_block(later_contacts=[])
-    sentence = "Subsequent contact with this customer: NONE recorded."
-    assert sentence in rendered
-    assert sentence in PROMPT
+    assert "NO CHAT FOLLOW-UP RECORDED" in rendered
+    assert "NO CHAT FOLLOW-UP RECORDED" in PROMPT
+    # and the renderer must carry the caveat, not only the prompt
+    assert "phone call" in rendered

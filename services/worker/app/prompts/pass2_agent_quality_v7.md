@@ -759,26 +759,36 @@ judge. It is not the judge's to decide.
 1. The block is absent, or is the literal word `unavailable`
    → nobody looked at the customer's timeline. Module 4 = `null`.
 
-2. The block says `Subsequent contact with this customer: NONE recorded.`
-   → the timeline WAS searched and there is nothing in it. **This is not
-   `null`. It is an agent who did not come back:** `timing` = "never",
-   `frequency` = "none", and `message_quality` scores over what is not there.
+2. The block says `NO CHAT FOLLOW-UP RECORDED`
+   → Module 4 = `null`, and say so in `notes`.
+
+   **This is the honest answer and it is NOT the same as "the agent did
+   nothing".** Only chat is searched. A phone call, a WhatsApp message from the
+   agent's own number, or the customer walking into the branch are all
+   invisible to this system — the telephone lane was removed from it entirely.
+   An agent who picked up the phone and closed the sale produces exactly the
+   same empty block as an agent who forgot the customer existed, and there is
+   no evidence here that separates them.
+
+   Scoring that as zero would punish the first agent for a gap in our data
+   collection rather than for anything they did, and it would do it to whoever
+   works the phone hardest. Do not do it. `null` removes the module from the
+   denominator, which is the correct treatment of a question the evidence
+   cannot answer (see THE NOT-APPLICABLE RULE).
 
 3. The block lists contacts
-   → score them.
+   → score them. This is the only case where Module 4 carries a number, and the
+   number is about what those contacts CONTAIN — timing, how many, and whether
+   the message said anything.
 
-**A FOLLOW-UP IS ALWAYS OWED BY THE TIME YOU SEE THIS CONVERSATION.** You are
-never given a live thread. A conversation reaches you only after it has been
-silent for at least three days, which is a property of the queue that selected
-it and not something for you to infer from the transcript. So "the customer was
-still replying, nothing was owed yet" is never true here, and it is not a reason
-to return `null`.
-
-That holds even when the customer left saying they would come back — "خليني
-أشاور وأرد عليك", "برجع أتواصل". Waiting three days for a customer who said
-they would call is precisely the situation Module 4 exists to grade, and it is
-the most common shape of a lost sale in this corpus. The agent was supposed to
-follow up. Whether they did is what the block tells you.
+**WHEN A FOLLOW-UP WAS OWED IS NOT YOUR DECISION.** You are never handed a live
+thread: a conversation reaches you only after it has been silent for at least
+three days, which is a property of the queue that selected it. So "the customer
+was still replying, nothing was owed yet" is never true here, and it is never a
+reason for `null` — case 2 above is the only reason. That holds even when the
+customer left saying they would come back ("خليني أشاور وأرد عليك", "برجع
+أتواصل"): three days of silence after that is exactly the situation Module 4
+exists to grade, and the block is what tells you whether the agent acted.
 
 CRITERIA 1 — Follow-up Timing (40 points)
 ✅ Followed up within 24 hours of last customer message = 40 pts
