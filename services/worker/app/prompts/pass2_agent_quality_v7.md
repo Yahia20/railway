@@ -748,47 +748,28 @@ Follow-up means: after the conversation went quiet, did the agent come back?
 conversation. The FOLLOW-UP HISTORY block below (supplied from the database,
 never estimated by you) lists every subsequent contact.
 
-⚖️ DECIDED — THREE STATES, AND ONLY THE FIRST IS `null`.
-
-Measured: the same model at temperature 0 nulled this module on one run and
-scored it 0 on the next, on the same conversation and the same block. That is a
-**twenty-point swing** — the largest single source of drift in this rubric — and
-it happened because the rule below used to leave "was a follow-up owed?" to the
-judge. It is not the judge's to decide.
+⚖️ DECIDED — TWO STATES.
 
 1. The block is absent, or is the literal word `unavailable`
-   → nobody looked at the customer's timeline. Module 4 = `null`.
+   → Module 4 = `null`. Nobody looked.
 
 2. The block says `NO CHAT FOLLOW-UP RECORDED`
-   → Module 4 = `null`, and say so in `notes`.
+   → `timing` = "never", `frequency` = "none", and `message_quality` is all
+   false. The agent did not follow up **in chat**.
 
-   **This is the honest answer and it is NOT the same as "the agent did
-   nothing".** Only chat is searched. A phone call, a WhatsApp message from the
-   agent's own number, or the customer walking into the branch are all
-   invisible to this system — the telephone lane was removed from it entirely.
-   An agent who picked up the phone and closed the sale produces exactly the
-   same empty block as an agent who forgot the customer existed, and there is
-   no evidence here that separates them.
+3. The block lists contacts → score them.
 
-   Scoring that as zero would punish the first agent for a gap in our data
-   collection rather than for anything they did, and it would do it to whoever
-   works the phone hardest. Do not do it. `null` removes the module from the
-   denominator, which is the correct treatment of a question the evidence
-   cannot answer (see THE NOT-APPLICABLE RULE).
+**THE QUESTION IS ABOUT CHAT, AND ONLY CHAT.** This system records chat. It
+does not record phone calls. Module 4 therefore answers "did the agent follow
+up in writing", and that is the question the company chose to measure. Do not
+null the module because a call might have happened; do not reason about calls
+at all.
 
-3. The block lists contacts
-   → score them. This is the only case where Module 4 carries a number, and the
-   number is about what those contacts CONTAIN — timing, how many, and whether
-   the message said anything.
-
-**WHEN A FOLLOW-UP WAS OWED IS NOT YOUR DECISION.** You are never handed a live
-thread: a conversation reaches you only after it has been silent for at least
-three days, which is a property of the queue that selected it. So "the customer
-was still replying, nothing was owed yet" is never true here, and it is never a
-reason for `null` — case 2 above is the only reason. That holds even when the
-customer left saying they would come back ("خليني أشاور وأرد عليك", "برجع
-أتواصل"): three days of silence after that is exactly the situation Module 4
-exists to grade, and the block is what tells you whether the agent acted.
+**A FOLLOW-UP IS ALWAYS OWED BY THE TIME YOU SEE THIS CONVERSATION.** You are
+never handed a live thread: a conversation reaches you only after three days of
+silence. "Nothing was owed yet" is never true here. That holds when the
+customer left saying they would return — "خليني أشاور وأرد عليك" — because
+three days of silence after that is exactly what this module grades.
 
 CRITERIA 1 — Follow-up Timing (40 points)
 ✅ Followed up within 24 hours of last customer message = 40 pts

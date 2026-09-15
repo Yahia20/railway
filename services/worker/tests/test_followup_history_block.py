@@ -188,8 +188,6 @@ def test_the_block_says_which_channels_it_searched():
     searched = metrics.followup_history_block(later_contacts=[])
     assert searched != "unavailable"
     assert "NO CHAT FOLLOW-UP RECORDED" in searched
-    assert "phone call" in searched
-    assert "may well have happened" in searched
 
 
 def test_the_prompt_separates_all_three_states_of_the_block():
@@ -206,4 +204,4 @@ def test_the_prompt_separates_all_three_states_of_the_block():
     assert "is the literal word `unavailable`" in prompt
     assert "Module 4 = `null`" in prompt
     assert "NO CHAT FOLLOW-UP RECORDED" in prompt
-    assert "invisible to this system" in prompt
+    assert "THE QUESTION IS ABOUT CHAT, AND ONLY CHAT" in prompt

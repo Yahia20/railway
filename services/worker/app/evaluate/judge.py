@@ -969,9 +969,16 @@ def run_pass2(conversation: str, input_type: Literal["chat"] = "chat",
     warnings += result.warnings
     warnings += scoring.validate_evidence(payload, conversation)
     warnings += scoring.require_evidence_for_deductions(payload, result.modules)
+    # `rejected` now carries two shapes. A v6 record restores a deduction to its
+    # cap (`restored_to`); a v7 record reduces an unquotable observation to its
+    # floor (`reduced_to`). One list, because both are "this finding had no
+    # anchor" and a reader wants them together — but the words have to say which
+    # way the score moved, or a reduction reads as points handed back.
     warnings += [
-        f"{r['module']}.{r['criterion']}: {r['reason']} — finding discarded, "
-        f"{r['model_score']} restored to {r['restored_to']}"
+        f"{r['module']}.{r['criterion']}: {r['reason']} — "
+        + (f"finding discarded, {r['model_score']} restored to {r['restored_to']}"
+           if "restored_to" in r
+           else f"observation unproven, {r['model_score']} reduced to {r['reduced_to']}")
         for r in rejected
     ]
     warnings += [

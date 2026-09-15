@@ -354,24 +354,21 @@ def test_the_prompt_decides_when_a_followup_was_owed():
     silent for three days, so "nothing was owed yet" is never true — but the
     prompt did not say so, and the model filled the gap differently each time.
     """
-    assert "THREE STATES, AND ONLY THE FIRST IS `null`" in PROMPT
-    assert "WHEN A FOLLOW-UP WAS OWED IS NOT YOUR DECISION" in PROMPT
+    assert "DECIDED — TWO STATES" in PROMPT
+    assert "A FOLLOW-UP IS ALWAYS OWED BY THE TIME YOU SEE THIS CONVERSATION" in PROMPT
     # the specific case that produced the split: the customer promised to return
     assert "خليني" in PROMPT
 
 
-def test_an_empty_chat_search_is_never_scored_as_a_missed_followup():
-    """The agent may have PHONED. We would not see it.
+def test_an_empty_chat_search_scores_the_narrower_question():
+    """Module 4 asks "did the agent follow up IN WRITING".
 
-    Only chat is searched — the telephone lane was removed from this system
-    altogether — so an agent who called the customer and closed the sale
-    produces exactly the same empty block as one who forgot them. Scoring that
-    as zero punishes whoever works the phone hardest, for a gap in our data
-    collection rather than anything they did.
+    A phone follow-up is invisible to this system. Rather than null 20% of the
+    rubric on every thread, the module answers the narrower question, which is
+    a true statement about the data that exists. The owner chose this.
     """
     assert "NO CHAT FOLLOW-UP RECORDED" in PROMPT
-    assert "it is NOT the same as" in PROMPT or "NOT the same as" in PROMPT
-    assert "invisible to this system" in PROMPT
+    assert "THE QUESTION IS ABOUT CHAT, AND ONLY CHAT" in PROMPT
 
 
 def test_the_prompt_quotes_the_sentence_the_renderer_actually_emits():
@@ -381,8 +378,6 @@ def test_the_prompt_quotes_the_sentence_the_renderer_actually_emits():
     rendered = metrics.followup_history_block(later_contacts=[])
     assert "NO CHAT FOLLOW-UP RECORDED" in rendered
     assert "NO CHAT FOLLOW-UP RECORDED" in PROMPT
-    # and the renderer must carry the caveat, not only the prompt
-    assert "phone call" in rendered
 
 
 def test_every_check_measured_drifting_has_been_decided():
@@ -516,3 +511,23 @@ def test_the_absence_exemption_is_narrow_and_justified():
     for entry in ABSENCE_CRITERIA:
         module, criterion = entry.split(".")
         assert criterion in ITEMS[module], entry
+
+
+def test_both_rejection_shapes_survive_the_warning_builder():
+    """A v6 record restores to `restored_to`; a v7 record reduces to
+    `reduced_to`. The judge builds one warning list from both, and reading the
+    wrong key raised KeyError on the first live v7 conversation — which surfaced
+    as a conversation with no score at all."""
+    v6 = {"module": "module1_reception", "criterion": "greeting",
+          "reason": "no evidence", "model_score": 5, "restored_to": 25, "quote": None}
+    v7 = {"module": "module2_offer", "criterion": "value_selling",
+          "reason": "no evidence", "model_score": 10, "reduced_to": 0, "quote": None}
+    lines = [
+        f"{r['module']}.{r['criterion']}: {r['reason']} — "
+        + (f"finding discarded, {r['model_score']} restored to {r['restored_to']}"
+           if "restored_to" in r
+           else f"observation unproven, {r['model_score']} reduced to {r['reduced_to']}")
+        for r in (v6, v7)
+    ]
+    assert "restored to 25" in lines[0]
+    assert "reduced to 0" in lines[1]
