@@ -14,7 +14,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .rubric_items import ITEMS, ChecksError, legal_values, score_criterion
+from .rubric_items import (ABSENCE_CRITERIA, ITEMS, ChecksError,
+                           legal_values, score_criterion)
 
 RUBRIC_VERSION = "1.0.0"
 
@@ -731,6 +732,25 @@ def unsupported_criteria(payload: dict, modules: dict[str, Any],
         block = modules.get(module_key)
         if not isinstance(block, dict):
             continue
+        # v7 POINTS THE OTHER WAY, AND RUNNING THIS ON IT IS ACTIVELY WRONG.
+        #
+        # This function asks a v6 question: "you deducted points — where is the
+        # quote?", and restores the points when there is none. Under v7 a
+        # below-cap score is not a deduction, it is a `false`: the model
+        # reported that something did not happen, and Rule 1 says that is the
+        # DEFAULT answer, needing no evidence at all.
+        #
+        # Measured: a model correctly answered all three `value_selling` checks
+        # false on an agent who sold nothing, attached a clumsy quote to say so,
+        # and the quote was rejected for joining three messages. That made
+        # value_selling "an unsupported deduction", which made module 2
+        # ungroundable, which nulled a module whose `attitude` had scored a
+        # clean 25 — and dropped the whole conversation below the 40% floor.
+        #
+        # `unquotable_positives` is the v7 counterpart and it moves scores DOWN,
+        # never up, which is the only safe direction for an unproven claim.
+        if isinstance(block.get("checks"), dict):
+            continue
         breakdown = block.get("breakdown")
         if not isinstance(breakdown, dict):
             continue
@@ -787,7 +807,20 @@ def criterion_evidence_problems(payload: dict, modules: dict[str, Any],
     back. Restoration then happened silently and en masse — on the day-13 replay,
     82 omission findings restored without the model being asked once.
     """
-    return [
+    # Both directions in one list, because the model gets ONE correction and it
+    # must be told about every anchoring problem in it. The v6 half asks for the
+    # quote behind a deduction; the v7 half asks for the quote behind an
+    # observation. A module answers to exactly one of them.
+    positives = [
+        f"{u['module']}.{u['criterion']} is scored {u['model_score']}, which "
+        f"claims you observed something, but {u['reason']}. Either add an "
+        f"evidence entry quoting the exact words CONTIGUOUSLY and VERBATIM "
+        f"from the conversation, or change the check to the answer that "
+        f"awards nothing. An observation you cannot quote is not an "
+        f"observation (Rule 2)."
+        for u in unquotable_positives(payload, modules, conversation_text)
+    ]
+    return positives + [
         f"{u['module']}.{u['criterion']} is scored {u['model_score']} "
         f"(below its cap of {u['restored_to']}) but {u['reason']}. "
         + _EVIDENCE_FIX.format(cap=u["restored_to"])
@@ -819,6 +852,81 @@ def deducted_criteria(modules: dict[str, Any]) -> dict[str, set[str]]:
             if value < cap:
                 found.setdefault(module_key, set()).add(criterion)
     return found
+
+
+def unquotable_positives(payload: dict, modules: dict[str, Any],
+                         conversation_text: str) -> list[dict[str, Any]]:
+    """RULE 2, ENFORCED: no quote, no `true`. Moves scores DOWN, never up.
+
+    The v7 counterpart to `unsupported_criteria`, and the mirror image of it.
+    That function asks "you took points away — prove it", because under v6 a
+    below-cap score was a deduction. Under v7 the model reports what it SAW,
+    so the claim that needs proving is the opposite one: a criterion that
+    scored above its floor is a criterion where the model says something
+    happened, and the prompt promises every such answer is anchored to words
+    that appear in the conversation.
+
+    An unanchored positive is reduced to its floor — 0 for a group of flags,
+    the lowest label's value for a `Choice`. It is never restored upward, which
+    is the only safe direction for a claim nobody could evidence: the worst
+    case is an agent who did something good and whose judge could not quote it,
+    and that costs points rather than inventing them.
+
+    Reports; mutates nothing. The caller re-asks once before applying it, so
+    the model gets the same chance to produce the quote that v6 gave it.
+    """
+    haystacks, folded = conversation_spans(conversation_text)
+
+    offered: dict[tuple[str, str], list[str]] = {}
+    for item in payload.get("evidence") or []:
+        if not isinstance(item, dict):
+            continue
+        key = evidence_criterion_key(item.get("module"), item.get("criterion"))
+        if key is None:
+            continue
+        offered.setdefault(key, []).append(item.get("quote"))
+
+    problems: list[dict[str, Any]] = []
+    for module_key, criteria in ITEMS.items():
+        block = modules.get(module_key)
+        if not isinstance(block, dict) or not isinstance(block.get("checks"), dict):
+            continue
+        breakdown = block.get("breakdown") or {}
+
+        for criterion in criteria:
+            if f"{module_key}.{criterion}" in ABSENCE_CRITERIA:
+                continue                      # its best answer has no words
+            value = breakdown.get(criterion)
+            if value is None or not isinstance(value, (int, float)):
+                continue
+            floor = min(legal_values(module_key, criterion))
+            if value <= floor:
+                continue                      # nothing is being claimed
+
+            quotes = offered.get((module_key.lower(), criterion), [])
+            reasons = [quote_problem(q, haystacks, folded) for q in quotes]
+            if any(r is None for r in reasons):
+                continue                      # at least one quote holds up
+
+            problems.append({
+                "module": module_key,
+                "criterion": criterion,
+                "reason": (reasons[0] if quotes
+                           else "no evidence cited for this observation"),
+                "model_score": value,
+                "reduced_to": floor,
+                "quote": quotes[0] if quotes else None,
+            })
+    return problems
+
+
+def apply_unquotable_positives(modules: dict[str, Any],
+                               problems: list[dict[str, Any]]) -> None:
+    """Write the reductions into `breakdown`, in place. Call AFTER the re-ask."""
+    for p in problems:
+        block = modules.get(p["module"])
+        if isinstance(block, dict) and isinstance(block.get("breakdown"), dict):
+            block["breakdown"][p["criterion"]] = p["reduced_to"]
 
 
 def ungroundable_modules(modules_before: dict[str, set[str]],

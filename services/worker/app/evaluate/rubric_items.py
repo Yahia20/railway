@@ -191,6 +191,28 @@ ITEMS: dict[str, dict[str, object]] = {
 }
 
 
+# CRITERIA WHOSE BEST ANSWER IS AN ABSENCE, AND THEREFORE CANNOT BE QUOTED.
+#
+# Rule 2 says no quote, no `true`, and `unquotable_positives` enforces it. That
+# works for every criterion asking whether the agent DID something: there are
+# words to point at, or there are not.
+#
+# `attitude` asks the opposite question. Its three top answers are
+# "professional throughout" (no unprofessional turn), "the customer was never
+# difficult" (no pressure to stay calm under) and "no defeatist language" (no
+# such phrase). All three assert that something is NOT in the conversation, and
+# an absence has no words of its own — demanding a quote for one is the same
+# mistake as demanding a quote for a `false`, which is what this exemption list
+# exists to stop repeating.
+#
+# Do not grow this list to silence an inconvenient reduction. The test is
+# whether the BEST answer is the absence of a behaviour, not whether evidence
+# happens to be hard to find.
+ABSENCE_CRITERIA: frozenset[str] = frozenset({
+    "module2_offer.attitude",
+})
+
+
 def _spec(module: str, criterion: str) -> object:
     try:
         return ITEMS[module][criterion]

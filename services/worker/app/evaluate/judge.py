@@ -915,6 +915,19 @@ def run_pass2(conversation: str, input_type: Literal["chat"] = "chat",
     # added a warning.
     rejected = scoring.enforce_criterion_evidence(payload, modules, conversation)
 
+    # THE SAME RULE, POINTING THE OTHER WAY, FOR v7 MODULES.
+    #
+    # The line above asks "you deducted — where is the quote?" and hands the
+    # points back when there is none. That is right for v6, where a below-cap
+    # score was a claim the judge made. Under v7 the claim runs the other way:
+    # the model reports what it SAW, so the answer needing an anchor is the
+    # positive one, and an unanchored positive is reduced to its floor rather
+    # than anything being restored. `unsupported_criteria` skips these modules
+    # entirely; this is what covers them instead.
+    unquotable = scoring.unquotable_positives(payload, modules, conversation)
+    scoring.apply_unquotable_positives(modules, unquotable)
+    rejected = rejected + unquotable
+
     # A module whose every deduction was discarded was not graded at all. Null
     # it rather than hand it a perfect score built on nothing.
     ungroundable = scoring.ungroundable_modules(deductions_before, rejected)

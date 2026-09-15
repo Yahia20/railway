@@ -403,3 +403,116 @@ def test_every_check_measured_drifting_has_been_decided():
         assert check in PROMPT, check
     # and the catch-all, so a check NOT on the list still has one answer
     assert "Rule 1 applies and the answer is `false`" in PROMPT
+
+
+# ── evidence points the other way under v7 ──────────────────────────────────
+
+CONV = ("[10:00] CUSTOMER: السلام عليكم، ابغى عرض لتركيا\n"
+        "[10:19] AGENT: اهلين\n"
+        "[10:19] AGENT: كم عدد الاشخاص؟\n")
+
+
+def _module2(value_selling_all_false=True, quote=None):
+    """module2 as a v7 response: attitude clean, value_selling all false."""
+    modules = {"module2_offer": {"weight": 0.25, "checks": {
+        "attitude": {"professional_language": "throughout",
+                     "difficult_customer": "never_difficult",
+                     "no_defeatist_language": True},
+        "offer_completeness": None,
+        "value_selling": {"stated_features": not value_selling_all_false,
+                          "connected_to_need": False, "used_persuasion": False},
+        "alternative_offer": None,
+    }}}
+    payload = {"modules": modules}
+    if quote is not None:
+        payload["evidence"] = [{"module": "module2_offer", "criterion": "value_selling",
+                                "quote": quote}]
+    scoring.materialise_checks(modules)
+    return payload, modules
+
+
+def test_a_false_never_needs_a_quote():
+    """THE REGRESSION, measured on a real run.
+
+    A model correctly answered all three `value_selling` checks false on an
+    agent who sold nothing, attached a clumsy quote joining three messages to
+    say so, and the quote was rejected. The v6 machinery read that as "an
+    unsupported deduction", made the whole module ungroundable, nulled a module
+    whose `attitude` had scored a clean 25, and dropped the conversation below
+    the 40% floor — for reporting, correctly, that something did not happen.
+    """
+    payload, modules = _module2(quote="اهلين\nكم عدد الاشخاص؟\nتمام ابشر")
+    assert scoring.unsupported_criteria(payload, modules, CONV) == []
+    problems = scoring.unquotable_positives(payload, modules, CONV)
+    assert [p["criterion"] for p in problems] == []
+
+
+def test_an_unquotable_true_is_reduced_not_restored():
+    """Rule 2 enforced. The only safe direction for an unproven claim is down:
+    the worst case is an agent who did something good and whose judge could not
+    quote it, and that costs points rather than inventing them."""
+    payload, modules = _module2(value_selling_all_false=False, quote="words never said")
+    problems = scoring.unquotable_positives(payload, modules, CONV)
+    assert len(problems) == 1
+    assert problems[0]["criterion"] == "value_selling"
+    assert problems[0]["model_score"] == 10
+    assert problems[0]["reduced_to"] == 0
+    scoring.apply_unquotable_positives(modules, problems)
+    assert modules["module2_offer"]["breakdown"]["value_selling"] == 0
+
+
+def test_a_valid_quote_keeps_the_observation():
+    payload, modules = _module2(value_selling_all_false=False, quote="كم عدد الاشخاص؟")
+    assert scoring.unquotable_positives(payload, modules, CONV) == []
+
+
+def test_a_choice_is_reduced_to_its_lowest_label_not_to_zero():
+    """`difficult_customer` bottoms out at 0 but `timing` bottoms out at 0 via
+    "never" — the floor is whatever the closed list can actually produce, which
+    is not always what a bare 0 would mean."""
+    modules = {"module5_closing": {"weight": 0.15, "checks": {
+        "payment_request": "direct", "next_steps_confirmation": "none",
+        "thank_you": "none", "booking_steps": "none",
+        "service_review_request": False,
+    }}}
+    payload = {"modules": modules}
+    scoring.materialise_checks(modules)
+    problems = scoring.unquotable_positives(payload, modules, CONV)
+    assert [p["criterion"] for p in problems] == ["payment_request"]
+    assert problems[0]["reduced_to"] == 0
+
+
+def test_v6_modules_still_get_the_v6_rule():
+    """A stored v6 response has no `checks`, so the deduction-based rule must
+    still apply to it exactly as before."""
+    modules = {"module1_reception": {"breakdown": {"greeting": 5}}}
+    payload = {"modules": modules}
+    assert scoring.unquotable_positives(payload, modules, CONV) == []
+    assert [u["criterion"] for u in
+            scoring.unsupported_criteria(payload, modules, CONV)] == ["greeting"]
+
+
+def test_the_correction_names_both_kinds_of_anchoring_problem():
+    payload, modules = _module2(value_selling_all_false=False, quote="not in there")
+    problems = scoring.criterion_evidence_problems(payload, modules, CONV)
+    assert any("Rule 2" in p for p in problems)
+
+
+def test_the_absence_exemption_is_narrow_and_justified():
+    """One criterion, and it earns it.
+
+    `attitude`'s three top answers are "no unprofessional turn", "the customer
+    was never difficult" and "no defeatist language". All three assert that
+    something is NOT in the conversation, and an absence has no words to quote.
+    Every other criterion asks whether the agent DID something, which either
+    has words or does not.
+
+    This list must not grow to silence an inconvenient reduction. If it does,
+    Rule 2 stops being enforced anywhere it is uncomfortable — which is
+    everywhere that matters.
+    """
+    from app.evaluate.rubric_items import ABSENCE_CRITERIA
+    assert ABSENCE_CRITERIA == frozenset({"module2_offer.attitude"})
+    for entry in ABSENCE_CRITERIA:
+        module, criterion = entry.split(".")
+        assert criterion in ITEMS[module], entry
