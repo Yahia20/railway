@@ -383,3 +383,23 @@ def test_the_prompt_quotes_the_sentence_the_renderer_actually_emits():
     assert "NO CHAT FOLLOW-UP RECORDED" in PROMPT
     # and the renderer must carry the caveat, not only the prompt
     assert "phone call" in rendered
+
+
+def test_every_check_measured_drifting_has_been_decided():
+    """One section, not five scattered paragraphs.
+
+    Each of these was observed disagreeing with ITSELF across two runs of the
+    same model at temperature 0. Rule 1 (doubt resolves down) is the floor, but
+    a check whose bar the rubric never states is not doubt to the model — it is
+    a bar the model sets, and it sets it differently each time. The fix is to
+    state the bar.
+    """
+    assert "WHAT COUNTS — the checks that have actually drifted, decided" in PROMPT
+    for check in ("answered_the_question_asked",
+                  "dates_known_or_asked",
+                  "traveler_count_known_or_asked",
+                  "used_a_greeting",
+                  "used_persuasion"):
+        assert check in PROMPT, check
+    # and the catch-all, so a check NOT on the list still has one answer
+    assert "Rule 1 applies and the answer is `false`" in PROMPT

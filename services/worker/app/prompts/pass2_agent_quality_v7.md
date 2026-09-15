@@ -861,6 +861,51 @@ SCORING:
 ⛔ ABSOLUTE RULE: If customer approved and agent disappeared or never requested payment = Criteria 1 = 0
 
 =============================================================
+WHAT COUNTS — the checks that have actually drifted, decided
+=============================================================
+
+Rule 1 says doubt resolves down. It is a floor, not a substitute for a
+decision: a check whose bar the rubric never states is one the model sets for
+itself, and it sets it differently on different runs. Every entry below is a
+check measured disagreeing with ITSELF — same model, same prompt, temperature
+0 — and each is now decided so it cannot.
+
+**`understanding_confirmation.answered_the_question_asked`**
+`true` only if the agent's turn contains the information the customer asked
+for, OR states plainly that it does not exist / is not available. Both are
+answers.
+`false` for: a deflection, a counter-question instead of an answer, a change of
+subject, or a reply that addresses a different part of the request than the one
+that was asked about.
+Measured split: the customer asked when the next appointment was and the agent
+said the embassy had no appointments. That is an answer — an unwelcome one.
+
+**`missing_info_request.dates_known_or_asked`**
+A DATE, not a period. `true` when the conversation contains a day, a date
+range, a named month WITH a year or an unambiguous near month, or an explicit
+"flexible" — or when the agent ASKED for one.
+`false` for "soon", "next month" said with nothing around it, "in the summer",
+"after Ramadan", "when it is cheap". Those tell you the customer has not
+decided, which is exactly why the agent was supposed to ask.
+
+**`missing_info_request.traveler_count_known_or_asked`**
+Same bar: a NUMBER, or the agent asking for one. "family", "us", "a group" are
+not numbers.
+
+**`greeting.used_a_greeting`**
+Decided in full at Module 1, Criterion 1. Short and informal still counts;
+"تمام" / "أوكي" / "أبشر" do not.
+
+**`value_selling.used_persuasion`**
+`true` only when the agent gives the customer a REASON, tied to something the
+customer said or to a concrete property of the product. `false` for an
+adjective on its own — "عرض ممتاز", "فندق حلو", "سعر كويس" are claims, not
+persuasion. This is the criterion most often flattered.
+
+WHEN A CHECK IS NOT ON THIS LIST and you cannot decide it from the criterion
+text, Rule 1 applies and the answer is `false`. Do not invent a middle.
+
+=============================================================
 THE OBSERVATION SHEET — EVERY QUESTION YOU MUST ANSWER
 =============================================================
 

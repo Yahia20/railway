@@ -31,7 +31,10 @@ anybody — and every one of them was being aggregated under a heading that said
 and the views stay. **It comes back when the PBX records the answering
 extension, and not before.**
 
-**The database half is written and NOT RUN** — no tunnel was available:
+**APPLIED to production on 2026-09-15.** 4,327 rows archived first, then 830
+call conversations deleted and three tables dropped. `audit_data_integrity`:
+**0 failures, 36 clean**. Live counts now: 1,504 interactions (all chat),
+37,672 messages, 42 evaluations, 1,008 threads due.
 
 ```bash
 python scripts/dump_calls.py --out ../travelgate-calls-archive/data   # FIRST
@@ -39,6 +42,29 @@ psql ... -v ON_ERROR_STOP=1 -f db/migrations/023_remove_calls.sql
 python scripts/dump_calls.py --out ../travelgate-calls-archive/data --verify
 python scripts/audit_data_integrity.py --port 55432
 ```
+
+**THREE DEPENDENCIES THE MIGRATION COULD NOT HAVE GUESSED**, each of which
+failed a real run before the file was correct. None is visible in the migration
+that created the object:
+
+1. `call_ingest_jobs` REFERENCES `interactions` with **no ON DELETE CASCADE**,
+   so deleting the conversations while that table stood failed on the FK.
+2. `call_ingest_jobs` REFERENCES `asr_runs`, so the parent could not go first.
+3. `v_spend_mtd` and `v_spend_by_component` read `asr_runs`, and
+   `v_pipeline_gate` reads `v_spend_mtd` — **the budget gate every workflow
+   asks before it claims work**. `v_alert_queue` and `v_alert_digest_daily`
+   join `call_ingest_jobs` for one column, `uniqueid`.
+
+All five are rebuilt with their **column lists unchanged**, because
+`app/budget.py`, `/spend` and `/report` select them by name and a gate that
+errors is a pipeline that stops. And 022's own `COMMIT` came in with its text
+and split the migration in two halfway through — the half that failed was the
+half that deletes rows.
+
+**Live n8n: 02 (calls state machine) and 99 (calls ops report) are now OFF**,
+backed up to `local-reports/n8n-backup-20260915/` first.
+`scripts/n8n_deploy.py --deactivate` does it and never deletes — the execution
+history is the record of what the lane did.
 
 `023` rebuilds `v_usable_evaluations`, `v_agent_scorecard` and
 `v_quality_by_input` without the `transcripts` join, drops
@@ -52,9 +78,6 @@ constraints make them unusable instead.
 `v_agent_scorecard.calls` is kept and hard-wired to `0`, and
 `v_quality_by_input.diarization` is kept and always NULL, so the display layer
 and `app/report.py` need no edit.
-
-**Workflow 02 is still ACTIVE in live n8n.** Deactivating it needs an
-`N8N_API_KEY`, which is not in Railway and not in this repo.
 
 **A gap this surfaced, and FIXED: Module 4 had never been sent its input.**
 01d never had a node that builds the follow-up-history block, so the judge was
@@ -106,6 +129,34 @@ closed labels; `app/evaluate/rubric_items.py` turns them into points.
 `tests/test_rubric_items.py` pins the item table to `CRITERION_MAX` and to the
 prompt text, in both directions — a check renamed in one and not the other
 fails the suite rather than silently zeroing a criterion.
+
+**MEASURED, on five written conversations through OpenRouter** (real judge
+path, real prompt, real scoring engine — not a reimplementation):
+
+```
+deepseek-chat-v3.1  run 1   45.5   59.2   92.8
+deepseek-chat-v3.1  run 2   45.5   59.2   92.8    ← identical, every time
+google/gemini-2.5   run 1   45.5   75.6   ...     ← another vendor, same answer
+openai/gpt-4o-mini          contract failed, no score published
+```
+
+**Re-run drift is gone.** What v7 does NOT fully solve is cross-model
+agreement: deepseek and gemini agree exactly on some conversations and differ
+on others. The difference is now *readable* — the comparison is per
+OBSERVATION, so you see which boolean flipped rather than two numbers.
+
+**gpt-4o-mini failing is the system working.** It fired three objections on a
+conversation that never reached negotiation and scored a service refusal its
+own `refusal_check` said had not happened. The contract caught all of it and
+published nothing. A weak model produces no number here, loudly — not a wrong
+one, quietly.
+
+**Every ambiguity the run exposed is now decided in the prompt**, in one
+section (`WHAT COUNTS`), because Rule 1 is a floor and not a substitute for a
+decision: a check whose bar the rubric never states is a bar the model sets,
+differently each time. Five so far — the greeting, whether the agent answered
+the question, what counts as a date, what counts as a traveller count, and
+what counts as persuasion. Expect more, and add them there.
 
 ### What runs, and when (all times Asia/Riyadh — n8n's GENERIC_TIMEZONE)
 
