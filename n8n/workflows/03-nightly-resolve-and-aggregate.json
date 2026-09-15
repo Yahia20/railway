@@ -160,6 +160,30 @@
       },
       "alwaysOutputData": true,
       "executeOnce": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Resolve deals.customer_id. RUNS HERE, NOT IN 04, and the order is the\n-- reason: the contact -> customer mapping is built from\n-- `interactions.customer_id`, which the node above has just finished\n-- writing. Run it in 04 (03:20) and it would work off yesterday's\n-- identity resolution and be permanently one night behind -- the same\n-- mistake 03's own resolver shipped with.\n--\n-- 04 fetches CONTACT_ID and stores it; this turns it into a customer.\n-- Idempotent: every UPDATE inside is guarded by IS DISTINCT FROM, so a\n-- night that changes nothing writes nothing.\nSELECT link_deal_customers() AS result;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -160,
+        460
+      ],
+      "id": "b7d3c1a2-4f58-4c19-9a3e-2d61ab77e410",
+      "name": "Link deal customers",
+      "credentials": {
+        "postgres": {
+          "id": "eYWvPxQFAwKs0bOu",
+          "name": "railway-pg (api)"
+        }
+      },
+      "executeOnce": true,
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
     }
   ],
   "connections": {
@@ -211,7 +235,7 @@
       "main": [
         [
           {
-            "node": "Materialise promises",
+            "node": "Link deal customers",
             "type": "main",
             "index": 0
           }
@@ -223,6 +247,17 @@
         [
           {
             "node": "Resolve identity (phone)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Link deal customers": {
+      "main": [
+        [
+          {
+            "node": "Materialise promises",
             "type": "main",
             "index": 0
           }

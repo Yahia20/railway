@@ -12,8 +12,16 @@ making decisions, not after.
 
 ## Status in one line
 
-**Chats only. The calls lane is gone, and the judge reports facts instead of
-scores.** Both landed 2026-09-14. Neither is deployed.
+**Chats only, deployed, and running. The pipeline is complete end to end and
+waiting on one thing: DeepSeek credit.**
+
+```
+worker      deployed, pass2-agent-quality-v7 live
+database    001-024 applied, audit_data_integrity 0 failures / 36 clean
+n8n         01c, 01d, 03, 04 active. 02 and 99 (calls) switched OFF
+report      /report, 20 panels, channels ["chat"], errors none
+blocked on  DeepSeek balance -0.10 USD. 1,008 threads waiting, attempts 0
+```
 
 ### Calls were REMOVED, not paused — and the archive is the only copy
 
@@ -106,6 +114,31 @@ the two is how the module went missing in the first place.
 and the write pool existed for one caller, `asr_jobs.py`, because Modal ran
 outside Railway. Rule 11's exception went with the calls lane: n8n is now the
 only writer, which is the property the split was always supposed to have.
+
+### 024 — a deal now belongs to a CUSTOMER, not just to a conversation
+
+`deals.customer_id` had existed since 003 and **never held a value**. Bitrix
+links a deal to a CONTACT, workflow 04 fetched `CONTACT_ID` and dropped it, and
+nothing resolved a Bitrix contact to our merged customer. So a customer's deals
+were reachable only through their conversations, and a deal opened for someone
+who never chatted was invisible on their profile.
+
+| where | what |
+|---|---|
+| `deals.bitrix_contact_id` | 04 stores the field it was already fetching |
+| `customer_identities` kind `bitrix_contact_id` | built from the 1,509 threads that carry both ids, `method = exact_crm_id`, confidence **0.95 not 1.00** — it is an assertion about a CRM record, inherited, not an exact phone match |
+| `link_deal_customers()` | contact first, conversation as fallback, idempotent |
+| `v_customer_deal_summary` | one definition of "won" (`stage_semantic = 'S'`) |
+
+**It runs in 03, not 04, and that is the whole point of where it sits.** The
+contact→customer mapping is built from `interactions.customer_id`, which 03's
+resolver writes at 03:40. Running it in 04 at 03:20 would work off yesterday's
+resolution and be permanently one night behind — the exact bug 03's own
+resolver shipped with.
+
+First run: **1,042 of 1,268 deals** now carry a customer. `linked_by_contact`
+was 0 because `bitrix_contact_id` is still empty; it fills on 04's next nightly
+pull and takes over from the conversation fallback.
 
 ### The judge reports observations, not scores — `pass2-agent-quality-v7`
 
@@ -604,21 +637,21 @@ python scripts/simulate_conversation.py <id> --webhook  # POST at live n8n
 ## Layout
 
 ```
-db/migrations/         001-022 applied to Railway. 023_remove_calls.sql is
-                       WRITTEN AND NOT RUN — read its header first.
+db/migrations/         001-024, ALL APPLIED to Railway. 023 removed the calls
+                       lane; 024 linked deals to customers.
 services/worker/app/
   serve.py             entrypoint — see gotcha 1 and 2 below
   main.py              FastAPI
-  sources/base.py      Conversation / CallRecording — the seam the APIs plug into
+  sources/base.py      Conversation — the seam the chat APIs plug into
   sources/bitrix_chats.py   webhook parser, verified against the real payload
   evaluate/judge.py         the two DeepSeek passes
   evaluate/scoring.py       weights, null handling, evidence validation
   evaluate/rubric_items.py  v7: the rubric as closed sets — observations to points
   prompts/                  THE RUBRIC — treat as source code, version it
-n8n/workflows/         01 chats (live), 01c store-only chat API (live),
-                       01d chat scoring (off), 03 nightly (off),
-                       04 nightly housekeeping. 02 (calls) is in the archive
-                       and STILL ACTIVE in live n8n — needs N8N_API_KEY to stop
+n8n/workflows/         01 chats, 01c store-only, 01d chat scoring,
+                       03 nightly identity, 04 nightly housekeeping —
+                       ALL FOUR DEPLOYED AND ACTIVE. 02 (calls) is in the
+                       archive and switched OFF in live n8n.
 scripts/               railway_api, railway_configure, n8n_setup, n8n_smoke_test
 docs/HANDOFF.md        full context
 docs/bitrix-integration-spec.md   forward to the client's IT team
