@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>Customer 360 — المحادثة</title>
+<style>
+/* Same tokens as report.html, so the two pages read as one console. System
+   fonts only: the worker serves this page and it makes no external request. */
+:root{
+  --bg:#EDF0F3; --panel:#FFFFFF; --panel-2:#F5F7F9;
+  --ink:#141A20; --ink-2:#3F4954; --muted:#6B7681;
+  --line:#D3DAE1; --line-soft:#E5EAEF;
+  --accent:#175E7C; --accent-soft:#DCEAF1;
+  --ok:#2A6B50; --ok-soft:#DBEBE2;
+  --warn:#8A570A; --warn-soft:#F5EAD5;
+  --bad:#9B342A; --bad-soft:#F6E1DE;
+  --cust:#FFFFFF; --agent:#DCEAF1; --bot:#F5F7F9;
+  --mono:ui-monospace,"Cascadia Mono","SF Mono",Consolas,"Courier New",monospace;
+  --ui:"Segoe UI",system-ui,-apple-system,"Noto Sans Arabic","Helvetica Neue",sans-serif;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0F1317; --panel:#171D23; --panel-2:#1D242B;
+  --ink:#E6EBF0; --ink-2:#B7C1CB; --muted:#84909C;
+  --line:#2B343D; --line-soft:#222A32;
+  --accent:#69AECC; --accent-soft:#17303C;
+  --ok:#6DBC94; --ok-soft:#152C22;
+  --warn:#D5A155; --warn-soft:#30260F;
+  --bad:#DE887C; --bad-soft:#371F1C;
+  --cust:#1D242B; --agent:#17303C; --bot:#171D23;
+}}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink);font-family:var(--ui);font-size:14px;line-height:1.65}
+.wrap{max-width:860px;margin:0 auto;padding:20px 16px 64px;display:flex;flex-direction:column;gap:16px}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:10px;justify-content:space-between;
+  padding-bottom:12px;border-bottom:2px solid var(--ink)}
+header h1{font-size:18px;margin:0;font-weight:650}
+.ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button,input{font-family:inherit;font-size:13px;padding:6px 11px;border-radius:5px;
+  border:1px solid var(--line);background:var(--panel);color:var(--ink)}
+button{cursor:pointer;font-weight:500}
+button:hover{border-color:var(--accent);color:var(--accent)}
+button:focus-visible,input:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+input.id{font-family:var(--mono);direction:ltr;width:150px}
+input[type=password]{font-family:var(--mono);direction:ltr;min-width:220px}
+#gate{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:20px;
+  display:flex;flex-direction:column;gap:10px;max-width:520px;margin:40px auto}
+#gate h2{margin:0;font-size:16px}
+#gate p,.note{margin:0;color:var(--muted);font-size:12.5px}
+.err{color:var(--bad);font-size:13px;min-height:18px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap}
+.tabs button[aria-selected=true]{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
+.meta{font-family:var(--mono);font-size:11px;color:var(--muted);direction:ltr;text-align:right}
+.thread{display:flex;flex-direction:column;gap:8px}
+.msg{max-width:78%;border:1px solid var(--line);border-radius:10px;padding:8px 11px;
+  display:flex;flex-direction:column;gap:6px;overflow-wrap:anywhere}
+.msg.customer{align-self:flex-start;background:var(--cust)}
+.msg.agent{align-self:flex-end;background:var(--agent);border-color:var(--accent-soft)}
+.msg.bot,.msg.system,.msg.unknown{align-self:flex-end;background:var(--bot);color:var(--ink-2)}
+.who{font-size:11px;color:var(--muted);display:flex;gap:8px;justify-content:space-between}
+.who time{font-family:var(--mono);direction:ltr}
+.text{white-space:pre-wrap}
+.att img{max-width:100%;max-height:420px;border-radius:6px;display:block;background:var(--panel-2)}
+.att audio,.att video{width:100%;max-width:420px;display:block}
+.att video{max-height:420px}
+.doc{display:inline-flex;gap:8px;align-items:center;padding:6px 10px;border:1px solid var(--line);
+  border-radius:6px;background:var(--panel-2);color:var(--ink);text-decoration:none;font-size:13px}
+.doc:hover{border-color:var(--accent);color:var(--accent)}
+.missing{font-size:12px;padding:6px 9px;border-radius:6px;border:1px dashed var(--warn);
+  color:var(--warn);background:var(--warn-soft)}
+.missing.gone{border-color:var(--bad);color:var(--bad);background:var(--bad-soft)}
+.empty{padding:16px;color:var(--muted);text-align:center}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>المحادثة</h1>
+    <div class="ctl">
+      <input class="id" id="q" placeholder="رقم الصفقة" inputmode="numeric" aria-label="رقم الصفقة">
+      <button id="go">افتح</button>
+      <button id="logout" title="امسح المفتاح من الصفحة">خروج</button>
+    </div>
+  </header>
+
+  <div id="gate" hidden>
+    <h2>مفتاح الـworker</h2>
+    <p>الصفحة دي مفيهاش بيانات. بتطلب المحادثة بنفسها بالمفتاح، والمفتاح بيفضل في التبويب ده بس.</p>
+    <input type="password" id="key" autocomplete="off" aria-label="WORKER_API_KEY">
+    <button id="save">دخول</button>
+    <div class="err" id="gateErr"></div>
+  </div>
+
+  <div class="err" id="err"></div>
+  <div id="out"></div>
+</div>
+<script>
+"use strict";
+const KEY_STORE = "c360_worker_key";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function apiKey() { try { return sessionStorage.getItem(KEY_STORE) || ""; } catch { return ""; } }
+function setKey(v) { try { v ? sessionStorage.setItem(KEY_STORE, v) : sessionStorage.removeItem(KEY_STORE); } catch {} }
+
+const ROLE = { customer: "العميل", agent: "الموظف", bot: "البوت", system: "النظام", unknown: "غير معروف" };
+function when(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return d.toLocaleString("en-GB", { timeZone: "Asia/Riyadh", day: "2-digit", month: "2-digit",
+    hour: "2-digit", minute: "2-digit" });
+}
+function size(n) { return n == null ? "" : n < 1048576 ? Math.round(n / 1024) + " KB" : (n / 1048576).toFixed(1) + " MB"; }
+
+/* A file is rendered from the URL the worker signed for it. The URL is set as
+   a DOM property, never spliced into HTML, and only http(s) is accepted. */
+function safeUrl(u) { try { const x = new URL(u); return /^https?:$/.test(x.protocol) ? x.href : null; } catch { return null; } }
+
+function attachment(m) {
+  const box = document.createElement("div");
+  box.className = "att";
+  const url = m.access_url && safeUrl(m.access_url);
+  if (!url) {
+    const gone = m.status === "recovery_pending" || m.status === "purged" || m.status === "rejected";
+    box.innerHTML = '<div class="missing' + (gone ? " gone" : "") + '">'
+      + esc((m.name ? m.name + " — " : "") + "الملف مش متاح: " + (m.reason || m.status)) + "</div>";
+    return box;
+  }
+  let el;
+  if (m.kind === "image") {
+    el = document.createElement("img"); el.loading = "lazy"; el.alt = m.name || "صورة"; el.src = url;
+  } else if (m.kind === "audio") {
+    el = document.createElement("audio"); el.controls = true; el.preload = "none"; el.src = url;
+  } else if (m.kind === "video") {
+    el = document.createElement("video"); el.controls = true; el.preload = "none"; el.src = url;
+  } else {
+    el = document.createElement("a"); el.className = "doc"; el.href = url;
+    el.target = "_blank"; el.rel = "noopener noreferrer";
+    el.textContent = "📄 " + (m.name || "ملف") + (m.bytes ? " · " + size(m.bytes) : "");
+    /* A document is opened by a click that may come long after the page was
+       loaded, so it always gets a fresh link first. */
+    if (m.id) el.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      const fresh = await freshLink(m.id);
+      if (fresh) window.open(fresh, "_blank", "noopener,noreferrer");
+    });
+  }
+  /* Links live five minutes. An image scrolled to, or a voice note played,
+     later than that fails to load: ask for a fresh link once and retry. */
+  if (m.id && el.tagName !== "A") {
+    el.addEventListener("error", async () => {
+      if (el.dataset.renewed) return;
+      el.dataset.renewed = "1";
+      const fresh = await freshLink(m.id);
+      if (fresh) { el.src = fresh; if (el.load && el.tagName !== "IMG") el.load(); }
+    });
+  }
+  box.appendChild(el);
+  return box;
+}
+
+async function freshLink(mediaId) {
+  try {
+    const res = await fetch("conversations/media/" + encodeURIComponent(mediaId) + "/link",
+      { headers: { "X-API-Key": apiKey() }, cache: "no-store" });
+    if (!res.ok) { $("err").textContent = "الملف مش متاح دلوقتي (" + res.status + ")"; return null; }
+    return safeUrl((await res.json()).access_url);
+  } catch (e) { $("err").textContent = e.message; return null; }
+}
+
+function renderThread(t) {
+  const wrap = document.createElement("div");
+  wrap.className = "thread";
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.textContent = "conversation " + (t.conversation_id || "?") + " · " + t.messages.length
+    + " msgs · feed guess " + t.feed_hint.value + " (unverified) · kept until " + when(t.retention_until);
+  wrap.appendChild(meta);
+  if (t.content_status !== "available") {
+    wrap.insertAdjacentHTML("beforeend", '<div class="empty">نص المحادثة اتمسح بعد مدة الاحتفاظ.</div>');
+    return wrap;
+  }
+  if (t.archive === "not_installed") {
+    wrap.insertAdjacentHTML("beforeend",
+      '<p class="note">أرشيف الملفات لسه مش شغال: الروابط العامة بتظهر زي ما هي، والباقي مش متاح.</p>');
+  }
+  for (const m of t.messages) {
+    const b = document.createElement("div");
+    b.className = "msg " + (ROLE[m.sender.role] ? m.sender.role : "unknown");
+    b.innerHTML = '<div class="who"><span>' + esc(ROLE[m.sender.role] || m.sender.role)
+      + "</span><time>" + esc(when(m.at)) + "</time></div>";
+    if (m.text) {
+      const p = document.createElement("div"); p.className = "text"; p.textContent = m.text; b.appendChild(p);
+    }
+    for (const a of m.media) b.appendChild(attachment(a));
+    wrap.appendChild(b);
+  }
+  if (t.truncated) wrap.insertAdjacentHTML("beforeend", '<p class="note">المحادثة أطول من حد العرض.</p>');
+  return wrap;
+}
+
+function render(data) {
+  const out = $("out");
+  out.innerHTML = "";
+  const threads = data.threads || [];
+  if (data.note && threads.length > 1) {
+    out.insertAdjacentHTML("beforeend", '<p class="note">' + esc(
+      "الصفقة دي ليها " + threads.length + " محادثات محفوظة. كل محادثة معروضة لوحدها؛ "
+      + "الرسايل اللي وصلت مرتين لسه مش متجمعة.") + "</p>");
+  }
+  const tabs = document.createElement("div"); tabs.className = "tabs"; tabs.setAttribute("role", "tablist");
+  const panes = threads.map(renderThread);
+  threads.forEach((t, i) => {
+    const btn = document.createElement("button");
+    btn.setAttribute("role", "tab");
+    btn.textContent = "محادثة " + (i + 1) + " · " + t.messages.length + " رسالة";
+    btn.onclick = () => show(i);
+    tabs.appendChild(btn);
+  });
+  function show(i) {
+    panes.forEach((p, j) => { p.hidden = j !== i; tabs.children[j].setAttribute("aria-selected", j === i); });
+  }
+  if (threads.length > 1) out.appendChild(tabs);
+  panes.forEach((p) => out.appendChild(p));
+  if (panes.length) show(0); else out.innerHTML = '<div class="empty">مفيش رسايل.</div>';
+}
+
+async function load() {
+  const q = $("q").value.trim();
+  $("err").textContent = "";
+  if (!q) return;
+  if (!apiKey()) { $("gate").hidden = false; return; }
+  const path = /^\d+$/.test(q) ? "conversations/by-deal/" + encodeURIComponent(q)
+                               : "conversations/" + encodeURIComponent(q);
+  try {
+    const res = await fetch(path, { headers: { "X-API-Key": apiKey() }, cache: "no-store" });
+    if (res.status === 401) { setKey(""); $("gate").hidden = false; throw new Error("المفتاح غلط"); }
+    if (res.status === 404) throw new Error("مفيش محادثة محفوظة بالرقم ده");
+    if (!res.ok) throw new Error("الـworker رجّع " + res.status + " — " + (await res.text()).slice(0, 200));
+    render(await res.json());
+    history.replaceState(null, "", "#" + encodeURIComponent(q));
+  } catch (e) { $("err").textContent = e.message; }
+}
+
+$("go").onclick = load;
+$("q").addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
+$("save").onclick = () => {
+  const v = $("key").value.trim();
+  if (!v) { $("gateErr").textContent = "اكتب المفتاح"; return; }
+  setKey(v); $("key").value = ""; $("gate").hidden = true; load();
+};
+$("logout").onclick = () => { setKey(""); $("out").innerHTML = ""; $("gate").hidden = false; };
+/* The deal number may ride in the fragment (#12345). A fragment is never sent
+   to the server, so it cannot leak into a log the way a query string would. */
+if (location.hash.length > 1) $("q").value = decodeURIComponent(location.hash.slice(1));
+if (!apiKey()) $("gate").hidden = false; else if ($("q").value) load();
+</script>
+</body>
+</html>
