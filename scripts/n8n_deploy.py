@@ -145,6 +145,16 @@ def deploy(cl: httpx.Client, stem: str, activate: bool) -> None:
         "settings": wf.get("settings", {"executionOrder": "v1"}),
     }
     wid = TARGETS[stem]
+    if not wid:
+        # A second run before TARGETS is edited must update, not create again.
+        same = [w["id"] for w in cl.get(f"{BASE}/workflows", params={"limit": 250}).json()["data"]
+                if w["name"] == wf["name"]]
+        if len(same) > 1:
+            print(f"FAIL  {stem}: {len(same)} live workflows named {wf['name']!r}: {same}")
+            return
+        if same:
+            wid = same[0]
+            print(f"      {stem}: found live id={wid} by name — add it to TARGETS")
     r = (cl.put(f"{BASE}/workflows/{wid}", json=body) if wid
          else cl.post(f"{BASE}/workflows", json=body))
     if r.status_code >= 300:
@@ -171,6 +181,8 @@ def main() -> int:
                     help="switch off the retired calls workflows (02, 99). "
                          "Backs them up first; never deletes.")
     args = ap.parse_args()
+    # Workflow names carry '·' and '→'; a Windows console is cp1252.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     with client() as cl:
         if args.deactivate:
