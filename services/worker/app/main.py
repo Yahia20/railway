@@ -674,6 +674,15 @@ DEAL_SELECT = [
 # parses workflow 04's SQL and fails if the two ever drift apart again.
 CONTACT_SELECT = ["ID", "PHONE", "NAME", "SECOND_NAME", "LAST_NAME"]
 
+# NEWEST FIRST, because `max_rows` cuts the END of the list. Bitrix's default
+# order is ID ascending, so a truncated pull kept the oldest deals and dropped
+# the new ones. On 2026-10-04/05 something touched 19,955 deals at once; every
+# one of them matched `>DATE_MODIFY`, the 5,000 cap filled with deals from
+# 2025, and for two nights no deal opened that week reached the database —
+# 3 of 149 conversations on 10-06 found their deal. With ID descending a cut
+# drops the oldest, which the previous nights already stored.
+DEAL_ORDER = {"ID": "DESC"}
+
 
 class BitrixDealsRequest(BaseModel):
     days: int = Field(default=7, ge=1, le=365,
@@ -722,7 +731,8 @@ def bitrix_deals(req: BitrixDealsRequest) -> dict:
     try:
         rows, total, requests = src.list_all(
             "crm.deal.list", select=DEAL_SELECT,
-            filter={">DATE_MODIFY": since}, max_rows=req.max_rows)
+            filter={">DATE_MODIFY": since}, order=DEAL_ORDER,
+            max_rows=req.max_rows)
     except Exception as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"bitrix: {exc}") from exc
 

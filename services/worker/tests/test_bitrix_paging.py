@@ -210,6 +210,31 @@ def test_no_contact_ids_makes_no_bitrix_call(monkeypatch):
                         "truncated": False, "requests": 0}
 
 
+def test_deal_pull_asks_for_newest_first(monkeypatch):
+    """A truncated pull must keep the NEW deals. On 2026-10-04/05 19,955 deals
+    were modified at once; the 5,000 cap filled in Bitrix's default ID-ascending
+    order and the week's new deals never arrived. The order has to be sent on
+    every page, or page two falls back to ascending."""
+    from fastapi.testclient import TestClient
+
+    from app import main
+    from app.config import settings
+
+    calls: list = []
+    src = source(monkeypatch, [page(50, 0, 19_955), page(50, 50, 19_955)], calls)
+    monkeypatch.setattr(settings, "worker_api_key", "k", raising=False)
+    monkeypatch.setattr(main, "_bitrix_rest", lambda: src)
+
+    r = TestClient(main.app).post("/bitrix/deals", headers={"X-API-Key": "k"},
+                                  json={"days": 7, "max_rows": 100})
+
+    assert r.status_code == 200
+    assert r.json()["truncated"] is True
+    assert len(calls) == 2
+    for _, params in calls:
+        assert params["order"] == {"ID": "DESC"}
+
+
 def test_workflow_04_no_longer_calls_bitrix_directly():
     """The paging fix is only real if the workflow stops bypassing it."""
     import json
