@@ -35,6 +35,8 @@ HEALTHY = {
     status.SQL_JUDGE: {"pending": 40, "dead24": 0, "evaluated24": 120, "last_eval": NOW,
                        "last_error": None},
     status.SQL_RETENTION: {"overdue": 0, "oldest": None},
+    status.SQL_QA: {"mode": "on", "may_run": True, "reason": None, "due": 40, "graded26": 120,
+                    "failed26": 0, "last_graded": NOW, "last_error": None},
 }
 EMPTY_LISTS = {status.SQL_MEDIA_REJECTED_24H: [], status.SQL_ROSTER: []}
 
@@ -86,6 +88,19 @@ def test_a_judge_switched_off_by_hand_is_off_not_ok_and_not_fail(monkeypatch):
 def test_an_open_gate_with_nothing_judged_is_a_failure(monkeypatch):
     stub(monkeypatch, SQL_JUDGE={"pending": 599, "evaluated24": 0})
     assert by_key(status.build())["judge"]["status"] == "fail"
+
+
+def test_qa_switched_on_but_workflow_never_ran_is_red(monkeypatch):
+    """The state right after `mode = 'on'` if workflow 10 was never activated in
+    n8n: the switch says yes, the queue waits, and nothing gets graded."""
+    stub(monkeypatch, SQL_QA={"due": 70, "graded26": 0})
+    qa = by_key(status.build())["qa"]
+    assert qa["status"] == "fail" and "n8n" in qa["fix"]
+
+
+def test_qa_switched_off_is_off(monkeypatch):
+    stub(monkeypatch, SQL_QA={"mode": "off", "may_run": False, "reason": "qa_config.mode is off"})
+    assert by_key(status.build())["qa"]["status"] == "off"
 
 
 def test_messages_received_but_not_stored_fail_even_when_traffic_is_live(monkeypatch):

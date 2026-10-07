@@ -370,9 +370,53 @@ def check_roster() -> dict[str, Any]:
     return c
 
 
+# ---------------------------------------------------------------------------
+# 8 · QA scorecard — is tonight's grading running? (workflow 10)
+# ---------------------------------------------------------------------------
+
+SQL_QA = """
+SELECT g.mode, g.may_run, g.reason,
+       (SELECT count(*) FROM v_qa_due)                                         AS due,
+       (SELECT count(*) FROM qa_evaluations
+         WHERE status = 'scored' AND evaluated_at > now() - interval '26 hours') AS graded26,
+       (SELECT count(*) FROM qa_evaluations
+         WHERE status = 'failed' AND updated_at > now() - interval '26 hours')   AS failed26,
+       (SELECT max(evaluated_at) FROM qa_evaluations WHERE status = 'scored')    AS last_graded,
+       (SELECT left(reason, 160) FROM qa_evaluations WHERE status = 'failed'
+         ORDER BY updated_at DESC LIMIT 1)                                       AS last_error
+FROM v_qa_gate g
+"""
+
+
+def check_qa() -> dict[str, Any]:
+    c = _check("qa", "تقييم الموظفين بشيت الجودة (10)")
+    r = db.one(SQL_QA)
+    c["since"] = _riyadh(r["last_graded"])
+    c["what"] = (f"آخر 26 ساعة: {r['graded26']} شات اتقيّم، {r['failed26']} فشل. "
+                 f"مستني تقييم: {r['due']}.")
+    if r["mode"] != "on":
+        c["status"] = "off"
+        c["why"] = "التقييم بشيت الجودة مقفول (qa_config.mode = off)."
+        c["fix"] = "UPDATE qa_config SET value = 'on' WHERE key = 'mode';"
+    elif not r["may_run"]:
+        c["status"] = "fail"
+        c["why"] = f"مفتوح بس البوابة مانعة الصرف: {r['reason']}."
+        c["fix"] = "اشحن رصيد DeepSeek، أو استنى أول فحص للرصيد الليلة."
+    elif r["due"] and not r["graded26"]:
+        c["status"] = "fail"
+        c["why"] = ("مفتوح وفيه شاتات مستنية، ومفيش ولا تقييم آخر 26 ساعة. يا workflow 10 "
+                    "مش Active في n8n، يا بيقع قبل ما يخلص.")
+        c["fix"] = "افتح n8n واتأكد إن 10 · Chat QA scorecard شغال، وشوف آخر execution."
+    elif r["failed26"]:
+        c["status"] = "warn"
+        c["why"] = f"شاتات فشل تقييمها وهتتعاد لوحدها. آخر خطأ: {r['last_error']}"
+        c["fix"] = "لو الرقم بيزيد، افتح executions بتاعة 10 في n8n."
+    return c
+
+
 CHECKS: list[Callable[[], dict[str, Any]]] = [
     check_ingest, check_media, check_deals, check_identity,
-    check_judge, check_retention, check_roster,
+    check_judge, check_qa, check_retention, check_roster,
 ]
 
 
