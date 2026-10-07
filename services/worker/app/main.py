@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from . import budget, db, report
 from .config import settings
 from .evaluate import judge, metrics, scoring
+from .media import links as media_links
 from .normalize.phone import try_normalize
 from .sources.base import Conversation, Message
 from .sources.bitrix_chats import BitrixWebhookSource
@@ -267,7 +268,12 @@ def prepare_chat(req: PrepareChatRequest) -> dict:
         if sent_at.tzinfo is None:
             sent_at = sent_at.replace(tzinfo=timezone.utc)
         sender = m.sender if m.sender in ("customer", "agent", "bot", "system") else "unknown"
-        parsed.append(Message(seq=m.seq, sender=sender, body=m.body, sent_at=sent_at))
+        # Voice-note links embed a live Bitrix REST token. It must never reach
+        # a model provider, so it is cut here — the one door every stored body
+        # passes through on its way to the judge. Nothing else in the text
+        # changes: any wider edit to the judge input is a new scoring baseline.
+        parsed.append(Message(seq=m.seq, sender=sender, body=media_links.redact(m.body),
+                              sent_at=sent_at))
 
     # Ordered by time, not by the caller's ordering or by seq: seq is renumbered
     # by 01c after every batch, and a thread mid-renumber must still render in
@@ -301,8 +307,21 @@ def prepare_chat(req: PrepareChatRequest) -> dict:
         # bullets under it, and the model would have to guess whether that means
         # "we looked and there was nothing" or "we did not look".
         "followup_history": metrics.followup_history_block(
-            later_contacts=req.later_interactions),
+            later_contacts=_redact_later(req.later_interactions)),
     }
+
+
+def _redact_later(later: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """The follow-up block quotes each later contact's first message, cut at
+    300 characters. Redact BEFORE that cut, or a token split across the
+    boundary survives as a prefix. `None` stays `None` (rule 2)."""
+    if later is None:
+        return None
+    return [
+        {**row, "first_message": media_links.redact(row["first_message"])}
+        if isinstance(row.get("first_message"), str) else row
+        for row in later
+    ]
 
 
 class NormalizePhonesRequest(BaseModel):
@@ -800,3 +819,35 @@ def spend_page() -> HTMLResponse:
             "Referrer-Policy": "no-referrer",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Chat media archive — workflow 09 downloads through these; see app/media/.
+# Mounted last so its routes can never shadow an existing one.
+# ---------------------------------------------------------------------------
+
+from .media import api as media_api  # noqa: E402  (needs require_api_key above)
+from .media import reader as media_reader  # noqa: E402
+
+CONVERSATION_PAGE = Path(__file__).resolve().parent / "static" / "conversation.html"
+
+
+@app.get("/conversations", response_class=HTMLResponse, include_in_schema=False)
+def conversation_page() -> HTMLResponse:
+    """Read one deal's chat with its files in place. Holds no data and no key:
+    like /report it asks for WORKER_API_KEY and fetches the JSON itself."""
+    try:
+        html = CONVERSATION_PAGE.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            f"conversation page missing: {exc}") from exc
+    return HTMLResponse(html, headers={
+        "Cache-Control": "no-store",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
+app.include_router(media_api.build_router(require_api_key))
+app.include_router(media_reader.build_router(require_api_key))

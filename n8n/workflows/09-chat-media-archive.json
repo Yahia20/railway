@@ -1,0 +1,663 @@
+{
+  "name": "09 · Chat media archive",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "every-minute",
+      "name": "Every minute",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: this statement IS the run lease; it writes nothing else.\n-- Take the run lease, or learn that another run holds it, or that mode is off.\n-- The UPDATE re-checks its WHERE after waiting on a concurrent writer, so two\n-- executions starting together cannot both win.\nWITH cfg AS (\n  SELECT max(value) FILTER (WHERE key = 'mode')          AS mode,\n         max(value) FILTER (WHERE key = 'scan_batch')    AS scan_batch,\n         max(value) FILTER (WHERE key = 'fetch_batch')   AS fetch_batch,\n         max(value) FILTER (WHERE key = 'max_attempts')  AS max_attempts,\n         max(value) FILTER (WHERE key = 'retention_days') AS retention_days\n  FROM media_archive_config\n),\nlease AS (\n  UPDATE media_archive_config c\n     SET value = (now() + interval '6 minutes')::text, updated_at = now()\n   WHERE c.key = 'run_lease_until'\n     AND c.value::timestamptz < now()\n     AND (SELECT mode FROM cfg) = 'on'\n  RETURNING 1\n),\ntok AS (\n  UPDATE media_archive_config\n     SET value = gen_random_uuid()::text, updated_at = now()\n   WHERE key = 'run_lease_token' AND EXISTS (SELECT 1 FROM lease)\n  RETURNING value\n)\nSELECT EXISTS (SELECT 1 FROM lease)                 AS acquired,\n       (SELECT value FROM tok)                       AS run_token,\n       cfg.mode,\n       coalesce(cfg.scan_batch, '300')::int          AS scan_batch,\n       coalesce(cfg.fetch_batch, '4')::int           AS fetch_batch,\n       coalesce(cfg.max_attempts, '8')::int          AS max_attempts,\n       coalesce(cfg.retention_days, '90')::int       AS retention_days\nFROM cfg;\n",
+        "options": {}
+      },
+      "id": "lease",
+      "name": "Take run lease",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "notes": "mode lives in media_archive_config. Deployed 'off'."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "lease-ok-c",
+              "leftValue": "={{ $('Take run lease').first().json.acquired === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "lease-ok",
+      "name": "Lease taken?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: runs only while this execution holds the run lease.\n-- fence-exempt: it CLEARS claims of purged jobs and fences nothing. Claims are\n-- only made and finished inside the execution that holds the run lease, so a\n-- claim still marked here belongs to a dead execution whose answer never comes.\n-- Retention. Same window and same anchor as purge_raw_content(): the\n-- interaction's started_at. Runs here, not in workflow 04, so media expiry\n-- does not depend on the chat purge succeeding (it failed every night from\n-- 2026-09-16 until 025).\nWITH cfg AS (SELECT $1::int AS days),\nexpired_refs AS (\n  DELETE FROM chat_media cm\n   USING chat_messages m, interactions i, cfg\n   WHERE m.message_id = cm.message_id\n     AND i.interaction_id = m.interaction_id\n     AND (i.started_at < now() - make_interval(days => cfg.days)\n          OR i.content_purged_at IS NOT NULL)\n  RETURNING cm.media_id, cm.job_id\n),\norphan_jobs AS (\n  -- A job nothing refers to any more. Its URL goes too (it may carry a token).\n  -- A claim in flight is fenced on its token and status, so its late answer\n  -- simply matches nothing.\n  --\n  -- Every CTE here reads ONE snapshot: the references deleted just above are\n  -- still visible to this NOT EXISTS, so they are excluded by id explicitly.\n  UPDATE media_fetch_jobs j\n     SET status = 'purged', sha256 = NULL, source_url = NULL,\n         claim_token = NULL, claim_until = NULL, claimed_at = NULL\n   WHERE j.status <> 'purged'\n     AND NOT EXISTS (SELECT 1 FROM chat_media cm\n                      WHERE cm.job_id = j.job_id\n                        AND cm.media_id NOT IN (SELECT media_id FROM expired_refs))\n  RETURNING j.url_hash\n),\ndoomed AS (\n  -- An object with no STORED job pointing at it. Jobs purged in this same\n  -- statement still hold their old sha256 in this snapshot, so they are\n  -- excluded explicitly.\n  UPDATE media_objects o\n     SET state = 'deleting'\n   WHERE o.state = 'present'\n     AND NOT EXISTS (\n       SELECT 1 FROM media_fetch_jobs j\n        WHERE j.sha256 = o.sha256 AND j.status = 'stored'\n          AND j.url_hash NOT IN (SELECT url_hash FROM orphan_jobs))\n  RETURNING o.sha256\n)\nSELECT\n  (SELECT count(*) FROM expired_refs)::int AS refs_expired,\n  -- Receipts still to delete: jobs purged now, plus purged jobs whose receipt\n  -- delete was never confirmed (receipt_deleted_at stays NULL until it is).\n  -- Bounded to the worker's limit; the rest go next run.\n  coalesce((SELECT json_agg(url_hash) FROM (\n      SELECT url_hash FROM orphan_jobs\n      UNION\n      SELECT url_hash FROM media_fetch_jobs\n       WHERE status = 'purged' AND receipt_deleted_at IS NULL\n      LIMIT 200) r), '[]'::json) AS receipts,\n  coalesce((SELECT json_agg(sha256) FROM (\n      SELECT sha256 FROM doomed\n      UNION\n      SELECT sha256 FROM media_objects WHERE state = 'deleting'   -- a previous run's leftovers\n      LIMIT 50) d), '[]'::json) AS objects;\n",
+        "options": {
+          "queryReplacement": "={{ [ $('Take run lease').first().json.retention_days ] }}"
+        }
+      },
+      "id": "retention",
+      "name": "Retention",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "del-any-c",
+              "leftValue": "={{ ($json.objects || []).length + ($json.receipts || []).length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "del-any",
+      "name": "Anything to delete?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORKER_URL }}/media/delete",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ sha256: $('Retention').first().json.objects || [], url_hashes: $('Retention').first().json.receipts || [] }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "delete",
+      "name": "Delete from bucket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "del-ok-c",
+              "leftValue": "={{ Array.isArray($json.objects) && Array.isArray($json.receipts) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "del-ok",
+      "name": "Delete answered?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1320,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: writes media_objects and receipt stamps only, inside the run\n-- lease; no claim is touched.\n-- Record what the worker confirmed. Three things, each only on its own `ok`:\nWITH r AS (SELECT $1::jsonb AS j),\nobjects_gone AS (\n  -- Only if still 'deleting': an object a fetch re-uploaded in the meantime is\n  -- 'present' again and stays so.\n  UPDATE media_objects o\n     SET state = 'deleted', deleted_at = now()\n    FROM r, jsonb_array_elements(r.j->'objects') x\n   WHERE o.sha256 = x->>'sha256' AND (x->>'ok')::boolean AND o.state = 'deleting'\n  RETURNING o.sha256\n),\nreceipts_gone AS (\n  UPDATE media_fetch_jobs f\n     SET receipt_deleted_at = now()\n    FROM r, jsonb_array_elements(r.j->'receipts') x\n   WHERE f.url_hash = x->>'url_hash' AND (x->>'ok')::boolean\n     AND f.status = 'purged' AND f.receipt_deleted_at IS NULL\n  RETURNING f.url_hash\n),\nreceipted_bytes AS (\n  -- Bytes a receipt named but no media_objects row knew: an upload whose\n  -- answer never reached the database (round-3 review). Registered as\n  -- 'deleting' so the next run removes them — unless a stored job now points\n  -- at the same content, in which case they are live and left alone.\n  INSERT INTO media_objects (sha256, bytes, mime, storage_key, state)\n  SELECT DISTINCT ON (x->>'sha256')\n         x->>'sha256', greatest(coalesce((x->>'bytes')::bigint, 1), 1),\n         coalesce(x->>'mime', 'application/octet-stream'),\n         'sha256/' || left(x->>'sha256', 2) || '/' || (x->>'sha256'), 'deleting'\n  FROM r, jsonb_array_elements(r.j->'receipt_objects') x\n  WHERE (x->>'sha256') ~ '^[0-9a-f]{64}$'\n    AND NOT EXISTS (SELECT 1 FROM media_fetch_jobs f\n                     WHERE f.sha256 = x->>'sha256' AND f.status = 'stored')\n  ON CONFLICT (sha256) DO UPDATE SET state = 'deleting', deleted_at = NULL\n   WHERE media_objects.state = 'deleted'\n  RETURNING sha256\n)\nSELECT (SELECT count(*) FROM objects_gone)::int    AS objects_deleted,\n       (SELECT count(*) FROM receipts_gone)::int   AS receipts_deleted,\n       (SELECT count(*) FROM receipted_bytes)::int AS orphans_registered;\n",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify({ objects: $json.objects, receipts: $json.receipts, receipt_objects: $json.receipt_objects || [] }) ] }}"
+        }
+      },
+      "id": "stamp-deleted",
+      "name": "Stamp deleted",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1540,
+        120
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "notes": "Only what the worker reported ok. Anything else stays pending for the next run."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Messages the archive has not examined, newest first: a customer link is\n-- worth most in its first minutes. Every row comes back, link or not, because\n-- \"examined, nothing here\" is recorded too.\nSELECT m.message_id::text AS message_id, m.body, m.content_type,\n       m.created_at AS seen_at\nFROM chat_messages m\nJOIN interactions i ON i.interaction_id = m.interaction_id\nWHERE i.external_source = 'bitrix_chat_api'\n  AND i.content_purged_at IS NULL\n  AND i.started_at >= now() - make_interval(days => $2::int)\n  AND NOT EXISTS (SELECT 1 FROM chat_media_scan s WHERE s.message_id = m.message_id)\nORDER BY m.message_id DESC\nLIMIT $1::int;\n",
+        "options": {
+          "queryReplacement": "={{ [ $('Take run lease').first().json.scan_batch, $('Take run lease').first().json.retention_days ] }}"
+        }
+      },
+      "id": "discover",
+      "name": "Find unexamined messages",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1760,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Turn examined messages into scan records and attachment references.\n// MUST AGREE with services/worker/app/media/links.py (test_workflow_09.py).\nconst FAMILIES = [\n  ['bitrix_rest',  'travelgate.bitrix24.ae',        /^\\/rest\\/\\d+\\/[^/]+\\/download\\//],\n  ['bitrix_short', 'travelgate.bitrix24.ae',        /^\\/~[A-Za-z0-9]+$/],\n  ['gupconnector', 'gupconnector.cultivbureau.com', /^\\/connector\\/gupshup-media\\//],\n  ['gupshup',      'filemanager.gupshup.io',        /^\\/wa\\//],\n];\nconst URL_RE = /https?:\\/\\/[^\\s<>\"']+/g;\nconst TRAIL_RE = /[.,;:!?)\\]}>'\"،]+$/;\nconst ATTACH_RE = /^\\[Attachment:\\s*([^\\]\\n]{1,255})\\]\\s*$/;\n\nfunction classify(url) {\n  // Read the RAW authority, not URL's normalised view: `:443` must be\n  // accepted and any other port, or credentials, refused — as urlsplit does.\n  const m = /^https:\\/\\/([^/?#]*)(\\/[^?#]*)?/i.exec(url);\n  if (!m) return null;\n  const authority = m[1];\n  if (authority.includes('@')) return null;\n  const hp = /^([^:]+)(?::(\\d*))?$/.exec(authority);\n  if (!hp) return null;\n  if (hp[2] !== undefined && hp[2] !== '443') return null;\n  const host = hp[1].toLowerCase();\n  const path = m[2] || '';\n  for (const [family, fhost, re] of FAMILIES) {\n    if (host === fhost && re.test(path)) return family;\n  }\n  return null;\n}\n\nfunction findLinks(body) {\n  const seen = new Set();\n  const out = [];\n  for (const raw of String(body || '').match(URL_RE) || []) {\n    const url = raw.replace(TRAIL_RE, '');\n    const family = classify(url);\n    if (family && !seen.has(url)) { seen.add(url); out.push({ url, family }); }\n  }\n  return out;\n}\n\nfunction attachmentName(body) {\n  for (const line of String(body || '').split(/\\r?\\n/)) {\n    const m = ATTACH_RE.exec(line.trim());\n    if (m) return m[1].trim();\n  }\n  return null;\n}\n\nconst scans = [];\nconst refs = [];\nfor (const item of $input.all()) {\n  const row = item.json || {};\n  if (row.message_id === undefined || row.message_id === null) continue;  // alwaysOutputData's empty item\n  const found = findLinks(row.body);\n  scans.push({ message_id: String(row.message_id), links_found: found.length });\n  const name = attachmentName(row.body);\n  found.forEach((l, i) => refs.push({\n    message_id: String(row.message_id), ordinal: i, url: l.url, family: l.family,\n    file_name: found.length === 1 ? name : null,\n    declared_type: row.content_type || null,\n    seen_at: row.seen_at,\n  }));\n}\nreturn [{ json: { scans, refs, scanned: scans.length, links: refs.length } }];\n"
+      },
+      "id": "parse",
+      "name": "Parse links",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1980,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: inserts new rows; on an existing job it only lowers\n-- first_seen_at or revives a PURGED one, which no claim can hold. Run-leased.\n-- Record what discovery found, in one statement. url_hash is computed HERE\n-- (pgcrypto) so it is byte-for-byte the sha256 the worker computes in Python.\nWITH d AS (SELECT $1::jsonb AS j),\nscan_in AS (\n  SELECT (s->>'message_id')::bigint AS message_id, (s->>'links_found')::int AS links_found\n  FROM d, jsonb_array_elements(d.j->'scans') s\n  WHERE EXISTS (SELECT 1 FROM chat_messages m WHERE m.message_id = (s->>'message_id')::bigint)\n),\nscans AS (\n  INSERT INTO chat_media_scan (message_id, links_found, parser)\n  SELECT message_id, links_found, $2 FROM scan_in\n  ON CONFLICT (message_id) DO NOTHING\n  RETURNING message_id\n),\nrefs AS (\n  SELECT (r->>'message_id')::bigint AS message_id, (r->>'ordinal')::int AS ordinal,\n         r->>'url' AS url, encode(digest(r->>'url', 'sha256'), 'hex') AS url_hash,\n         r->>'family' AS family, nullif(r->>'file_name', '') AS file_name,\n         nullif(r->>'declared_type', '') AS declared_type,\n         (r->>'seen_at')::timestamptz AS seen_at\n  FROM d, jsonb_array_elements(d.j->'refs') r\n  WHERE (r->>'message_id')::bigint IN (SELECT message_id FROM scans)\n),\none_per_url AS (\n  -- ON CONFLICT DO UPDATE may not touch one row twice in a statement.\n  SELECT DISTINCT ON (url_hash) url_hash, url, family,\n         min(seen_at) OVER (PARTITION BY url_hash) AS first_seen_at\n  FROM refs ORDER BY url_hash\n),\njobs AS (\n  INSERT INTO media_fetch_jobs (url_hash, family, source_url, first_seen_at)\n  SELECT url_hash, family, url, first_seen_at FROM one_per_url\n  ON CONFLICT (url_hash) DO UPDATE SET\n    -- earliest observation wins; a second delivery never makes a link look younger\n    first_seen_at = LEAST(media_fetch_jobs.first_seen_at, EXCLUDED.first_seen_at),\n    -- a URL whose old references all expired and that is sent again is worth fetching again\n    status = CASE WHEN media_fetch_jobs.status = 'purged' THEN 'pending' ELSE media_fetch_jobs.status END,\n    attempts = CASE WHEN media_fetch_jobs.status = 'purged' THEN 0 ELSE media_fetch_jobs.attempts END,\n    next_attempt_at = CASE WHEN media_fetch_jobs.status = 'purged' THEN now() ELSE media_fetch_jobs.next_attempt_at END,\n    source_url = CASE WHEN media_fetch_jobs.status = 'purged' THEN EXCLUDED.source_url\n                      ELSE media_fetch_jobs.source_url END,\n    -- A revived job will write a NEW receipt; the old \"receipt deleted\" stamp\n    -- must not stop that one from being cleaned up when it is purged again.\n    receipt_deleted_at = CASE WHEN media_fetch_jobs.status = 'purged' THEN NULL\n                              ELSE media_fetch_jobs.receipt_deleted_at END\n  RETURNING job_id, url_hash\n),\nins AS (\n  INSERT INTO chat_media (message_id, ordinal, job_id, declared_type, file_name)\n  SELECT r.message_id, r.ordinal, j.job_id, r.declared_type, r.file_name\n  FROM refs r JOIN jobs j ON j.url_hash = r.url_hash\n  ON CONFLICT (message_id, ordinal) DO NOTHING\n  RETURNING media_id\n)\nSELECT (SELECT count(*) FROM scans)::int AS scanned,\n       (SELECT count(*) FROM ins)::int   AS references_added,\n       (SELECT count(*) FROM jobs)::int  AS jobs_touched;\n",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('Parse links').first().json), 'links-v1' ] }}"
+        }
+      },
+      "id": "persist",
+      "name": "Record discoveries",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2200,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Reclaim claims whose deadline passed (their execution died), then claim a\n-- batch. Order: customer links seen in the last 25 minutes first, oldest of\n-- those first (earliest deadline); then durable links; then customer links\n-- old enough that they are probably dead, last.\nWITH reclaimed AS (\n  UPDATE media_fetch_jobs\n     SET status = 'retry_wait', claim_token = NULL, claim_until = NULL, claimed_at = NULL,\n         next_attempt_at = now(), last_outcome = 'claim_expired'\n   WHERE status = 'fetching' AND claim_until < now()\n  RETURNING job_id\n),\npicked AS (\n  SELECT j.job_id\n  FROM media_fetch_jobs j\n  WHERE j.status IN ('pending', 'retry_wait')\n    AND j.next_attempt_at <= now()\n    AND j.source_url IS NOT NULL\n    AND EXISTS (SELECT 1 FROM chat_media cm WHERE cm.job_id = j.job_id)\n    AND j.job_id NOT IN (SELECT job_id FROM reclaimed)\n  ORDER BY CASE WHEN j.family = 'gupconnector' AND j.first_seen_at > now() - interval '25 minutes' THEN 0\n                WHEN j.family = 'gupconnector' THEN 2\n                ELSE 1 END,\n           j.first_seen_at\n  LIMIT $1::int\n  FOR UPDATE SKIP LOCKED\n),\nclaimed AS (\n  UPDATE media_fetch_jobs j\n     SET status = 'fetching', claim_token = gen_random_uuid(), claimed_at = now(),\n         -- One claim must outlive the whole serial batch (3 x 75 s + margin)\n         -- and still expire before the next run can take the lease (6 min).\n         claim_until = now() + interval '5 minutes', attempts = j.attempts + 1\n    FROM picked\n   WHERE j.job_id = picked.job_id\n  RETURNING j.job_id::text AS job_id, j.claim_token::text AS claim_token,\n            j.source_url, j.family, j.attempts\n)\nSELECT c.*,\n       (SELECT cm.file_name FROM chat_media cm\n         WHERE cm.job_id = c.job_id::uuid AND cm.file_name IS NOT NULL LIMIT 1) AS file_name\nFROM claimed c;\n",
+        "options": {
+          "queryReplacement": "={{ [ $('Take run lease').first().json.fetch_batch ] }}"
+        }
+      },
+      "id": "claim",
+      "name": "Claim downloads",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2420,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "claimed-c",
+              "leftValue": "={{ typeof $json.claim_token === 'string' && $json.claim_token.length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "claimed",
+      "name": "Claimed one?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "each",
+      "name": "Each download",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        2860,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORKER_URL }}/media/fetch",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ url: $json.source_url, file_name: $json.file_name || null }) }}",
+        "options": {
+          "timeout": 75000
+        }
+      },
+      "id": "fetch",
+      "name": "Download through worker",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3080,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "75 s cap x fetch_batch 3 stays inside the 300 s execution timeout and the 5-minute claim. onError continues so a timeout becomes a recorded 'no_answer', never a lost claim."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Write one fetch outcome, FENCED: only the claim that is still current may\n-- finish the job. A late answer from an expired claim matches nothing.\n-- multi-item: one fetch result per item, each paired with its own claim.\nWITH a AS (SELECT $1::jsonb AS j, $2::int AS max_attempts),\nv AS (\n  SELECT (j->'job'->>'job_id')::uuid      AS job_id,\n         (j->'job'->>'claim_token')::uuid AS tok,\n         (j->'job'->>'attempts')::int     AS attempts,\n         j->'res'                         AS res,\n         -- An answer counts only if it is one of the worker's outcome words.\n         -- An error item (timeout, 503) has no outcome and is `no_answer`.\n         CASE WHEN j->'res'->>'outcome' IN ('stored','expired','too_large','not_a_file',\n                                            'not_allowed','failed')\n              THEN j->'res'->>'outcome' ELSE 'no_answer' END AS outcome,\n         max_attempts\n  FROM a\n),\nowned AS MATERIALIZED (\n  -- The fence, LOCKED: the job row is held from here to commit, so nothing\n  -- can reclaim and re-claim it between this check and the write below.\n  SELECT j.job_id\n  FROM media_fetch_jobs j, v\n  WHERE j.job_id = v.job_id AND j.claim_token = v.tok AND j.status = 'fetching'\n    AND j.claim_until > now()          -- an elapsed claim may not finish, reclaimed or not\n  FOR UPDATE OF j\n),\nobj AS (\n  INSERT INTO media_objects (sha256, bytes, mime, storage_key)\n  SELECT res->>'sha256', (res->>'bytes')::bigint, coalesce(res->>'mime', 'application/octet-stream'),\n         'sha256/' || left(res->>'sha256', 2) || '/' || (res->>'sha256')\n  FROM v\n  WHERE outcome = 'stored' AND (res->>'sha256') ~ '^[0-9a-f]{64}$'\n    AND EXISTS (SELECT 1 FROM owned)\n  ON CONFLICT (sha256) DO UPDATE SET state = 'present', deleted_at = NULL\n  RETURNING sha256\n),\ndecided AS (\n  -- The new status, decided once. Everything else follows from it, so the\n  -- URL can never be dropped from a job that is going to need it again.\n  SELECT v.*,\n         CASE\n           WHEN v.outcome = 'stored' AND EXISTS (SELECT 1 FROM obj)  THEN 'stored'\n           WHEN v.outcome = 'expired'                                THEN 'recovery_pending'\n           WHEN v.outcome IN ('too_large','not_a_file','not_allowed') THEN 'rejected'\n           WHEN v.outcome = 'failed' AND v.attempts >= v.max_attempts THEN 'rejected'\n           ELSE 'retry_wait'\n         END AS new_status\n  FROM v\n),\nupd AS (\n  UPDATE media_fetch_jobs j SET\n    status = d.new_status,\n    sha256 = CASE WHEN d.new_status = 'stored' THEN d.res->>'sha256' END,\n    -- The URL goes the moment the job can never use it again (it may carry a\n    -- REST token). Only retry_wait keeps it.\n    source_url = CASE WHEN d.new_status = 'retry_wait' THEN j.source_url END,\n    -- no_answer (the worker never answered: timeout, 503, no bucket) is an\n    -- infrastructure pause, not a verdict on the file: it gives the attempt\n    -- back and waits 5 minutes, so a long outage cannot reject good files.\n    attempts = CASE WHEN d.outcome = 'no_answer' THEN greatest(j.attempts - 1, 0)\n                    ELSE j.attempts END,\n    http_status  = nullif(d.res->>'http_status', '')::int,\n    last_outcome = CASE WHEN d.new_status = 'rejected' AND d.outcome = 'failed'\n                        THEN 'gave_up_after_' || d.attempts ELSE d.outcome END,\n    last_error   = left(coalesce(d.res->>'error', d.res->>'message'), 300),\n    -- 30 s, 1, 2, 4 … capped at 30 min. A one-minute schedule rounds up.\n    next_attempt_at = CASE WHEN d.outcome = 'no_answer' THEN now() + interval '5 minutes'\n                           ELSE now() + LEAST(interval '30 minutes',\n                                interval '30 seconds' * power(2, LEAST(d.attempts - 1, 6))) END,\n    claim_token = NULL, claim_until = NULL, claimed_at = NULL\n  FROM decided d\n  WHERE j.job_id = d.job_id AND j.job_id IN (SELECT job_id FROM owned)\n    AND j.claim_token = d.tok AND j.status = 'fetching'\n  RETURNING j.job_id::text AS job_id, j.status, j.last_outcome\n)\nSELECT coalesce((SELECT job_id FROM upd), (SELECT job_id::text FROM v)) AS job_id,\n       (SELECT status FROM upd)          AS status,\n       (SELECT last_outcome FROM upd)    AS outcome,\n       EXISTS (SELECT 1 FROM upd)        AS fenced_write_applied;\n",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify({ job: $('Each download').item.json, res: $json }), $('Take run lease').first().json.max_attempts ] }}"
+        }
+      },
+      "id": "record",
+      "name": "Record outcome",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3300,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: this releases the run lease, fenced on the run token below.\n-- Release the run lease, but only our own: a run that overran its lease must\n-- not release the lease a later run now holds.\nUPDATE media_archive_config c\n   SET value = '1970-01-01T00:00:00Z', updated_at = now()\n WHERE c.key = 'run_lease_until'\n   AND EXISTS (SELECT 1 FROM media_archive_config t\n                WHERE t.key = 'run_lease_token' AND t.value = $1)\nRETURNING c.key;\n",
+        "options": {
+          "queryReplacement": "={{ [ $('Take run lease').first().json.run_token ] }}"
+        }
+      },
+      "id": "release",
+      "name": "Release run lease",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3520,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true
+    }
+  ],
+  "connections": {
+    "Every minute": {
+      "main": [
+        [
+          {
+            "node": "Take run lease",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Take run lease": {
+      "main": [
+        [
+          {
+            "node": "Lease taken?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lease taken?": {
+      "main": [
+        [
+          {
+            "node": "Retention",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Retention": {
+      "main": [
+        [
+          {
+            "node": "Anything to delete?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything to delete?": {
+      "main": [
+        [
+          {
+            "node": "Delete from bucket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Find unexamined messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete from bucket": {
+      "main": [
+        [
+          {
+            "node": "Delete answered?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete answered?": {
+      "main": [
+        [
+          {
+            "node": "Stamp deleted",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Release run lease",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stamp deleted": {
+      "main": [
+        [
+          {
+            "node": "Find unexamined messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find unexamined messages": {
+      "main": [
+        [
+          {
+            "node": "Parse links",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse links": {
+      "main": [
+        [
+          {
+            "node": "Record discoveries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record discoveries": {
+      "main": [
+        [
+          {
+            "node": "Claim downloads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim downloads": {
+      "main": [
+        [
+          {
+            "node": "Claimed one?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claimed one?": {
+      "main": [
+        [
+          {
+            "node": "Each download",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Release run lease",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Each download": {
+      "main": [
+        [
+          {
+            "node": "Release run lease",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Download through worker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download through worker": {
+      "main": [
+        [
+          {
+            "node": "Record outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record outcome": {
+      "main": [
+        [
+          {
+            "node": "Each download",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Riyadh",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "none",
+    "saveManualExecutions": false,
+    "saveExecutionProgress": false,
+    "executionTimeout": 300
+  }
+}

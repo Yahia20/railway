@@ -187,3 +187,58 @@ def test_empty_body_still_occupies_its_turn():
 def test_auth_is_required():
     r = client.post("/chats/prepare", json={"external_id": "x", "messages": []})
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# The Bitrix REST token never reaches the judge
+# ---------------------------------------------------------------------------
+
+TOKEN = "q7RESTtokenZZ91"
+VOICE = (f"Voice message\nhttps://travelgate.bitrix24.ae/rest/1/{TOKEN}/download/"
+         "?token=disk|aWQ9MQ==|ImRvd25sb2FkIg==|abc")
+
+
+def test_voice_note_links_reach_the_judge_without_the_rest_token():
+    r = prepare([
+        msg(1, "customer", VOICE, "2026-08-27T10:00:00+03:00"),
+        msg(2, "agent", "وصلتني الرسالة الصوتية", "2026-08-27T10:02:00+03:00"),
+    ])
+    assert r.status_code == 200
+    text = r.json()["transcript_text"]
+    assert TOKEN not in text
+    assert "/rest/1/[redacted]/download/" in text   # the turn still says a file was sent
+
+
+def test_follow_up_history_is_redacted_before_it_is_cut_at_300_chars():
+    # The token sits across the 300-character boundary the formatter cuts at;
+    # redacting after the cut would leave a prefix of it behind.
+    first = "ا" * 260 + " " + VOICE
+    r = client.post("/chats/prepare", headers=AUTH, json={
+        "external_id": "conv-1", "channel": "whatsapp",
+        "messages": [msg(1, "customer", "مرحبا", "2026-08-27T10:00:00+03:00"),
+                     msg(2, "agent", "اهلا", "2026-08-27T10:01:00+03:00")],
+        "later_interactions": [{"started_at": "2026-08-28T10:00:00+03:00", "channel": "chat",
+                                "direction": "outbound", "agent_name": "A",
+                                "hours_after": 24.0, "first_message": first}],
+    })
+    history = r.json()["followup_history"]
+    assert "q7REST" not in history and TOKEN[:6] not in history
+
+
+def test_redaction_changes_nothing_else_in_the_judge_input():
+    """Rule: any wider change to the judge input is a new scoring baseline.
+    A thread with no Bitrix REST link must render byte-for-byte as before."""
+    thread = [
+        msg(1, "customer", "[Attachment: عرض.pdf]\nhttps://travelgate.bitrix24.ae/~Ab12Cd",
+            "2026-08-27T10:00:00+03:00"),
+        msg(2, "agent", "شوف https://example.com/x?a=1 لو سمحت", "2026-08-27T10:01:00+03:00"),
+    ]
+    text = prepare(thread).json()["transcript_text"]
+    assert "https://travelgate.bitrix24.ae/~Ab12Cd" in text
+    assert "https://example.com/x?a=1" in text
+
+
+def test_none_later_interactions_stays_none_rule_2():
+    r = prepare([msg(1, "customer", "مرحبا", "2026-08-27T10:00:00+03:00"),
+                 msg(2, "agent", "اهلا", "2026-08-27T10:01:00+03:00")])
+    assert r.json()["followup_history"] == "unavailable"
