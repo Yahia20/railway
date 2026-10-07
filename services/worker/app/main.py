@@ -672,6 +672,92 @@ def status_data() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# QA scorecard (app/qa). Workflow 10 claims a chat, calls this, and stores
+# what comes back — this endpoint reads the chat and asks the model, nothing
+# more (rule 11).
+# ---------------------------------------------------------------------------
+
+class QAEvaluateRequest(BaseModel):
+    interaction_id: str = Field(min_length=36, max_length=36)
+
+
+@app.post("/qa/evaluate", dependencies=[Depends(require_api_key)])
+def qa_evaluate(req: QAEvaluateRequest) -> dict:
+    """`gradeable: false` is an answer, not an error: n8n marks the chat and
+    moves on. Only a failed model call is an error, and it costs no row."""
+    from .qa import engine as qa_engine
+
+    try:
+        thread = qa_engine.load_thread(req.interaction_id)
+    except qa_engine.NotGradeable as exc:
+        return {"gradeable": False, "interaction_id": req.interaction_id, "reason": str(exc)}
+    except db.DatabaseUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    try:
+        result = qa_engine.evaluate(thread)
+    except judge.JudgeError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    return {"gradeable": True, **result}
+
+
+# The dashboard. Like /report: the page is a shell with no data and no key; it
+# asks for WORKER_API_KEY and fetches the rest. It reads qa_evaluations live,
+# so every chat workflow 10 grades tonight is on it tomorrow morning.
+DASHBOARD_PAGE = Path(__file__).resolve().parent / "static" / "dashboard.html"
+_SHELL_HEADERS = {"Cache-Control": "no-store", "X-Frame-Options": "DENY",
+                  "Referrer-Policy": "no-referrer"}
+
+
+@app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+def dashboard_page() -> HTMLResponse:
+    try:
+        html = DASHBOARD_PAGE.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            f"dashboard page missing: {exc}") from exc
+    return HTMLResponse(html, headers=_SHELL_HEADERS)
+
+
+def _dash(call):
+    try:
+        return call()
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except db.DatabaseUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+
+@app.get("/dashboard/data", dependencies=[Depends(require_api_key)])
+def dashboard_data(start: str | None = None, end: str | None = None) -> dict:
+    from . import dashboard
+    return _dash(lambda: dashboard.build(start, end))
+
+
+@app.get("/dashboard/agent/{agent_id}/chats", dependencies=[Depends(require_api_key)])
+def dashboard_agent_chats(agent_id: str, start: str | None = None,
+                          end: str | None = None) -> list[dict]:
+    from . import dashboard
+    return _dash(lambda: dashboard.agent_chats(agent_id, start, end))
+
+
+@app.get("/dashboard/chat/{interaction_id}", response_class=HTMLResponse,
+         dependencies=[Depends(require_api_key)])
+def dashboard_chat(interaction_id: str, k: int = 1) -> HTMLResponse:
+    from . import dashboard
+    frag = _dash(lambda: dashboard.chat_fragment(interaction_id, k))
+    if frag is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "this chat has not been graded")
+    return HTMLResponse(frag, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/dashboard/rules", response_class=HTMLResponse,
+         dependencies=[Depends(require_api_key)])
+def dashboard_rules() -> HTMLResponse:
+    from .qa import render
+    return HTMLResponse(render.rules_html(), headers={"Cache-Control": "no-store"})
+
+
+# ---------------------------------------------------------------------------
 # Bitrix CRM pulls
 #
 # WHY THESE ARE HERE AND NOT IN n8n. Workflow 04 called crm.deal.list directly

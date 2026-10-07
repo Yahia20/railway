@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>داشبورد الجودة</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600&family=Noto+Kufi+Arabic:wght@600;700&display=swap">
+<style>
+/* The approved QA page's look (artifact "تقييم جودة الموظفين"), with the team
+   and customers screens of "ست شاشات TravelGate" added as tabs. Holds no data:
+   everything is fetched with the key, live, on every load. */
+:root {
+  --bg: #f3f5f6; --surface: #ffffff; --ink: #16242a; --muted: #5b6b72; --line: #d9e0e3;
+  --accent: #0e6a70; --accent-soft: #e1eff0;
+  --good: #1d7a46; --good-soft: #e3f3e9; --bad: #b3261e; --bad-soft: #fbe7e5; --mid: #8a5a00; --mid-soft: #fbf1dc;
+  --font-display: "Noto Kufi Arabic", "IBM Plex Sans Arabic", Tahoma, sans-serif;
+  --font-body: "IBM Plex Sans Arabic", Tahoma, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1719; --surface: #172226; --ink: #e4ecee; --muted: #9aabb1; --line: #2a3a40;
+    --accent: #5cc1c7; --accent-soft: #173a3d; --good: #5fcf8c; --good-soft: #163424;
+    --bad: #ff8a80; --bad-soft: #3d1c1a; --mid: #f0c060; --mid-soft: #3a2f14; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1719; --surface: #172226; --ink: #e4ecee; --muted: #9aabb1; --line: #2a3a40;
+  --accent: #5cc1c7; --accent-soft: #173a3d; --good: #5fcf8c; --good-soft: #163424;
+  --bad: #ff8a80; --bad-soft: #3d1c1a; --mid: #f0c060; --mid-soft: #3a2f14; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--ink); font-family: var(--font-body); font-size: 16px; line-height: 1.7; }
+.wrap { max-width: 1000px; margin: 0 auto; padding-inline: 16px; padding-block: 24px 64px; display: grid; gap: 16px; }
+h1 { font-family: var(--font-display); margin: 0; line-height: 1.4; font-size: clamp(1.4rem, 4vw, 2rem); }
+p { margin: 0; }
+.top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; }
+.summary { font-size: 1.05rem; background: var(--accent-soft); border-radius: 10px; padding: 12px 16px; }
+.summary b { color: var(--accent); }
+.hint { color: var(--muted); font-size: .92rem; }
+.tabs { display: flex; gap: 6px; flex-wrap: wrap; border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+.tab { font-weight: 600; border-radius: 999px; }
+.tab[aria-selected="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: .92rem; }
+.bar input[type=date], .bar input[type=search] { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); }
+.page[hidden] { display: none; }
+
+.sc, .is { font-family: var(--font-display); font-weight: 700; border-radius: 8px; padding: 0 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.good { background: var(--good-soft); color: var(--good); }
+.bad { background: var(--bad-soft); color: var(--bad); }
+.mid { background: var(--mid-soft); color: var(--mid); }
+.emp, .chatrow { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+.emp > summary, .chatrow > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 12px; padding: 12px 16px; }
+.emp > summary::-webkit-details-marker, .chatrow > summary::-webkit-details-marker { display: none; }
+.emp > summary::after, .chatrow > summary::after { content: "▾"; color: var(--muted); }
+.emp[open] > summary::after, .chatrow[open] > summary::after { content: "▴"; }
+.chatrow { background: var(--bg); }
+.chatrow > summary { padding: 8px 12px; }
+.en { font-weight: 600; font-size: 1.05rem; margin-inline-end: auto; }
+.ec { color: var(--muted); font-size: .9rem; }
+.cb { background: var(--bad-soft); color: var(--bad); font-size: .8rem; font-weight: 600; border-radius: 999px; padding: 1px 10px; }
+.emp-body { border-top: 1px solid var(--line); padding: 14px; display: grid; gap: 10px; }
+.chat { border: 1px solid var(--line); border-radius: 10px; padding: 12px; display: grid; gap: 10px; background: var(--bg); }
+.chat-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.label { font-weight: 600; font-size: 1.02rem; }
+.item { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; display: grid; gap: 6px; }
+.ih { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-weight: 600; }
+.is { font-size: .85rem; }
+.w { font-size: .75rem; font-weight: 600; color: var(--accent); background: var(--accent-soft); border-radius: 999px; padding: 0 7px; margin-inline-start: 6px; }
+.w.big { font-size: .9rem; }
+.qs { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.qs li { display: grid; grid-template-columns: 1.4rem minmax(0, 1fr); gap: 6px; }
+.mark { font-weight: 700; text-align: center; }
+li.yes .mark { color: var(--good); }
+li.no .mark { color: var(--bad); }
+li.no > div > b { color: var(--bad); }
+.imp { font-size: .72rem; font-weight: 600; padding: 0 7px; border-radius: 999px; margin-inline-start: 6px; background: var(--bad-soft); color: var(--bad); }
+.proof { display: grid; gap: 3px; margin-top: 3px; }
+.pl { font-size: .82rem; color: var(--muted); }
+.ev { font-size: .85rem; border-radius: 8px; padding: 4px 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ev .who, .msg .who { display: block; font-size: .72rem; color: var(--muted); }
+.ev.customer { background: var(--bg); }
+.ev.agent { background: var(--accent-soft); }
+.ev.bot, .ev.system { background: var(--bg); color: var(--muted); }
+li.yes .ev { opacity: .85; }
+.re { display: block; font-size: .76rem; color: var(--muted); border-inline-start: 3px solid var(--line); padding-inline-start: 6px; margin-bottom: 2px; }
+.crit-box { border-color: var(--bad); }
+.crit-box .ih { color: var(--bad); }
+.crit-box.ok { border-color: var(--line); }
+.crit-box.ok .ih { color: var(--good); }
+.na { font-size: .85rem; color: var(--muted); }
+.convo > summary { cursor: pointer; color: var(--accent); font-size: .9rem; font-weight: 600; }
+.msgs { display: grid; gap: 4px; max-height: 440px; overflow-y: auto; background: var(--surface); border-radius: 8px; padding: 10px; margin-top: 8px; }
+.msg { font-size: .88rem; padding: 6px 10px; border-radius: 8px; max-width: 88%; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.customer { background: var(--bg); justify-self: start; }
+.msg.agent { background: var(--accent-soft); justify-self: end; }
+.msg.bot, .msg.system { background: var(--bg); color: var(--muted); justify-self: center; font-size: .8rem; }
+.final { display: flex; justify-content: space-between; align-items: center; gap: 10px; border-radius: 10px; padding: 10px 14px; font-weight: 600; }
+.final b { font-family: var(--font-display); font-size: 1.5rem; font-variant-numeric: tabular-nums; }
+.ritem { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; display: grid; gap: 4px; }
+.rh { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-weight: 700; font-family: var(--font-display); }
+.en-name { font-size: .82rem; color: var(--muted); }
+.ritem ul { margin: 4px 0 0; padding-inline-start: 18px; display: grid; gap: 4px; }
+.rule { display: block; font-size: .88rem; color: var(--muted); }
+.crit-r { border-color: var(--bad); }
+.crit-r .rh { color: var(--bad); }
+.out .rh { color: var(--muted); }
+
+.tbl { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+th { font-size: .78rem; color: var(--muted); font-weight: 600; text-align: start; padding: 8px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; position: sticky; top: 0; background: var(--surface); }
+td { padding: 7px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; font-variant-numeric: tabular-nums; }
+tr:last-child td { border-bottom: 0; }
+td.c5 { text-align: center; font-weight: 600; border-radius: 6px; }
+.na-cell { color: var(--muted); }
+.legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: .82rem; color: var(--muted); }
+.legend span { border-radius: 6px; padding: 0 8px; }
+
+button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 5px 14px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#gate { max-width: 420px; margin: 80px auto; padding: 0 16px; display: grid; gap: 10px; }
+#gate input { font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); }
+.err { color: var(--bad); font-size: .9rem; min-height: 1em; }
+.loading { color: var(--muted); font-size: .9rem; }
+[hidden] { display: none !important; }
+@media (max-width: 560px) { .emp > summary { flex-wrap: wrap; } .en { flex-basis: 100%; } }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <h2>مفتاح الوصول</h2>
+  <p>الصفحة دي بتقرا شاتات عملاء حقيقية. الرقم السري هو <code>WORKER_API_KEY</code>، وبيتخزن في الـ session بس.</p>
+  <input type="password" id="key" placeholder="WORKER_API_KEY" autocomplete="off" spellcheck="false">
+  <div class="err" id="gateErr"></div>
+  <button id="enter">ادخل</button>
+</div>
+
+<div class="wrap" id="app" hidden>
+  <div class="top"><h1>داشبورد الجودة</h1><span class="hint" id="stamp"></span></div>
+  <div class="bar">
+    <span>من</span><input type="date" id="from">
+    <span>لـ</span><input type="date" id="to">
+    <button id="apply">اعرض</button>
+    <button id="lastWeek">آخر أسبوع</button>
+    <button id="all">كل الفترة</button>
+  </div>
+  <p class="summary" id="summary"></p>
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" data-p="emp" aria-selected="true">الموظفين</button>
+    <button class="tab" role="tab" data-p="team" aria-selected="false">الفريق</button>
+    <button class="tab" role="tab" data-p="cust" aria-selected="false">العملاء</button>
+    <button class="tab" role="tab" data-p="rules" aria-selected="false">قواعد التقييم</button>
+  </div>
+  <div class="err" id="loadErr"></div>
+
+  <section class="page" id="p-emp">
+    <p class="hint">اضغط على اسم الموظف تشوف شاتاته، واضغط على الشات تشوف البنود والأسئلة والدليل من الشات.</p>
+    <div id="emps" style="display:grid;gap:12px"></div>
+  </section>
+
+  <section class="page" id="p-team" hidden>
+    <p class="hint">كل بند من بنود شيت الجودة من 5، متوسط على الشاتات اللي البند اتطبّق فيها. "—" يعني البند ما اتطبّقش في ولا شات.</p>
+    <div class="legend"><span class="good">4 لـ 5</span><span class="mid">2.5 لـ 4</span><span class="bad">أقل من 2.5</span></div>
+    <div class="tbl"><table id="teamTbl"></table></div>
+    <p class="hint">"اتعامل" = كل شاتاته في الفترة. "اتقيّم" = اللي عدّت الفلتر (الطرفين كتبوا مرتين على الأقل، 4 لـ 60 رسالة، وعدّى عليها 3 أيام). الـ deals عن كل الفترة، مش الفترة المختارة بس.</p>
+  </section>
+
+  <section class="page" id="p-cust" hidden>
+    <div class="bar"><input type="search" id="custQ" placeholder="ابحث بالاسم أو آخر 4 أرقام" style="min-width:240px"><span class="hint" id="custCount"></span></div>
+    <div class="tbl"><table id="custTbl"></table></div>
+    <p class="hint">آخر درجة = درجة آخر شات اتقيّم للعميل ده، مش متوسط. العميل غالباً عنده شات أو اتنين، والمتوسط على رقم واحد مالوش معنى.</p>
+  </section>
+
+  <section class="page" id="p-rules" hidden><div id="rules" style="display:grid;gap:12px"></div></section>
+</div>
+
+<script>
+"use strict";
+const KEY_STORE = "c360_worker_key";
+const ITEMS = {1:"التحية والتخصيص واسم العميل",2:"سرعة الرد",3:"فهم الطلب وقراءة المحادثة كلها",4:"أسئلة لفهم الطلب",5:"كتابة واضحة ومهنية",6:"التعاطف والأسلوب الإيجابي",7:"المعلومة الصح والكاملة",8:"الإجراءات والمستندات والتحويل",9:"الحل المناسب والبدائل",10:"التعامل مع الاعتراض",11:"توضيح الخطوة الجاية والمواعيد",12:"فرصة البيع",13:"القفل وطلب الخطوة الجاية",14:"التأكد إن العميل فهم",15:"الإملاء والتنسيق"};
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const band = (s) => s >= 70 ? "good" : s < 50 ? "bad" : "mid";
+const band5 = (v) => v >= 4 ? "good" : v < 2.5 ? "bad" : "mid";
+const day = (iso) => new Date(iso).toLocaleDateString("en-CA", {timeZone: "Asia/Riyadh"});
+const count = (n) => n === 1 ? "شات واحد" : n === 2 ? "شاتين" : n + " شاتات";
+let range = {start: null, end: null};
+
+function apiKey() { try { return sessionStorage.getItem(KEY_STORE) || ""; } catch { return ""; } }
+function setKey(v) { try { v ? sessionStorage.setItem(KEY_STORE, v) : sessionStorage.removeItem(KEY_STORE); } catch {} }
+function qs() {
+  const p = new URLSearchParams();
+  if (range.start) p.set("start", range.start);
+  if (range.end) p.set("end", range.end);
+  return p.toString() ? "?" + p : "";
+}
+async function get(path, asText) {
+  const res = await fetch(path, {headers: {"X-API-Key": apiKey()}, cache: "no-store"});
+  if (res.status === 401) throw Object.assign(new Error("المفتاح غلط"), {auth: true});
+  if (!res.ok) throw new Error("الـ worker رجّع " + res.status + " — " + (await res.text()).slice(0, 200));
+  return asText ? res.text() : res.json();
+}
+
+function renderEmployees(agents) {
+  $("emps").innerHTML = agents.length ? agents.map((a) => {
+    const crit = a.critical ? '<span class="cb">⚠ ' + a.critical + " غلطة خطيرة</span>" : "";
+    return '<details class="emp" data-agent="' + esc(a.agent_id) + '" data-name="' + esc(a.full_name) +
+      '"><summary><span class="en">' + esc(a.full_name) + '</span><span class="ec">' + count(a.chats) +
+      "</span>" + crit + '<span class="sc ' + band(a.score) + '">' + Math.round(a.score) +
+      '%</span></summary><div class="emp-body"><span class="loading">بيحمّل…</span></div></details>';
+  }).join("") : '<p class="hint">مفيش شاتات اتقيّمت في الفترة دي.</p>';
+  document.querySelectorAll(".emp").forEach((el) => el.addEventListener("toggle", () => openAgent(el), {once: true}));
+}
+
+async function openAgent(el) {
+  const body = el.querySelector(".emp-body");
+  try {
+    const chats = await get("dashboard/agent/" + el.dataset.agent + "/chats" + qs());
+    const avg = Math.round(chats.reduce((s, c) => s + c.score, 0) / (chats.length || 1));
+    body.innerHTML = chats.map((c, i) =>
+      '<details class="chatrow" data-id="' + esc(c.interaction_id) + '" data-k="' + (i + 1) + '"><summary>' +
+      '<span class="en">شات ' + (i + 1) + " · " + day(c.started_at) + "</span>" +
+      (c.critical.length ? '<span class="cb">⚠ ' + c.critical.length + "</span>" : "") +
+      '<span class="sc ' + band(c.score) + '">' + Math.round(c.score) + '%</span></summary>' +
+      '<div class="frag"><span class="loading">بيحمّل…</span></div></details>').join("") +
+      '<div class="final ' + band(avg) + '"><span>التقييم النهائي لـ ' + esc(el.dataset.name) +
+      " (متوسط " + count(chats.length) + ")</span><b>" + avg + "%</b></div>";
+    body.querySelectorAll(".chatrow").forEach((row) => row.addEventListener("toggle", () => openChat(row), {once: true}));
+  } catch (e) { body.innerHTML = '<span class="err">' + esc(e.message) + "</span>"; }
+}
+
+async function openChat(row) {
+  const frag = row.querySelector(".frag");
+  try { frag.innerHTML = await get("dashboard/chat/" + row.dataset.id + "?k=" + row.dataset.k, true); }
+  catch (e) { frag.innerHTML = '<span class="err">' + esc(e.message) + "</span>"; }
+}
+
+function renderTeam(agents) {
+  const head = "<tr><th>الموظف</th><th>اتعامل</th><th>اتقيّم</th><th>الدرجة</th>" +
+    Object.keys(ITEMS).map((n) => '<th title="' + esc(ITEMS[n]) + '">' + n + "</th>").join("") +
+    "<th>غلطات خطيرة</th><th>deals</th><th>اتقفلت بيع</th></tr>";
+  const rows = agents.map((a) => "<tr><td>" + esc(a.full_name) + "</td><td>" + a.handled + "</td><td>" + a.chats +
+    '</td><td><span class="sc ' + band(a.score) + '">' + Math.round(a.score) + "%</span></td>" +
+    Object.keys(ITEMS).map((n) => {
+      const v = a.items[n];
+      return v == null ? '<td class="c5 na-cell">—</td>'
+        : '<td class="c5 ' + band5(v) + '" title="' + esc(ITEMS[n]) + '">' + v.toFixed(1) + "</td>";
+    }).join("") + "<td>" + (a.critical || "") + "</td><td>" + a.deals + "</td><td>" + a.won + "</td></tr>").join("");
+  $("teamTbl").innerHTML = "<thead>" + head + "</thead><tbody>" + rows + "</tbody>";
+}
+
+let customers = [];
+function renderCustomers() {
+  const q = $("custQ").value.trim().toLowerCase();
+  const list = customers.filter((c) => !q || (c.display_name || "").toLowerCase().includes(q) || (c.phone_tail || "").includes(q));
+  $("custCount").textContent = list.length + " عميل";
+  $("custTbl").innerHTML = "<thead><tr><th>العميل</th><th>الموبايل</th><th>شاتات</th><th>آخر تواصل</th><th>آخر موظف</th><th>آخر درجة</th><th>deals</th><th>اتقفلت بيع</th></tr></thead><tbody>" +
+    list.slice(0, 500).map((c) => "<tr><td>" + (c.display_name ? esc(c.display_name) : '<span class="na-cell">من غير اسم</span>') +
+      "</td><td>" + (c.phone_tail ? "•••" + esc(c.phone_tail) : "—") + "</td><td>" + c.chats + "</td><td>" + day(c.last_at) +
+      "</td><td>" + esc(c.last_agent || "—") + "</td><td>" +
+      (c.last_score == null ? '<span class="na-cell">ما اتقيّمش</span>' : '<span class="sc ' + band(c.last_score) + '">' + Math.round(c.last_score) + "%</span>") +
+      "</td><td>" + c.deals + "</td><td>" + c.won + "</td></tr>").join("") + "</tbody>";
+}
+
+async function load() {
+  try {
+    const d = await get("dashboard/data" + qs());
+    $("gate").hidden = true; $("app").hidden = false; $("loadErr").textContent = "";
+    $("from").value = d.from;
+    const to = new Date(d.to + "T00:00:00"); to.setDate(to.getDate() - 1);
+    $("to").value = to.toISOString().slice(0, 10);
+    const t = d.totals;
+    $("summary").innerHTML = "اتقيّم <b>" + t.graded + " شات</b> لـ <b>" + t.agents + " موظف</b>. متوسط الدرجة <b>" +
+      (t.avg_score == null ? "—" : Math.round(t.avg_score) + "%") + "</b>." +
+      (t.critical ? " <b>" + t.critical + "</b> غلطة خطيرة محتاجة مراجعة." : "") +
+      (t.waiting ? " مستني تقييم: <b>" + t.waiting + "</b> شات." : "");
+    $("stamp").textContent = t.last_graded ? "آخر تقييم اتعمل: " + new Date(t.last_graded).toLocaleString("ar-EG", {timeZone: "Asia/Riyadh"}) : "";
+    renderEmployees(d.agents); renderTeam(d.agents);
+    customers = d.customers; renderCustomers();
+  } catch (e) {
+    if (e.auth) { setKey(""); $("app").hidden = true; $("gate").hidden = false; $("gateErr").textContent = e.message; }
+    else { $("loadErr").textContent = e.message; }
+  }
+}
+
+let rulesLoaded = false;
+document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", async () => {
+  document.querySelectorAll(".tab").forEach((x) => x.setAttribute("aria-selected", x === b));
+  document.querySelectorAll(".page").forEach((p) => { p.hidden = p.id !== "p-" + b.dataset.p; });
+  if (b.dataset.p === "rules" && !rulesLoaded) {
+    try { $("rules").innerHTML = await get("dashboard/rules", true); rulesLoaded = true; }
+    catch (e) { $("rules").innerHTML = '<span class="err">' + esc(e.message) + "</span>"; }
+  }
+}));
+$("apply").addEventListener("click", () => {
+  const to = $("to").value ? new Date($("to").value + "T00:00:00") : null;
+  if (to) to.setDate(to.getDate() + 1);
+  range = {start: $("from").value || null, end: to ? to.toISOString().slice(0, 10) : null};
+  load();
+});
+$("lastWeek").addEventListener("click", () => {
+  const today = new Date(new Date().toLocaleDateString("en-CA", {timeZone: "Asia/Riyadh"}) + "T00:00:00");
+  const s = new Date(today); s.setDate(s.getDate() - 7);
+  range = {start: s.toISOString().slice(0, 10), end: null}; load();
+});
+$("all").addEventListener("click", () => { range = {start: null, end: null}; load(); });
+$("custQ").addEventListener("input", renderCustomers);
+$("enter").addEventListener("click", () => { setKey($("key").value.trim()); load(); });
+$("key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("enter").click(); });
+if (apiKey()) load();
+</script>
+</body>
+</html>

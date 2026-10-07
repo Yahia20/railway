@@ -1,0 +1,519 @@
+{
+  "name": "10 · Chat QA scorecard",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/10 23,0-3 * * *"
+            }
+          ]
+        }
+      },
+      "name": "Every 10 min, 23:00-04:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "Asia/Riyadh (settings.timezone). 23:00-03:59 local is entirely outside DeepSeek's peak (01-04 and 06-10 UTC), which halves the bill, and it ends before 04:00.",
+      "id": "wf10-01"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORKER_URL }}/budget/preflight",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ providers: [\"deepseek\"] }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "name": "Check budget",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "id": "wf10-02"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: pipeline-wide state, not per-job work; the same single write\n-- path into provider_status that 01d uses (the worker probes, n8n writes).\nINSERT INTO provider_status\n  (provider, checked_at, available, reason, balance_usd, spend_mtd_usd, raw)\nSELECT e.key, now(),\n       (e.value->>'available')::boolean,\n       e.value->>'reason',\n       nullif(e.value->>'balance_usd', '')::numeric,\n       nullif(e.value->>'spend_mtd_usd', '')::numeric,\n       coalesce(e.value->'raw', '{}'::jsonb)\n  FROM jsonb_each($1::jsonb) AS e\nON CONFLICT (provider) DO UPDATE\n   SET checked_at = EXCLUDED.checked_at, available = EXCLUDED.available,\n       reason = EXCLUDED.reason, balance_usd = EXCLUDED.balance_usd,\n       spend_mtd_usd = EXCLUDED.spend_mtd_usd, raw = EXCLUDED.raw\nRETURNING provider, available;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.providers || {}) ] }}"
+        }
+      },
+      "name": "Record provider status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf10-03"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- multi-item: a plain read of one row.\n-- A SEPARATE statement so it sees the write above. v_qa_gate (030) holds the\n-- policy: qa_config.mode, the monthly cap, a known and available balance, and\n-- a probe younger than an hour. It does NOT read provider_budgets.enabled —\n-- that switch keeps the old v7 judge (01d) off and must not stop this one.\nSELECT mode, may_run, reason, balance_usd FROM v_qa_gate;",
+        "options": {}
+      },
+      "name": "Read QA gate",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf10-04"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "may-we-spend",
+              "leftValue": "={{ $json.may_run === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "May we spend?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        300
+      ],
+      "id": "wf10-05"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: a run log entry; nothing was claimed.\n-- 'skipped', not 'failed': no chat changed state and the queue is exactly as\n-- it was, so the next tick picks it up with nothing to backfill.\nINSERT INTO job_runs (job_name, status, started_at, finished_at,\n                      items_in, items_ok, items_failed, error, detail)\nSELECT 'qa_chat', 'skipped'::job_status, now(), now(),\n       (SELECT count(*) FROM v_qa_due), 0, 0, $1::text,\n       jsonb_build_object('gate', 'v_qa_gate', 'reason', $1::text)\nRETURNING run_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Read QA gate').first().json.reason || 'blocked' ] }}"
+        }
+      },
+      "name": "Log blocked run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        480
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf10-06"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: housekeeping on rows no run holds.\n-- The 90-day purge blanks a conversation's text; the quotes stored in\n-- qa_evaluations.items are that same text, so they go too. Score and the 15\n-- item scores stay: they are numbers about the agent, not the customer's words.\nWITH gone AS (\n  UPDATE qa_evaluations q SET items = NULL, updated_at = now()\n  FROM interactions i\n  WHERE i.interaction_id = q.interaction_id\n    AND i.content_purged_at IS NOT NULL AND q.items IS NOT NULL\n  RETURNING q.interaction_id)\nSELECT count(*)::int AS blanked FROM gone;",
+        "options": {}
+      },
+      "name": "Retention",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf10-07"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- fence-exempt: this statement IS the claim. INSERT ... ON CONFLICT DO UPDATE\n-- locks the conflicting row itself and evaluates the WHERE below on the locked,\n-- current version, so two ticks cannot both take over the same stale row.\n-- Claim up to qa_config.batch due chats, oldest first, each with a fresh\n-- token. A row that is already claimed is taken over only once its claim is\n-- 30 minutes stale (a crashed run); a failed one only after an hour, and only\n-- while it has attempts left — the same rules v_qa_due states.\nINSERT INTO qa_evaluations (interaction_id, status, claimed_at, claim_token)\nSELECT d.interaction_id, 'claimed', now(), gen_random_uuid()\n  FROM v_qa_due d\n ORDER BY d.started_at\n LIMIT (SELECT value::int FROM qa_config WHERE key = 'batch')\nON CONFLICT (interaction_id) DO UPDATE\n   SET status = 'claimed', claimed_at = now(), claim_token = EXCLUDED.claim_token,\n       updated_at = now()\n WHERE (qa_evaluations.status = 'claimed'\n        AND qa_evaluations.claimed_at < now() - interval '30 minutes')\n    OR (qa_evaluations.status = 'failed' AND qa_evaluations.attempts < 3\n        AND qa_evaluations.updated_at < now() - interval '1 hour')\nRETURNING interaction_id::text, claim_token::text;",
+        "options": {}
+      },
+      "name": "Claim chats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1320,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf10-08"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "claimed-one",
+              "leftValue": "={{ typeof $json.claim_token === 'string' && $json.claim_token.length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Claimed one?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1540,
+        300
+      ],
+      "id": "wf10-09"
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "name": "Each chat",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1760,
+        300
+      ],
+      "id": "wf10-10"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORKER_URL }}/qa/evaluate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ interaction_id: $json.interaction_id }) }}",
+        "options": {
+          "timeout": 240000
+        }
+      },
+      "name": "Grade through worker",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "notes": "Three model runs in parallel inside the worker, ~10-30 s. onError continues so a timeout becomes a recorded failure with an attempt spent, never a lost claim.",
+      "id": "wf10-11"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Store one answer, FENCED on the claim token: an answer whose claim was taken\n-- over by a later tick matches nothing and changes nothing.\n-- multi-item: one worker answer per item, each paired with its own claim.\n-- The outcome is decided by the TYPE of `gradeable` (gotcha 15): an error item\n-- from a timeout has no `gradeable` at all and is recorded as a failure with an\n-- attempt spent, never read as a grade.\nWITH r AS (SELECT $1::jsonb AS j, $2::uuid AS id, $3::uuid AS tok),\no AS (\n  SELECT r.*, CASE WHEN jsonb_typeof(j->'gradeable') = 'boolean'\n                    AND (j->>'gradeable')::boolean           THEN 'scored'\n                   WHEN jsonb_typeof(j->'gradeable') = 'boolean' THEN 'not_gradeable'\n                   ELSE 'failed' END AS outcome\n  FROM r),\nowned AS MATERIALIZED (\n  -- The fence, LOCKED: the row is held from here to commit, so a takeover\n  -- cannot slip in between this check and the write below.\n  SELECT q.interaction_id\n  FROM qa_evaluations q, o\n  WHERE q.interaction_id = o.id AND q.claim_token = o.tok AND q.status = 'claimed'\n  FOR UPDATE OF q)\nUPDATE qa_evaluations q SET\n  status         = o.outcome,\n  agent_id       = coalesce((o.j->>'agent_id')::uuid, q.agent_id),\n  prompt_version = o.j->>'prompt_version',\n  model          = o.j->>'model',\n  runs           = (o.j->>'runs')::smallint,\n  score          = (o.j->>'score')::numeric,\n  critical       = coalesce(ARRAY(SELECT x::smallint\n                                    FROM jsonb_array_elements_text(o.j->'critical') AS x), '{}'),\n  items          = CASE WHEN o.outcome = 'scored' THEN o.j->'items' END,\n  categories     = CASE WHEN o.outcome = 'scored' THEN o.j->'categories' END,\n  cost_usd       = (o.j->>'cost_usd')::numeric,\n  reason         = CASE o.outcome WHEN 'not_gradeable' THEN o.j->>'reason'\n                                  WHEN 'failed' THEN left(coalesce(o.j->'error'->>'message', o.j::text), 500)\n                   END,\n  attempts       = q.attempts + CASE WHEN o.outcome = 'failed' THEN 1 ELSE 0 END,\n  evaluated_at   = CASE WHEN o.outcome = 'scored' THEN now() END,\n  claim_token    = NULL,\n  updated_at     = now()\nFROM o, owned\nWHERE q.interaction_id = owned.interaction_id\nRETURNING q.interaction_id::text, q.status;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json), $('Each chat').item.json.interaction_id, $('Each chat').item.json.claim_token ] }}"
+        }
+      },
+      "name": "Store result",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2200,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true,
+      "id": "wf10-12"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: the money was spent whether or not this claim still owns the\n-- chat, and rule 12 says every judge call lands in model_calls; UNIQUE below\n-- dedupes a re-store, and the rows describe the calls, not the chat's grade.\n-- Rule 12: every judge call lands in model_calls. Three per chat, one per run;\n-- UNIQUE (purpose, input_hash, prompt_version) makes a re-store a no-op.\n-- multi-item: one worker answer per item.\nWITH c AS (SELECT jsonb_array_elements(coalesce($1::jsonb->'calls', '[]'::jsonb)) AS x),\nins AS (\n  INSERT INTO model_calls (interaction_id, purpose, provider, model, prompt_version, input_hash,\n                           prompt_tokens, output_tokens, cached_tokens, cost_usd, priced_at_peak,\n                           latency_ms, succeeded, error)\n  SELECT $2::uuid, x->>'purpose', x->>'provider', x->>'model', x->>'prompt_version',\n         x->>'input_hash', (x->>'prompt_tokens')::int, (x->>'output_tokens')::int,\n         (x->>'cached_tokens')::int, (x->>'cost_usd')::numeric,\n         (x->>'priced_at_peak')::boolean, (x->>'latency_ms')::int,\n         coalesce((x->>'succeeded')::boolean, true), x->>'error'\n    FROM c\n  ON CONFLICT (purpose, input_hash, prompt_version) DO NOTHING\n  RETURNING call_id)\nSELECT count(*)::int AS calls_stored FROM ins;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('Grade through worker').item.json), $('Each chat').item.json.interaction_id ] }}"
+        }
+      },
+      "name": "Store model calls",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2420,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Reads the worker answer by node name: after a Postgres node $json is that node's own result (gotcha 5).",
+      "id": "wf10-13"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: a run log entry written once the loop is done.\nINSERT INTO job_runs (job_name, status, started_at, finished_at,\n                      items_in, items_ok, items_failed, cost_usd, detail)\nSELECT 'qa_chat', 'succeeded'::job_status, now(), now(),\n       count(*) FILTER (WHERE updated_at > now() - interval '15 minutes'),\n       count(*) FILTER (WHERE status IN ('scored', 'not_gradeable')\n                          AND updated_at > now() - interval '15 minutes'),\n       count(*) FILTER (WHERE status = 'failed' AND updated_at > now() - interval '15 minutes'),\n       sum(cost_usd) FILTER (WHERE updated_at > now() - interval '15 minutes'),\n       jsonb_build_object('due_left', (SELECT count(*) FROM v_qa_due))\n  FROM qa_evaluations\nRETURNING run_id;",
+        "options": {}
+      },
+      "name": "Log run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1980,
+        440
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf10-14"
+    }
+  ],
+  "connections": {
+    "Every 10 min, 23:00-04:00": {
+      "main": [
+        [
+          {
+            "node": "Check budget",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check budget": {
+      "main": [
+        [
+          {
+            "node": "Record provider status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record provider status": {
+      "main": [
+        [
+          {
+            "node": "Read QA gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read QA gate": {
+      "main": [
+        [
+          {
+            "node": "May we spend?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "May we spend?": {
+      "main": [
+        [
+          {
+            "node": "Retention",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log blocked run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retention": {
+      "main": [
+        [
+          {
+            "node": "Claim chats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim chats": {
+      "main": [
+        [
+          {
+            "node": "Claimed one?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claimed one?": {
+      "main": [
+        [
+          {
+            "node": "Each chat",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Each chat": {
+      "main": [
+        [
+          {
+            "node": "Log run",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Grade through worker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Grade through worker": {
+      "main": [
+        [
+          {
+            "node": "Store result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store result": {
+      "main": [
+        [
+          {
+            "node": "Store model calls",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store model calls": {
+      "main": [
+        [
+          {
+            "node": "Each chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Riyadh",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true,
+    "executionTimeout": 540
+  }
+}

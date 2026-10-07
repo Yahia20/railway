@@ -150,6 +150,17 @@ def test_cached_prompt_is_not_priced_as_fresh():
     assert cached == pytest.approx(0.00285, abs=5e-5)
 
 
+def test_the_name_the_api_echoes_is_priced():
+    """Asked for deepseek-v4-flash, the API answered model='deepseek-flash' on
+    all 891 calls of the 2026-10-07 QA trial. cost_row prices by the echoed
+    name, so an unknown alias stored cost_usd = NULL: spend invisible to /spend
+    and to the monthly cap."""
+    usage = {"prompt_tokens": 2_742, "prompt_cache_hit_tokens": 1_444,
+             "prompt_cache_miss_tokens": 1_298, "completion_tokens": 320}
+    assert judge.estimate_cost_usd(usage, "deepseek-flash", PEAK) == \
+        judge.estimate_cost_usd(usage, "deepseek-v4-flash", PEAK)
+
+
 def test_off_peak_is_exactly_half():
     usage = {"prompt_tokens": 15_400, "prompt_cache_hit_tokens": 14_979,
              "prompt_cache_miss_tokens": 421, "completion_tokens": 1_849}

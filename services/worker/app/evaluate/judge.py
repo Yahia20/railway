@@ -251,12 +251,19 @@ class DeepSeekClient:
             DeepSeekClient._last_request = time.monotonic()
 
     def complete_json(self, prompt: str, temperature: float = 0.0,
-                      max_tokens: int = 8000, retries: int = 3) -> tuple[dict, dict]:
+                      max_tokens: int = 8000, retries: int = 3,
+                      system: str | None = None) -> tuple[dict, dict]:
         # 8000 is a mitigation for long calls whose pass-2 JSON overran 4096
         # and died truncated 3/3; the real fix is segmenting long transcripts.
+        # `system` is for the QA scorecard (app/qa), whose approved request is
+        # a system prompt plus the chat as the user turn. Pass 1 and pass 2
+        # never set it, so their request is byte-for-byte what it was.
+        messages = [{"role": "user", "content": prompt}]
+        if system is not None:
+            messages.insert(0, {"role": "system", "content": system})
         body = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             # Deterministic on purpose. A QA score that changes when you re-run
             # the same conversation is not a measurement, and agents will notice
             # the inconsistency long before management does.
@@ -462,6 +469,11 @@ def validate_pass1(payload: dict, conversation: str) -> dict[str, Any]:
 # judging batch runs at night: see PEAK_HOURS_UTC.
 DEEPSEEK_PRICING = {
     "deepseek-v4-flash":            {"hit": 0.014, "miss": 0.44, "out": 1.32},
+    # What the API ECHOES for a deepseek-v4-flash request as of 2026-10-07
+    # (measured on 891 calls). cost_row prices by the echoed name, so without
+    # this every call stored cost_usd = NULL and vanished from /spend and from
+    # the monthly cap.
+    "deepseek-flash":               {"hit": 0.014, "miss": 0.44, "out": 1.32},
     "deepseek-v4-flash-vision-exp": {"hit": 0.014, "miss": 0.44, "out": 1.32},
     "deepseek-v4-pro":              {"hit": 0.044, "miss": 1.32, "out": 3.96},
 }
