@@ -147,7 +147,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Which contacts do we still have no phone for?\n--\n-- Bounded on purpose. crm.contact.list takes a filter, not the whole address\n-- book, and 500 ids is already more than a night's worth of new conversations.\n-- Anything left over is picked up tomorrow.\nSELECT jsonb_agg(DISTINCT external_contact_id) AS contact_ids,\n       count(DISTINCT external_contact_id)     AS n\nFROM (\n  SELECT external_contact_id\n  FROM interactions\n  WHERE external_contact_id IS NOT NULL\n    AND customer_phone_e164 IS NULL\n  LIMIT 500\n) s;",
+        "query": "-- Which contacts are we still missing something for?\n--\n-- WAS \"missing a phone\". A name is now the second thing we come here for\n-- (027): crm.contact.list carries NAME/LAST_NAME and this is the only node\n-- that ever asks Bitrix about a contact, so widening the question here is the\n-- whole of the fix on the read side.\n--\n-- THREE REASONS TO ASK, AND THEY EXPIRE DIFFERENTLY.\n--\n--   no phone          identity resolution matches on E.164 and nothing else,\n--                     so a conversation with no phone can never reach a\n--                     customer. Retried every night; it is the expensive gap.\n--   never fetched     we have never seen this contact's record at all.\n--   fetched, no name  the CRM genuinely has no name on file. Retried MONTHLY,\n--                     not nightly -- a contact that will never have a name\n--                     would otherwise occupy the 500-id budget forever and\n--                     starve the contacts that would answer.\n--\n-- Bounded on purpose. crm.contact.list takes a filter, not the whole address\n-- book, and 500 distinct ids is more than a night's worth of new conversations.\n-- Anything left over is picked up tomorrow.\n--\n-- DISTINCT MOVED INSIDE THE LIMIT. It used to take 500 ROWS and then dedupe\n-- them, so a busy contact with 40 threads could spend 40 of the 500 places and\n-- the batch would carry a couple of hundred real ids. 500 now means 500.\nSELECT jsonb_agg(cid) AS contact_ids,\n       count(cid)     AS n\nFROM (\n  SELECT DISTINCT i.external_contact_id AS cid\n  FROM interactions i\n  LEFT JOIN bitrix_contacts bc\n         ON bc.bitrix_contact_id = i.external_contact_id\n  WHERE i.external_contact_id IS NOT NULL\n    AND i.external_contact_id <> ''\n    AND (i.customer_phone_e164 IS NULL\n         OR bc.bitrix_contact_id IS NULL\n         OR (bc.full_name IS NULL\n             AND bc.fetched_at < now() - interval '30 days'))\n  LIMIT 500\n) s;",
         "options": {}
       },
       "type": "n8n-nodes-base.postgres",
@@ -157,7 +157,7 @@
         480
       ],
       "id": "contacts-missing-a-phone",
-      "name": "Contacts missing a phone",
+      "name": "Contacts we still need",
       "credentials": {
         "postgres": {
           "id": "railway-pg",
@@ -263,6 +263,26 @@
           "name": "railway-pg"
         }
       }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The CRM's own answer about who this person is, stored instead of discarded.\n--\n-- WHY THIS NODE DID NOT EXIST. `Pair contact to phone` reads `c.PHONE` off each\n-- contact object and drops the rest, so NAME and LAST_NAME arrived in this\n-- workflow's memory every night and left it again. `customers.display_name` has\n-- been NULL since 002 partly because of these four lines of JavaScript.\n--\n-- WHAT BITRIX SAID, NOT WHAT WE CONCLUDED. This table is the CRM's record.\n-- `customers.display_name` is our conclusion, written by resolve_customer_names()\n-- in workflow 03, which runs after identity resolution because it needs\n-- customer_id. Keeping the two apart is what makes a wrong name auditable.\n--\n-- A NULL NEVER ERASES A STORED NAME. Every column coalesces onto what is\n-- already there. If the select list on /bitrix/contacts is ever narrowed again,\n-- the fields stop arriving and arrive as NULL rather than as an error (gotcha\n-- 16) -- and the failure mode of that must be \"we learn nothing new\", never\n-- \"we forget what we knew\".\nINSERT INTO bitrix_contacts (bitrix_contact_id, name, second_name, last_name,\n                             phone_raw, fetched_at)\nSELECT c->>'ID',\n       nullif(btrim(c->>'NAME'), ''),\n       nullif(btrim(c->>'SECOND_NAME'), ''),\n       nullif(btrim(c->>'LAST_NAME'), ''),\n       nullif(btrim(c->'PHONE'->0->>'VALUE'), ''),\n       now()\nFROM jsonb_array_elements($1::jsonb) AS c\nWHERE nullif(btrim(coalesce(c->>'ID', '')), '') IS NOT NULL\nON CONFLICT (bitrix_contact_id) DO UPDATE SET\n  name        = coalesce(EXCLUDED.name,        bitrix_contacts.name),\n  second_name = coalesce(EXCLUDED.second_name, bitrix_contacts.second_name),\n  last_name   = coalesce(EXCLUDED.last_name,   bitrix_contacts.last_name),\n  phone_raw   = coalesce(EXCLUDED.phone_raw,   bitrix_contacts.phone_raw),\n  fetched_at  = now()\nRETURNING bitrix_contact_id, full_name;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('Fetch Bitrix contacts').first().json.result || []) ] }}"
+        }
+      },
+      "id": "c0a7e1d4-5b62-4f18-9e30-7a1c2b4d8e55",
+      "name": "Store contact names",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        900,
+        660
+      ],
+      "executeOnce": true,
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
     }
   ],
   "connections": {
@@ -303,7 +323,7 @@
       "main": [
         [
           {
-            "node": "Contacts missing a phone",
+            "node": "Contacts we still need",
             "type": "main",
             "index": 0
           }
@@ -321,22 +341,16 @@
         ]
       ]
     },
-    "Contacts missing a phone": {
-      "main": [
-        [
-          {
-            "node": "Fetch Bitrix contacts",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Fetch Bitrix contacts": {
       "main": [
         [
           {
             "node": "Pair contact to phone",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Store contact names",
             "type": "main",
             "index": 0
           }
@@ -370,6 +384,17 @@
         [
           {
             "node": "Purge raw content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contacts we still need": {
+      "main": [
+        [
+          {
+            "node": "Fetch Bitrix contacts",
             "type": "main",
             "index": 0
           }

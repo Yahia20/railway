@@ -19,7 +19,7 @@ waiting on one thing: DeepSeek credit.**
 worker      deployed, pass2-agent-quality-v7 live
 database    001-024 applied, audit_data_integrity 0 failures / 36 clean
 n8n         01c, 01d, 03, 04 active. 02 and 99 (calls) switched OFF
-report      /report, 20 panels, channels ["chat"], errors none
+report      /report, 27 panels, channels ["chat"], errors none
 blocked on  DeepSeek balance -0.10 USD. 1,008 threads waiting, attempts 0
 ```
 
@@ -139,6 +139,78 @@ resolver shipped with.
 First run: **1,042 of 1,268 deals** now carry a customer. `linked_by_contact`
 was 0 because `bitrix_contact_id` is still empty; it fills on 04's next nightly
 pull and takes over from the conversation fallback.
+
+### 025 — a customer has a NAME, and /report answers the sales question
+
+**NOT APPLIED YET.** Written, tested, unmigrated. `psql -f db/migrations/025_customer_names.sql`, then deploy the worker and `python scripts/n8n_deploy.py 01d 03 04 --activate`.
+
+`customers.display_name` has existed since 002 and **never held a value**, and
+neither has `customers.name_source` beside it. 002 did not miss the problem — it
+wrote the CHECK `name_source IN ('crm_contact','deal_title','ai_extracted',
+'manual')`, which is a PRECEDENCE, with a comment naming the exact conflict it
+was built for. The column list was right. Nothing was wired to it. So every
+customer page, dashboard row and follow-up queue identified a human being by
+their phone number.
+
+**All three sources were already here, each dropped at a different step.**
+
+| source | where it was lost |
+|---|---|
+| `crm_contact` | `/bitrix/contacts` asked for `select=["ID","PHONE"]`. NAME arrives NULL rather than as an error (gotcha 16), and 04's pairing node reads `c.PHONE` and drops the rest of the object |
+| `deal_title` | `deals.title` often IS the name and since 024 a deal knows its customer — but a title is free text, so **`p_use_deal_title` defaults FALSE**. Look at `v_customer_name_candidates` before switching it on; it is an argument, not a deploy |
+| `ai_extracted` | pass 1 fills `customer.name` and `interaction_analysis.customer_name` was **in no INSERT in any workflow**. Stored in `raw_response` and unreadable |
+
+**Rank-ordered, and it can only ever promote.** `name_source_rank` is a table,
+not a CASE, so changing which source wins is an UPDATE. `manual` is 0 and
+outranks everything automated permanently. A name pass 1 itself flagged in
+`uncertain_fields` is never promoted — the prompt is explicit that a wrong name
+creates a person who does not exist and identity resolution then merges real
+people onto them.
+
+**`resolve_customer_names()` runs in 03, not 04, for the same reason
+`link_deal_customers()` does.** Both sources are keyed on `customer_id`, which
+03 writes at 03:40. In 04 at 03:20 it would work off yesterday's resolution and
+be permanently one night behind.
+
+**`bitrix_contacts` is new and holds what Bitrix SAID**, separate from
+`display_name` which is what we concluded — so a disagreement survives and a
+wrong name is auditable. 04's selector widened from "contacts missing a phone"
+to "contacts we still need"; a contact the CRM genuinely has no name for is
+retried **monthly, not nightly**, or it would occupy the 500-id budget forever.
+
+**The trap this walked around:** `interaction_destinations` (004) has no writer
+either, exactly like `display_name`. A real-ask panel built on it would report
+zero forever and look like a finding. `interaction_requests.destination` is the
+only destination this system records.
+
+#### /report now answers the commercial question, not only the quality one
+
+Seven new panels: `real_ask_funnel`, `agent_commercial`, `service_mix`,
+`customers`, `name_coverage`, `followup_totals`, `followups`.
+
+**A real ask is mechanical, and defined once.** Destination AND travellers AND
+date — three fields present or not, so it cannot drift between runs the way a
+model's opinion of "serious" does (rule 3). `_REAL_ASK` is bound into all three
+queries that count it; a second copy is how the agent table and the headline
+start disagreeing by one. Requests with `evidence_valid = false` are excluded
+(rule 9).
+
+**Rule 2, moved out of the rubric and into a sales report.** `real_asks` can
+only be counted on a conversation pass 1 has read. Printing "2" against 35
+customers reports 33 time-wasters where the truth is 31 were never looked at, so
+`analysed` travels in the same row, the page renders **"2 من 4 مقروء"**, and an
+agent with nothing analysed gets a dash — never a zero.
+
+**The customer row carries `last_score`, not an average.** A customer has one to
+five conversations, so a "customer average" is a mean of one dressed as a
+statistic — 022's failure with a smaller n and no display view to qualify it. A
+single `final_score` needs no denominator.
+
+`test_customer_names_and_real_ask.py` (41 assertions) pins all of it: the
+contact select against the SQL that reads it, the never-demote guard on all
+three UPDATEs, that nothing may come between `Pair contact to phone` and
+`Normalise phones` (gotcha 5), and that the real-ask denominator is visible.
+**700 tests pass.**
 
 ### The judge reports observations, not scores — `pass2-agent-quality-v7`
 
@@ -577,7 +649,7 @@ python scripts/seed_agents.py --roster local-reports/agent_roster.json --apply
 # holds no data and fetches /report/data itself, because a browser cannot set a
 # header on a navigation and a key in the URL lands in history and proxy logs.
 #   https://railway-production-d648.up.railway.app/report
-# Sixteen panels, each separately fallible; `errors` is present and empty when
+# Twenty-seven panels, each separately fallible; `errors` is present and empty when
 # healthy. crm_missing_deals leads. `build_dashboard_data.py` and
 # `build_crm_pages_data.py` are superseded — they wrote a JSON file by hand next
 # to a static page and nothing scheduled ever ran them.
@@ -637,8 +709,9 @@ python scripts/simulate_conversation.py <id> --webhook  # POST at live n8n
 ## Layout
 
 ```
-db/migrations/         001-024, ALL APPLIED to Railway. 023 removed the calls
-                       lane; 024 linked deals to customers.
+db/migrations/         001-024 APPLIED to Railway. 023 removed the calls lane,
+                       024 linked deals to customers. **025 is written and NOT
+                       applied** — it gives a customer a name.
 services/worker/app/
   serve.py             entrypoint — see gotcha 1 and 2 below
   main.py              FastAPI

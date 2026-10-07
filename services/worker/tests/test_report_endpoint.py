@@ -90,9 +90,20 @@ def test_there_are_sql_constants_to_check():
 
 @pytest.mark.parametrize("name", sorted(_sql_constants()))
 def test_every_report_query_is_read_only(name):
+    """WITH is allowed; a data-modifying CTE is not.
+
+    The constants were all bare SELECTs until a panel needed to count the same
+    conversations two ways, which is a CTE. `WITH` on its own says nothing about
+    whether a statement writes — Postgres is perfectly happy to put an INSERT in
+    one, and that is the case this test has to keep catching. So the shape check
+    widens to SELECT-or-WITH and `WRITES` above, which scans the WHOLE string
+    rather than only its first word, stays the assertion that matters.
+    """
     sql = _sql_constants()[name]
-    assert not WRITES.search(sql), f"{name} is not a pure SELECT"
-    assert sql.lstrip().upper().startswith("SELECT"), f"{name} does not start with SELECT"
+    assert not WRITES.search(sql), f"{name} is not read-only"
+    head = sql.lstrip().upper()
+    assert head.startswith(("SELECT", "WITH")), \
+        f"{name} does not start with SELECT or WITH"
 
 
 @pytest.mark.parametrize("name", sorted(_sql_constants()))

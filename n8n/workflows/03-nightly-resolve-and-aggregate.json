@@ -184,6 +184,23 @@
       "executeOnce": true,
       "onError": "continueRegularOutput",
       "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- STEP 2c — give the customer a NAME (027).\n--\n-- WHY IT SITS HERE AND NOT IN 04. Both automated sources are keyed on\n-- `customers.customer_id`: the CRM contact reaches a customer through the\n-- `bitrix_contact_id` identities that `Link deal customers` writes one node\n-- above, and pass 1's name reaches one through `interactions.customer_id`,\n-- which `Resolve identity (phone)` writes three nodes above. Run this in 04 at\n-- 03:20 and it would work off last night's resolution and be permanently one\n-- night behind -- the exact bug 03's own resolver shipped with, and the exact\n-- reason link_deal_customers() was put in 03 rather than 04.\n--\n-- DEAL TITLES ARE ON, and the argument is how they were turned on -- not a\n-- deploy, and not an edit to the function. 028 measured them: after stripping\n-- the destination welded to the name, 916 titles yield a candidate and 737\n-- customers got a name from one. Before 028 the same flag would have named\n-- people after countries (\"Abdullah Azerbaijan\"), which is why it shipped off.\n--\n-- IT IS THE WEAKEST SOURCE AND IS MEANT TO BE OVERWRITTEN. rank 2, below the\n-- CRM contact, so every one of these 737 is replaced the moment\n-- `bitrix_contacts` carries a real NAME for that person. A residual tail is\n-- still wrong -- a company, a rare destination below the frequency threshold --\n-- and `name_source = 'deal_title'` is how you find them.\n--\n-- TURNING IT BACK OFF IS EDITING THIS ONE WORD, and re-running with `false`\n-- does NOT erase what is already written: the function only ever promotes.\n-- To actually clear them:\n--   UPDATE customers SET display_name = NULL, name_source = NULL\n--    WHERE name_source = 'deal_title';\n--\n-- NOTHING HERE CAN DEMOTE A NAME. The function is rank-ordered on\n-- `name_source_rank` and never overwrites a better source with a worse one, so\n-- a nightly run cannot replace a CRM name with a guess, and `manual` -- a human\n-- who corrected a name by hand -- outranks every automated source permanently.\nSELECT resolve_customer_names(true) AS names;",
+        "options": {}
+      },
+      "id": "9f3b21ce-6d47-4a8b-bb15-2e7c40d9a611",
+      "name": "Resolve customer names",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -50,
+        460
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
     }
   ],
   "connections": {
@@ -254,6 +271,17 @@
       ]
     },
     "Link deal customers": {
+      "main": [
+        [
+          {
+            "node": "Resolve customer names",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve customer names": {
       "main": [
         [
           {

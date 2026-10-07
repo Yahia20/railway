@@ -646,6 +646,15 @@ DEAL_SELECT = [
     "SOURCE_ID", "DATE_CREATE", "DATE_MODIFY", "BEGINDATE", "CLOSEDATE",
 ]
 
+# A CONSTANT FOR THE SAME REASON DEAL_SELECT IS ONE: so a test can read it.
+#
+# A field absent from this list arrives NULL rather than as an error (gotcha
+# 16), so the omission is invisible at the call site and only shows up wherever
+# the value was supposed to land — which for NAME was `customers.display_name`,
+# empty since 002. `test_contact_select_covers_every_field_the_sql_reads` now
+# parses workflow 04's SQL and fails if the two ever drift apart again.
+CONTACT_SELECT = ["ID", "PHONE", "NAME", "SECOND_NAME", "LAST_NAME"]
+
 
 class BitrixDealsRequest(BaseModel):
     days: int = Field(default=7, ge=1, le=365,
@@ -727,7 +736,12 @@ def bitrix_contacts(req: BitrixContactsRequest) -> dict:
     src = _bitrix_rest()
     try:
         rows, total, requests = src.list_all(
-            "crm.contact.list", select=["ID", "PHONE"],
+            # NAME / SECOND_NAME / LAST_NAME are in CONTACT_SELECT because a
+            # customer with no name is the most visible hole in every report
+            # this system produces, and the CRM has been able to answer it all
+            # along. The request succeeded without them, the objects came back
+            # without them, and nothing anywhere said so.
+            "crm.contact.list", select=CONTACT_SELECT,
             filter={"ID": ids}, max_rows=req.max_rows)
     except Exception as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"bitrix: {exc}") from exc

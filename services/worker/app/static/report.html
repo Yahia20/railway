@@ -219,6 +219,35 @@ tbody tr:hover{background:var(--panel-2)}
     <div class="tw" id="quality"></div>
   </section>
 
+  <!-- ٦ · الجانب التجاري -->
+  <section>
+    <h2>الطلب الجدّي <span class="hint">العميل قال الوجهة + عدد الأفراد + تاريخ السفر. تعريف ميكانيكي: تلات خانات موجودة أو لأ — مش رأي موديل يتغيّر بين تشغيلة وتشغيلة</span></h2>
+    <div class="body">
+      <div class="big" id="askBig"></div>
+      <p class="note" id="askNote"></p>
+    </div>
+    <div class="tw" id="serviceMix"></div>
+  </section>
+
+  <section>
+    <h2>أداء الفريق — تجاريًا <span class="hint" id="commHint">كل موظف: جاله كام عميل، كام منهم طلبه جدّي، وكام صفقة كسب. «الجدّي» بيتعدّ من المحادثات اللي اتقرت بس — الرقم اللي جنبه هو المقام الحقيقي</span></h2>
+    <div class="tw" id="commercial"></div>
+  </section>
+
+  <!-- ٧ · العملاء -->
+  <section>
+    <h2>العملاء <span class="hint" id="custHint">الاسم بييجي من بيتريكس أولًا، وبعدين من المحادثة نفسها. مصدر الاسم مكتوب جنبه لأن سجل CRM واسم قراه موديل مش نفس الادعاء</span></h2>
+    <div class="tw" id="nameCoverage"></div>
+    <div class="tw" id="customers"></div>
+  </section>
+
+  <!-- ٨ · الوعود -->
+  <section>
+    <h2>الوعود — مين مستني <span class="hint" id="fuHint">وعود الموظفين اللي طلّعها التحليل من الشات نفسه. المتأخر فوق، لأنه عميل اتخذل خلاص مش عميل لسه ممكن نلحقه</span></h2>
+    <div class="strip" id="fuTotals"></div>
+    <div class="tw" id="followups"></div>
+  </section>
+
   <section>
     <h2>محادثة محادثة <span class="hint" id="convHint">افتح أي محادثة وشوف الحكم نفسه — الملخص، الخمس موديولات، ونقطة القوة والضعف. الموديول اللي موقفه ماحصلش بيتكتب «لم تنشأ» مش صفر</span></h2>
     <div class="tw" id="conversations"></div>
@@ -507,6 +536,10 @@ function render(rep) {
   ], "مفيش تقييمات");
 
   conversations(d.conversations);
+
+  commercial(d);
+  customers(d);
+  followups(d);
 }
 
 /* ---------- drill-down: one conversation at a time ----------
@@ -616,6 +649,159 @@ function conversations(c) {
       "بيعرض " + num(rows.length) + " من " + num(c.total_in_window)
       + " محادثة في الفترة دي — زوّد الفترة أو الـlimit عشان تشوف الباقي. "
       + "الموديول اللي موقفه ماحصلش بيتكتب «لم تنشأ» مش صفر";
+  }
+}
+
+
+/* ---------- ٦ · الجانب التجاري ----------
+
+   NULL IS NOT ZERO, IN A SALES REPORT (rule 2).
+
+   `real_asks` can only be counted on a conversation pass 1 has read. Printing
+   "2" against 35 customers would report 33 time-wasters where the truth is that
+   31 were never looked at. Every real-ask number on this page is therefore
+   rendered as "x من y مقروء", never as a share of the customers, and an agent
+   with nothing analysed gets an explicit dash — the same distinction the rubric
+   makes between a module that scored 0 and one that never arose. */
+function askShare(real, analysed) {
+  if (analysed == null || Number(analysed) === 0) {
+    return '<span class="c mute" title="مفيش محادثة اتقرت لسه">—</span>';
+  }
+  const r = Number(real || 0), a = Number(analysed);
+  const cls = r === 0 ? "bad" : r / a >= 0.5 ? "ok" : "warn";
+  return '<span class="c ' + cls + '">' + num(r) + "</span>"
+       + '<span class="c mute"> من ' + num(a) + " مقروء</span>";
+}
+
+function commercial(d) {
+  const f = d.real_ask_funnel || {};
+  const threads = Number(f.threads || 0);
+  const analysed = Number(f.analysed || 0);
+  $("askBig").innerHTML = [
+    ['<span class="n hot">' + num(f.real_asks) + "</span>", "طلب جدّي"],
+    ['<span class="n">' + num(analysed) + "</span>", "محادثة اتقرت"],
+    ['<span class="n" style="color:var(--muted)">' + num(threads) + "</span>", "محادثة في الفترة"],
+    ['<span class="n">' + num(f.customers) + "</span>", "عميل"],
+  ].map(([n, l]) => "<div>" + n + '<span class="lbl">' + esc(l) + "</span></div>").join("");
+
+  /* The gap between the two denominators, said out loud rather than left for a
+     reader to work out from two numbers side by side. */
+  const unread = threads - analysed;
+  $("askNote").textContent = unread > 0
+    ? "الـ" + num(f.real_asks) + " دول من " + num(analysed) + " محادثة اتقرت. "
+      + "باقي " + num(unread) + " محادثة محدش قراها لسه، فمش محسوبة لا جدّية ولا غير جدّية. "
+      + "النسبة تبقى ليها معنى لما التقييم يشتغل على الكل."
+    : "كل محادثات الفترة اتقرت، فالنسبة دي على المجموع الكامل.";
+
+  table($("serviceMix"), d.service_mix, [
+    { h: "الخدمة", k: "service" },
+    { h: "طلبات", cls: "num", f: (r) => num(r.requests) },
+    { h: "محادثات", cls: "num", f: (r) => num(r.conversations) },
+  ], "مفيش طلبات اتسجّلت في الفترة دي");
+
+  const rows = d.agent_commercial || [];
+  table($("commercial"), rows, [
+    { h: "الموظف", k: "agent_name" },
+    { h: "عملاء", cls: "num", f: (r) => num(r.customers) },
+    { h: "محادثات", cls: "num", f: (r) => num(r.threads) },
+    { h: "طلب جدّي", f: (r) => askShare(r.real_asks, r.analysed) },
+    { h: "صفقات", cls: "num", f: (r) => num(r.deals) },
+    { h: "مكسوبة", cls: "num", f: (r) => {
+        const w = Number(r.won || 0);
+        return '<span class="c ' + (w ? "ok" : "mute") + '">' + num(w) + "</span>"; } },
+    { h: "قيمة المكسوب", cls: "num", f: (r) => money(r.won_amount) },
+  ], "مفيش موظف اتنسبتله محادثة في الفترة دي");
+
+  const noneAnalysed = rows.filter((r) => !Number(r.analysed)).length;
+  if (noneAnalysed) {
+    $("commHint").textContent =
+      noneAnalysed + " من " + rows.length + " موظف مفيش ولا محادثة ليهم اتقرت، "
+      + "فخانة «طلب جدّي» عندهم شرطة — مش صفر. الصفر معناه اتقرت وماكانتش جدّية.";
+  }
+}
+
+/* ---------- ٧ · العملاء ---------- */
+function customers(d) {
+  table($("nameCoverage"), d.name_coverage, [
+    { h: "مصدر الاسم", f: (r) => {
+        const lbl = { crm_contact: "سجل بيتريكس", deal_title: "عنوان الصفقة",
+                      ai_extracted: "من المحادثة", manual: "بإيد بشر",
+                      none: "بدون اسم" }[r.name_source] || r.name_source;
+        const cls = r.name_source === "none" ? "bad"
+                  : r.name_source === "deal_title" ? "warn" : "ok";
+        return '<span class="c ' + cls + '">' + esc(lbl) + "</span>"; } },
+    { h: "عملاء", cls: "num", f: (r) => num(r.customers) },
+    { h: "ليهم اسم", cls: "num", f: (r) => num(r.named) },
+  ], "مفيش عملاء لسه");
+
+  const c = d.customers || {};
+  table($("customers"), c.rows, [
+    { h: "العميل", f: (r) => r.display_name
+        ? esc(r.display_name)
+        : '<span class="c mute">بدون اسم</span>' },
+    { h: "التليفون", k: "phone", cls: "id" },
+    { h: "محادثات", cls: "num", f: (r) => num(r.threads) },
+    { h: "طلب جدّي", cls: "num", f: (r) => num(r.real_ask_threads) },
+    { h: "صفقات", cls: "num", f: (r) => num(r.deals) },
+    { h: "مكسوبة", cls: "num", f: (r) => num(r.won) },
+    /* آخر درجة، مش متوسط. العميل عنده محادثة لخمسة، والمتوسط على رقم زي ده
+       بيتقري كأنه حكم — وده بالظبط اللي ٠٢٢ اتعمل عشانه. الدرجة الواحدة
+       ملهاش مقام، وعدد المقيَّم جنبها. */
+    { h: "آخر درجة", cls: "num", f: (r) => r.last_score == null
+        ? '<span class="c mute">لم يُقيَّم</span>'
+        : num(r.last_score, 1) + '<span class="c mute"> من ' + num(r.evaluated) + "</span>" },
+    { h: "آخر تواصل", cls: "id", f: (r) => esc(when(r.last_at)) },
+  ], "مفيش عملاء اتربطوا بمحادثات لسه");
+
+  if (c.truncated) {
+    $("custHint").textContent =
+      "بيعرض " + num((c.rows || []).length) + " من " + num(c.total_in_window)
+      + " عميل، الأحدث تواصلًا الأول.";
+  }
+}
+
+/* ---------- ٨ · الوعود ---------- */
+function followups(d) {
+  const t = d.followup_totals || {};
+  /* This page's own strip markup — `.strip .s > b + span`, with `alarm` and
+     `zero` the only two modifiers it styles. Borrowing `.big`'s `.n`/`.lbl`
+     here would render unstyled text that looks like a broken panel. */
+  $("fuTotals").innerHTML = [
+    ["متأخر", t.missed, true], ["اتنفّذ متأخر", t.late, false],
+    ["مستني", t.open, false], ["اتنفّذ", t.fulfilled, false],
+    ["إجمالي الوعود", t.promises, false],
+    ["متوسط ساعات التنفيذ", t.avg_hours_to_fulfil, false],
+  ].map(([l, v, alarm]) =>
+    '<div class="s ' + (alarm && Number(v) ? "alarm" : !Number(v) ? "zero" : "") + '"><b>'
+    + (v == null ? "—" : num(v, 0)) + "</b><span>" + esc(l) + "</span></div>").join("");
+
+  const q = d.followups || {};
+  table($("followups"), q.rows, [
+    { h: "الحالة", f: (r) => {
+        const m = { missed: ["متأخر", "bad"], late: ["اتنفّذ متأخر", "warn"],
+                    open: ["مستني", "cool"], fulfilled: ["اتنفّذ", "ok"],
+                    cancelled: ["اتلغى", "mute"] }[r.status] || [r.status, "mute"];
+        return '<span class="c ' + m[1] + '">' + esc(m[0]) + "</span>"; } },
+    { h: "العميل", f: (r) => r.customer_name
+        ? esc(r.customer_name)
+        : '<span class="c mute">' + esc(r.customer_phone || "بدون اسم") + "</span>" },
+    { h: "الموظف", k: "agent_name" },
+    { h: "الوعد", f: (r) => esc(r.promise_text || "—") },
+    { h: "اتوعد", cls: "id", f: (r) => esc(when(r.promised_at)) },
+    { h: "متأخر بكام ساعة", cls: "num", f: (r) =>
+        (r.status === "missed" || r.status === "open") && Number(r.hours_overdue) > 0
+          ? '<span class="c bad">' + num(r.hours_overdue, 1) + "</span>" : "—" },
+  ], "مفيش وعود اتسجّلت لسه — التحليل قرا ٤٢ محادثة بس، والوعود بتتطلّع منها");
+
+  /* A queue this short is almost never "agents keep their promises". Say which
+     of the two it is, because the reader cannot tell from an empty table. */
+  if (!(q.rows || []).length) {
+    $("fuHint").textContent =
+      "الطابور فاضي لأن التحليل لسه ماقراش غير شوية محادثات — مش لأن مفيش وعود. "
+      + "الوعود بتتطلّع من نفس التحليل اللي بيحسب الطلب الجدّي.";
+  } else if (q.truncated) {
+    $("fuHint").textContent = "بيعرض " + num(q.rows.length) + " من "
+      + num(q.total_in_window) + " وعد، المتأخر الأول.";
   }
 }
 

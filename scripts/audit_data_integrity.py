@@ -326,13 +326,20 @@ def main() -> int:
                     help="exit non-zero on WARN as well as FAIL")
     args = ap.parse_args()
 
-    password = os.getenv("PGPASSWORD")
-    if not password:
-        raise SystemExit("PGPASSWORD is not set")
-
     import psycopg
 
-    dsn = f"postgresql://postgres:{password}@127.0.0.1:{args.port}/{args.database}"
+    # PGPASSWORD if it is set; otherwise let libpq find the password itself.
+    #
+    # libpq reads ~/.pgpass (%APPDATA%\postgresql\pgpass.conf on Windows) when a
+    # connection supplies no password, which is how an operator can run this
+    # without the secret ever entering a shell, a history file or a process
+    # list. Refusing to start without PGPASSWORD forced the worse habit.
+    password = os.getenv("PGPASSWORD")
+    if password:
+        dsn = f"postgresql://postgres:{password}@127.0.0.1:{args.port}/{args.database}"
+    else:
+        dsn = (f"host=127.0.0.1 port={args.port} "
+               f"dbname={args.database} user=postgres")
     fails = warns = 0
     with psycopg.connect(dsn, connect_timeout=20, autocommit=True) as conn:
         for check_id, severity, why, sql in CHECKS:
