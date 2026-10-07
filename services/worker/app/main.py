@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from . import budget, db, report
+from . import status as pipeline_status  # `status` is FastAPI's, used below
 from .config import settings
 from .evaluate import judge, metrics, scoring
 from .media import links as media_links
@@ -637,6 +638,35 @@ def report_data(days: int = 30, limit: int = report.SAMPLE_LIMIT) -> dict:
     limit = max(1, min(int(limit), 500))
     try:
         return report.build(days=days, limit=limit)
+    except db.DatabaseUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+
+# What is broken right now, and why. /health stays what Railway's healthcheck
+# hits (process up); this is whether the PIPELINE is up, which a process that
+# answers 200 says nothing about.
+STATUS_PAGE = Path(__file__).resolve().parent / "static" / "status.html"
+
+
+@app.get("/status", response_class=HTMLResponse, include_in_schema=False)
+def status_page() -> HTMLResponse:
+    """Holds no data and no key, like /report: it fetches /status/data."""
+    try:
+        html = STATUS_PAGE.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            f"status page missing: {exc}") from exc
+    return HTMLResponse(html, headers={
+        "Cache-Control": "no-store",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+    })
+
+
+@app.get("/status/data", dependencies=[Depends(require_api_key)])
+def status_data() -> dict:
+    try:
+        return pipeline_status.build()
     except db.DatabaseUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 

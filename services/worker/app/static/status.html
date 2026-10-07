@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Customer 360 — حالة النظام</title>
+<style>
+/* One question per card: what is happening, why, what to do. Same tokens and
+   key storage as /report, so a session open on one is open on the other. */
+:root{
+  --bg:#EDF0F3; --panel:#FFFFFF; --panel-2:#F5F7F9;
+  --ink:#141A20; --ink-2:#3F4954; --muted:#6B7681; --line:#D3DAE1;
+  --accent:#175E7C;
+  --ok:#2A6B50; --ok-soft:#DBEBE2;
+  --warn:#8A570A; --warn-soft:#F5EAD5;
+  --bad:#9B342A; --bad-soft:#F6E1DE;
+  --off:#55606B; --off-soft:#E6EAEE;
+  --mono:ui-monospace,"Cascadia Mono","SF Mono",Consolas,"Courier New",monospace;
+  --ui:"Segoe UI",system-ui,-apple-system,"Noto Sans Arabic","Helvetica Neue",sans-serif;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0F1317; --panel:#171D23; --panel-2:#1D242B;
+  --ink:#E6EBF0; --ink-2:#B7C1CB; --muted:#84909C; --line:#2B343D;
+  --accent:#69AECC;
+  --ok:#6DBC94; --ok-soft:#152C22;
+  --warn:#D5A155; --warn-soft:#30260F;
+  --bad:#DE887C; --bad-soft:#371F1C;
+  --off:#A3AEB9; --off-soft:#222A32;
+}}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink);font-family:var(--ui);font-size:15px;line-height:1.7}
+.wrap{max-width:860px;margin:0 auto;padding:20px 16px 64px;display:flex;flex-direction:column;gap:14px}
+header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;
+  padding-bottom:12px;border-bottom:2px solid var(--ink)}
+header h1{font-size:19px;margin:0;font-weight:650}
+.meta{font-size:12.5px;color:var(--muted)}
+nav a{color:var(--accent);font-weight:600;text-decoration:none;margin-inline-start:12px;font-size:13.5px}
+.banner{border-radius:10px;padding:14px 16px;font-weight:650;font-size:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-inline-start:5px solid var(--line);
+  border-radius:10px;padding:13px 16px;display:flex;flex-direction:column;gap:6px}
+.head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.head b{font-size:15.5px}
+.pill{font-size:12px;font-weight:700;border-radius:999px;padding:1px 10px;white-space:nowrap}
+.since{font-size:12px;color:var(--muted);margin-inline-start:auto}
+.row{display:grid;grid-template-columns:4.2em minmax(0,1fr);gap:8px;font-size:14px}
+.row > span:first-child{color:var(--muted);font-size:12.5px;padding-top:2px}
+.fix{font-family:var(--mono);font-size:12.5px;background:var(--panel-2);border-radius:6px;padding:4px 8px;
+  overflow-wrap:anywhere;direction:ltr;text-align:left;unicode-bidi:plaintext}
+.s-fail{border-inline-start-color:var(--bad)} .s-fail .pill,.b-fail{background:var(--bad-soft);color:var(--bad)}
+.s-error{border-inline-start-color:var(--bad)} .s-error .pill,.b-error{background:var(--bad-soft);color:var(--bad)}
+.s-warn{border-inline-start-color:var(--warn)} .s-warn .pill,.b-warn{background:var(--warn-soft);color:var(--warn)}
+.s-off{border-inline-start-color:var(--off)} .s-off .pill,.b-off{background:var(--off-soft);color:var(--off)}
+.s-ok{border-inline-start-color:var(--ok)} .s-ok .pill,.b-ok{background:var(--ok-soft);color:var(--ok)}
+#gate{max-width:420px;margin:80px auto;padding:0 16px;display:flex;flex-direction:column;gap:10px}
+#gate input{font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink)}
+#gate button,.again{font:inherit;font-weight:600;padding:7px 14px;border-radius:8px;border:1px solid var(--accent);
+  background:var(--accent);color:#fff;cursor:pointer}
+.err{color:var(--bad);font-size:13px;min-height:1em}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <h2>مفتاح الوصول</h2>
+  <p>الصفحة دي بتقرا من الداتابيز الحقيقية. الرقم السري هو <code>WORKER_API_KEY</code>، وبيتخزن في الـ session بس.</p>
+  <input type="password" id="key" placeholder="WORKER_API_KEY" autocomplete="off" spellcheck="false">
+  <div class="err" id="gateErr"></div>
+  <button id="enter">ادخل</button>
+</div>
+
+<div class="wrap" id="app" hidden>
+  <header>
+    <div>
+      <h1>حالة النظام — الشاتات</h1>
+      <div class="meta" id="stamp">—</div>
+    </div>
+    <nav><a href="report">التقرير</a><a href="spend">المصاريف</a></nav>
+  </header>
+  <div class="banner" id="banner"></div>
+  <div id="checks" style="display:flex;flex-direction:column;gap:12px"></div>
+  <div class="err" id="loadErr"></div>
+</div>
+
+<script>
+"use strict";
+const KEY_STORE = "c360_worker_key";
+const REFRESH_MS = 60000;
+const LABEL = {fail: "عطلان", error: "الفحص وقع", warn: "تحذير", off: "مقفول بإيد", ok: "تمام"};
+const BANNER = {
+  fail: "فيه حاجة واقعة دلوقتي — شوف الكروت الحمرا.",
+  error: "فحص من الفحوصات نفسه مش شغال.",
+  warn: "شغال، بس فيه حاجات محتاجة انتباه.",
+  off: "كله شغال، وفيه جزء مقفول بإيد.",
+  ok: "كله شغال.",
+};
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function apiKey() { try { return sessionStorage.getItem(KEY_STORE) || ""; } catch { return ""; } }
+function setKey(v) { try { v ? sessionStorage.setItem(KEY_STORE, v) : sessionStorage.removeItem(KEY_STORE); } catch {} }
+
+async function fetchStatus() {
+  const res = await fetch("status/data", {headers: {"X-API-Key": apiKey()}, cache: "no-store"});
+  if (res.status === 401) throw Object.assign(new Error("المفتاح غلط"), {auth: true});
+  if (!res.ok) throw new Error("الـ worker رجّع " + res.status + " — " + (await res.text()).slice(0, 200));
+  return res.json();
+}
+
+function card(c) {
+  const rows = [["إيه", c.what], ["ليه", c.why]]
+    .filter(([, v]) => v)
+    .map(([k, v]) => '<div class="row"><span>' + k + "</span><span>" + esc(v) + "</span></div>")
+    .join("");
+  const fix = c.fix ? '<div class="row"><span>الحل</span><span class="fix">' + esc(c.fix) + "</span></div>" : "";
+  return '<div class="card s-' + esc(c.status) + '"><div class="head"><b>' + esc(c.title) +
+    '</b><span class="pill">' + esc(LABEL[c.status] || c.status) + "</span>" +
+    (c.since ? '<span class="since">آخر حركة: ' + esc(c.since) + "</span>" : "") +
+    "</div>" + rows + fix + "</div>";
+}
+
+function render(s) {
+  const t = new Date(s.generated_at);
+  $("stamp").textContent = "اتحدّث " + t.toLocaleTimeString("ar-EG", {timeZone: "Asia/Riyadh"}) +
+    " بتوقيت الرياض · بيتحدّث لوحده كل دقيقة";
+  const b = $("banner");
+  b.className = "banner b-" + s.overall;
+  b.textContent = BANNER[s.overall] || s.overall;
+  $("checks").innerHTML = s.checks.map(card).join("");
+}
+
+async function load() {
+  try {
+    render(await fetchStatus());
+    $("loadErr").textContent = "";
+    $("gate").hidden = true; $("app").hidden = false;
+  } catch (e) {
+    if (e.auth) { setKey(""); $("app").hidden = true; $("gate").hidden = false; $("gateErr").textContent = e.message; }
+    else { $("loadErr").textContent = e.message; }
+  }
+}
+
+$("enter").addEventListener("click", () => { setKey($("key").value.trim()); load(); });
+$("key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("enter").click(); });
+if (apiKey()) load();
+setInterval(() => { if (apiKey() && !document.hidden) load(); }, REFRESH_MS);
+</script>
+</body>
+</html>
