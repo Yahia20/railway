@@ -17,6 +17,7 @@ from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import budget, db, report
@@ -672,8 +673,8 @@ def status_data() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# QA scorecard (app/qa). Workflow 10 claims a chat, calls this, and stores
-# what comes back — this endpoint reads the chat and asks the model, nothing
+# QA scorecard (app/qa/v4). Workflow 10 claims a chat, calls this, and stores
+# what comes back — this endpoint reads the chat and asks the models, nothing
 # more (rule 11).
 # ---------------------------------------------------------------------------
 
@@ -684,38 +685,45 @@ class QAEvaluateRequest(BaseModel):
 @app.post("/qa/evaluate", dependencies=[Depends(require_api_key)])
 def qa_evaluate(req: QAEvaluateRequest) -> dict:
     """`gradeable: false` is an answer, not an error: n8n marks the chat and
-    moves on. Only a failed model call is an error, and it costs no row."""
-    from .qa import engine as qa_engine
+    moves on. Only a failed call 1 is an error, and it costs no row."""
+    from .qa import engine as qa_loader
+    from .qa.v4 import engine as qa_engine
 
     try:
-        thread = qa_engine.load_thread(req.interaction_id)
-    except qa_engine.NotGradeable as exc:
+        thread = qa_loader.load_thread(req.interaction_id)
+        settings_now = qa_engine.load_settings()
+    except qa_loader.NotGradeable as exc:
         return {"gradeable": False, "interaction_id": req.interaction_id, "reason": str(exc)}
     except db.DatabaseUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     try:
-        result = qa_engine.evaluate(thread)
+        result = qa_engine.evaluate(thread, settings_now)
     except judge.JudgeError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
     return {"gradeable": True, **result}
 
 
-# The dashboard. Like /report: the page is a shell with no data and no key; it
-# asks for WORKER_API_KEY and fetches the rest. It reads qa_evaluations live,
-# so every chat workflow 10 grades tonight is on it tomorrow morning.
-DASHBOARD_PAGE = Path(__file__).resolve().parent / "static" / "dashboard.html"
+# ---------------------------------------------------------------------------
+# The Customer 360 console (/dashboard). Like /report: the page and its
+# assets hold no data and no key; the page asks for WORKER_API_KEY and calls
+# the keyed routes below, which read the database live (app/dashboard.py).
+# The v0.5 page that preceded it stays at /dashboard/v05 for the 297 trial
+# grades (app/dashboard_v05.py).
+# ---------------------------------------------------------------------------
+
+STATIC = Path(__file__).resolve().parent / "static"
+C360_DIR = STATIC / "c360"
 _SHELL_HEADERS = {"Cache-Control": "no-store", "X-Frame-Options": "DENY",
                   "Referrer-Policy": "no-referrer"}
 
+app.mount("/dashboard/assets", StaticFiles(directory=C360_DIR / "assets"), name="c360-assets")
 
-@app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
-def dashboard_page() -> HTMLResponse:
+
+def _page(path: Path) -> HTMLResponse:
     try:
-        html = DASHBOARD_PAGE.read_text(encoding="utf-8")
+        return HTMLResponse(path.read_text(encoding="utf-8"), headers=_SHELL_HEADERS)
     except OSError as exc:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
-                            f"dashboard page missing: {exc}") from exc
-    return HTMLResponse(html, headers=_SHELL_HEADERS)
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"page missing: {exc}") from exc
 
 
 def _dash(call):
@@ -727,10 +735,21 @@ def _dash(call):
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 
 
-@app.get("/dashboard/data", dependencies=[Depends(require_api_key)])
-def dashboard_data(start: str | None = None, end: str | None = None) -> dict:
+def _fragment(html: str | None, missing: str) -> HTMLResponse:
+    if html is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, missing)
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+def dashboard_page() -> HTMLResponse:
+    return _page(C360_DIR / "index.html")
+
+
+@app.get("/dashboard/overview", dependencies=[Depends(require_api_key)])
+def dashboard_overview(start: str | None = None, end: str | None = None) -> dict:
     from . import dashboard
-    return _dash(lambda: dashboard.build(start, end))
+    return _dash(lambda: dashboard.overview(start, end))
 
 
 @app.get("/dashboard/agent/{agent_id}/chats", dependencies=[Depends(require_api_key)])
@@ -740,22 +759,75 @@ def dashboard_agent_chats(agent_id: str, start: str | None = None,
     return _dash(lambda: dashboard.agent_chats(agent_id, start, end))
 
 
+@app.get("/dashboard/customers/search", dependencies=[Depends(require_api_key)])
+def dashboard_search(q: str = "") -> list[dict]:
+    from . import dashboard
+    return _dash(lambda: dashboard.search(q))
+
+
+@app.get("/dashboard/customer/{customer_id}", dependencies=[Depends(require_api_key)])
+def dashboard_customer(customer_id: str) -> dict:
+    from . import dashboard
+    rec = _dash(lambda: dashboard.customer(customer_id))
+    if rec is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such customer")
+    return rec
+
+
+@app.get("/dashboard/promises", dependencies=[Depends(require_api_key)])
+def dashboard_promises(start: str | None = None, end: str | None = None) -> dict:
+    from . import dashboard
+    return _dash(lambda: dashboard.promises(start, end))
+
+
 @app.get("/dashboard/chat/{interaction_id}", response_class=HTMLResponse,
          dependencies=[Depends(require_api_key)])
-def dashboard_chat(interaction_id: str, k: int = 1) -> HTMLResponse:
+def dashboard_chat(interaction_id: str) -> HTMLResponse:
     from . import dashboard
-    frag = _dash(lambda: dashboard.chat_fragment(interaction_id, k))
-    if frag is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "this chat has not been graded")
-    return HTMLResponse(frag, headers={"Cache-Control": "no-store"})
+    return _fragment(_dash(lambda: dashboard.chat_fragment(interaction_id)),
+                     "this chat has not been graded")
 
 
 @app.get("/dashboard/rules", response_class=HTMLResponse,
          dependencies=[Depends(require_api_key)])
 def dashboard_rules() -> HTMLResponse:
-    from .qa import render
-    return HTMLResponse(render.rules_html(), headers={"Cache-Control": "no-store"})
+    from . import dashboard
+    return _fragment(dashboard.rules_fragment(), "")
 
+
+# --- the v0.5 trial page, read-only ----------------------------------------
+
+@app.get("/dashboard/v05", response_class=HTMLResponse, include_in_schema=False)
+def dashboard_v05_page() -> HTMLResponse:
+    return _page(STATIC / "dashboard_v05.html")
+
+
+@app.get("/dashboard/v05/data", dependencies=[Depends(require_api_key)])
+def dashboard_v05_data(start: str | None = None, end: str | None = None) -> dict:
+    from . import dashboard_v05
+    return _dash(lambda: dashboard_v05.build(start, end))
+
+
+@app.get("/dashboard/v05/agent/{agent_id}/chats", dependencies=[Depends(require_api_key)])
+def dashboard_v05_agent_chats(agent_id: str, start: str | None = None,
+                              end: str | None = None) -> list[dict]:
+    from . import dashboard_v05
+    return _dash(lambda: dashboard_v05.agent_chats(agent_id, start, end))
+
+
+@app.get("/dashboard/v05/chat/{interaction_id}", response_class=HTMLResponse,
+         dependencies=[Depends(require_api_key)])
+def dashboard_v05_chat(interaction_id: str, k: int = 1) -> HTMLResponse:
+    from . import dashboard_v05
+    return _fragment(_dash(lambda: dashboard_v05.chat_fragment(interaction_id, k)),
+                     "this chat has not been graded")
+
+
+@app.get("/dashboard/v05/rules", response_class=HTMLResponse,
+         dependencies=[Depends(require_api_key)])
+def dashboard_v05_rules() -> HTMLResponse:
+    from .qa import render
+    return _fragment(render.rules_html(), "")
 
 # ---------------------------------------------------------------------------
 # Bitrix CRM pulls

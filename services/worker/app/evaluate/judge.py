@@ -523,24 +523,30 @@ def estimate_cost_usd(usage: dict, model: str, when: datetime | None = None) -> 
 
 def cost_row(purpose: str, *, model: str, prompt_version: str, input_hash: str,
              usage: dict, latency_ms: int | None = None,
-             succeeded: bool = True, error: str | None = None) -> dict:
+             succeeded: bool = True, error: str | None = None,
+             provider: str = "deepseek") -> dict:
     """One `model_calls` row, ready for the INSERT n8n runs.
 
     `input_hash` is already the hash of the exact text sent, and the table's
     UNIQUE (purpose, input_hash, prompt_version) turns a re-run of the same
     input into a no-op instead of a second charge.
+
+    DeepSeek is priced here, with its off-peak discount. Any other provider
+    prices its own call and passes the dollars in `usage["cost_usd"]`; it has
+    no peak window, so `priced_at_peak` is false for it.
     """
+    deepseek = provider == "deepseek"
     return {
         "purpose": purpose,
-        "provider": "deepseek",
+        "provider": provider,
         "model": model,
         "prompt_version": prompt_version,
         "input_hash": input_hash,
         "prompt_tokens": int(usage.get("prompt_tokens") or 0) or None,
         "output_tokens": int(usage.get("completion_tokens") or 0) or None,
         "cached_tokens": int(usage.get("prompt_cache_hit_tokens") or 0) or None,
-        "cost_usd": estimate_cost_usd(usage, model),
-        "priced_at_peak": is_peak(),
+        "cost_usd": estimate_cost_usd(usage, model) if deepseek else usage.get("cost_usd"),
+        "priced_at_peak": is_peak() if deepseek else False,
         "latency_ms": latency_ms,
         "succeeded": succeeded,
         "error": error,

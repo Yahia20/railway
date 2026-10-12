@@ -29,6 +29,7 @@ from app.config import settings
 from app.evaluate import judge
 from app.main import app
 from app.qa import engine, render
+from app.qa.v4 import engine as engine_v4
 from app.qa.score_v05 import CATEGORIES, score_thread
 
 KEY = "test-key-for-qa"
@@ -178,29 +179,42 @@ def test_not_gradeable_is_an_answer_not_an_error(client, monkeypatch):
 
 
 def test_a_failed_model_call_is_a_502(client, monkeypatch):
+    """/qa/evaluate grades with the v4 scorecard; v0.5's loader still reads the chat."""
     monkeypatch.setattr(engine, "load_thread", lambda _id, **_: THREAD)
+    monkeypatch.setattr(engine_v4, "load_settings", lambda: engine_v4.Settings())
 
-    def boom(_t, _c=None):
+    def boom(_t, _s, **_):
         raise judge.JudgeError("DeepSeek call failed after 3 attempts")
 
-    monkeypatch.setattr(engine, "evaluate", boom)
+    monkeypatch.setattr(engine_v4, "evaluate", boom)
     r = client.post("/qa/evaluate", headers=H, json={"interaction_id": THREAD["id"]})
     assert r.status_code == 502
 
 
-def test_dashboard_shell_is_public_and_empty_data_is_keyed(client, monkeypatch):
-    page = client.get("/dashboard")
-    assert page.status_code == 200 and page.headers["cache-control"] == "no-store"
+KEYED = ("/dashboard/overview", f"/dashboard/agent/{THREAD['agent_id']}/chats",
+         "/dashboard/customers/search?q=0501", f"/dashboard/customer/{THREAD['id']}",
+         "/dashboard/promises", f"/dashboard/chat/{THREAD['id']}", "/dashboard/rules",
+         "/dashboard/v05/data", f"/dashboard/v05/agent/{THREAD['agent_id']}/chats",
+         f"/dashboard/v05/chat/{THREAD['id']}", "/dashboard/v05/rules")
+
+
+@pytest.mark.parametrize("page", ["/dashboard", "/dashboard/v05"])
+def test_dashboard_shells_are_public_and_carry_no_data(client, page):
+    res = client.get(page)
+    assert res.status_code == 200 and res.headers["cache-control"] == "no-store"
     # The shell's script names fields; what it must never carry is a value —
     # a conversation id or a phone number baked into the HTML.
-    assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-", page.text)
-    assert not re.search(r"\d{9,}", page.text)
-    for path in ("/dashboard/data", f"/dashboard/agent/{THREAD['agent_id']}/chats",
-                 f"/dashboard/chat/{THREAD['id']}", "/dashboard/rules", "/qa/evaluate"):
-        res = client.post(path, json={}) if path == "/qa/evaluate" else client.get(path)
-        assert res.status_code == 401, path
+    assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-", res.text)
+    assert not re.search(r"\d{9,}", res.text)
+
+
+@pytest.mark.parametrize("path", KEYED + ("/qa/evaluate",))
+def test_every_data_route_needs_the_key(client, path):
+    res = client.post(path, json={}) if path == "/qa/evaluate" else client.get(path)
+    assert res.status_code == 401, path
 
 
 def test_an_ungraded_chat_is_a_404(client, monkeypatch):
     monkeypatch.setattr(db, "one", lambda sql, params=None: {})
     assert client.get(f"/dashboard/chat/{THREAD['id']}", headers=H).status_code == 404
+    assert client.get(f"/dashboard/v05/chat/{THREAD['id']}", headers=H).status_code == 404

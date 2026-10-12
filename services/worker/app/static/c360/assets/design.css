@@ -1,0 +1,100 @@
+/* Travel Gate — Customer 360 design tokens (single source for every screen)
+   Source of truth: docs/brand-guidelines.md. Edit there first, then here.
+   Layers: primitive (--tg-*) -> semantic (--bg, --ink, --primary ...) -> components use semantic only.
+   Fonts: self-hosted, see assets/fonts/fonts.css (no third-party request on customer-data pages). */
+
+@import url("./fonts/fonts.css");
+
+:root {
+  /* ---- primitive: brand ---- */
+  --tg-teal-700: #0B4A45; --tg-teal-600: #0E5F58; --tg-teal-100: #BFE0DB; --tg-teal-50: #E8F5F0;
+  --tg-turq-500: #45C1BB; --tg-turq-600: #2BAF9B; --tg-turq-300: #7FD1CB; --tg-turq-200: #A6E3DE;
+  --tg-orange-500: #F48041; --tg-orange-700: #C2410C; --tg-orange-300: #FFB287; --tg-orange-50: #FDF0E7;
+  /* ---- primitive: neutrals (teal-biased) ---- */
+  --tg-n-0: #FFFFFF; --tg-n-50: #F1F5F5; --tg-n-100: #E7EDED; --tg-n-200: #C2D0D0; --tg-n-500: #6E8585;
+  --tg-n-600: #4A5D64; --tg-n-700: #2B444B; --tg-n-900: #0E2A30;
+  --tg-d-950: #0B1D21; --tg-d-900: #10282D; --tg-d-925: #0D2226; --tg-d-700: #24444A; --tg-d-500: #5E7C80;
+  --tg-d-300: #93A9A7; --tg-d-200: #C5D6D4; --tg-d-100: #E6F0EF;
+
+  /* ---- semantic: surfaces & text ---- */
+  --bg: var(--tg-n-50); --surface: var(--tg-n-0); --sunken: var(--tg-n-100);
+  --ink: var(--tg-n-900); --ink-2: var(--tg-n-700); --muted: var(--tg-n-600);
+  --line: var(--tg-n-200); --line-strong: var(--tg-n-500);
+  /* ---- semantic: brand roles ---- */
+  --primary: var(--tg-teal-600); --primary-hover: var(--tg-teal-700); --primary-tint: var(--tg-teal-50);
+  --primary-line: var(--tg-teal-100); --on-primary: #FFFFFF; --brand: var(--tg-turq-500);
+  --accent: var(--tg-orange-500); --accent-ink: var(--tg-orange-700); --accent-tint: var(--tg-orange-50);
+  /* ---- semantic: status (never the accent) ---- */
+  --good: #0F6B4F; --good-tint: #E7F7F0;
+  --warn: #B7791F; --warn-tint: #FFF4DB;
+  --bad: #B42318; --bad-tint: #FDECEA;
+  /* ---- shape, elevation, motion ---- */
+  --r-sm: 8px; --r: 12px; --r-lg: 18px; --r-pill: 999px;
+  --shadow: 0 4px 12px rgba(14, 42, 48, .08);
+  --ease: 180ms ease-out;
+  /* ---- spacing (dense dashboard scale) ---- */
+  --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-6: 24px; --s-8: 32px;
+  /* ---- type ---- */
+  --font-display: 'Cairo', 'Segoe UI', system-ui, sans-serif;
+  --font-body: 'Tajawal', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: ui-monospace, Consolas, monospace;
+  --fs-h1: clamp(1.5rem, 4vw, 2rem); --fs-h2: 1.25rem; --fs-h3: 1rem; --fs-kpi: clamp(1.6rem, 3vw, 1.9rem);
+  --fs-body: 1rem; --fs-table: .94rem; --fs-cap: .8rem;
+  --lh-body: 1.7; --lh-tight: 1.35;
+  /* ---- score bands: informational only — the page reads the live thresholds from
+     /dashboard/overview meta.bands (app/qa/v4/scorecard.py BANDS) ---- */
+  --score-low-max: 60; --score-mid-max: 80;
+  /* ---- chart fills (always shown with their value; validated with dataviz) ---- */
+  --bar-good: #0F6B4F; --bar-warn: #B7791F; --bar-bad: #B42318; --bar-brand: var(--tg-teal-600);
+  --grid: #DCE5E5;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: var(--tg-d-950); --surface: var(--tg-d-900); --sunken: var(--tg-d-925);
+    --ink: var(--tg-d-100); --ink-2: var(--tg-d-200); --muted: var(--tg-d-300);
+    --line: var(--tg-d-700); --line-strong: var(--tg-d-500);
+    --primary: var(--tg-turq-300); --primary-hover: var(--tg-turq-200); --primary-tint: #123A3A;
+    --primary-line: #1E5652; --on-primary: var(--tg-d-950);
+    --accent-ink: var(--tg-orange-300); --accent-tint: #3A2417;
+    --good: #7FD9B5; --good-tint: #12352A; --warn: #F2C14E; --warn-tint: #3A2E10; --bad: #F4A081; --bad-tint: #3E1B12;
+    --shadow: 0 4px 12px rgba(0, 0, 0, .35);
+    --bar-good: #3FAF7F; --bar-warn: #D9A23B; --bar-bad: #E5604F; --bar-brand: var(--tg-turq-300); --grid: #1F3B40;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: var(--tg-d-950); --surface: var(--tg-d-900); --sunken: var(--tg-d-925);
+  --ink: var(--tg-d-100); --ink-2: var(--tg-d-200); --muted: var(--tg-d-300);
+  --line: var(--tg-d-700); --line-strong: var(--tg-d-500);
+  --primary: var(--tg-turq-300); --primary-hover: var(--tg-turq-200); --primary-tint: #123A3A;
+  --primary-line: #1E5652; --on-primary: var(--tg-d-950);
+  --accent-ink: var(--tg-orange-300); --accent-tint: #3A2417;
+  --good: #7FD9B5; --good-tint: #12352A; --warn: #F2C14E; --warn-tint: #3A2E10; --bad: #F4A081; --bad-tint: #3E1B12;
+  --shadow: 0 4px 12px rgba(0, 0, 0, .35);
+  --bar-good: #3FAF7F; --bar-warn: #D9A23B; --bar-bad: #E5604F; --bar-brand: var(--tg-turq-300); --grid: #1F3B40;
+  color-scheme: dark;
+}
+
+/* ---- base ---- */
+*, *::before, *::after { box-sizing: border-box; }
+html { direction: rtl; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font-family: var(--font-body); font-size: var(--fs-body); line-height: var(--lh-body);
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3 { font-family: var(--font-display); margin: 0; line-height: var(--lh-tight); text-wrap: balance; }
+h1 { font-size: var(--fs-h1); font-weight: 800; }
+h2 { font-size: var(--fs-h2); font-weight: 800; }
+h3 { font-size: var(--fs-h3); font-weight: 700; }
+p { margin: 0; }
+a { color: var(--primary); }
+:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
+.num, .phone { font-family: var(--font-display); font-variant-numeric: tabular-nums; direction: ltr; unicode-bidi: isolate; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }
+
+/* ---- score band utilities (apply by data-band set from the thresholds above) ---- */
+.band-low  { background: var(--bad-tint);  color: var(--bad); }
+.band-mid  { background: var(--warn-tint); color: var(--warn); }
+.band-high { background: var(--good-tint); color: var(--good); }

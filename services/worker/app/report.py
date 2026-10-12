@@ -694,6 +694,7 @@ SELECT f.follow_up_id::text                   AS follow_up_id,
              f.promised_at + interval '24 hours'))) / 3600.0, 1)
                                               AS hours_overdue,
        coalesce(ag.full_name, 'unassigned')   AS agent_name,
+       f.customer_id::text                    AS customer_id,
        c.display_name                         AS customer_name,
        c.primary_phone_e164                   AS customer_phone,
        i.external_id                          AS promised_in_external_id,

@@ -376,14 +376,17 @@ def check_roster() -> dict[str, Any]:
 
 SQL_QA = """
 SELECT g.mode, g.may_run, g.reason,
-       (SELECT count(*) FROM v_qa_due)                                         AS due,
-       (SELECT count(*) FROM qa_evaluations
+       (SELECT count(*) FROM v_qa_grade_due)                                    AS due,
+       (SELECT count(*) FROM qa_grades
          WHERE status = 'scored' AND evaluated_at > now() - interval '26 hours') AS graded26,
-       (SELECT count(*) FROM qa_evaluations
+       (SELECT count(*) FROM qa_grades
          WHERE status = 'failed' AND updated_at > now() - interval '26 hours')   AS failed26,
-       (SELECT max(evaluated_at) FROM qa_evaluations WHERE status = 'scored')    AS last_graded,
-       (SELECT left(reason, 160) FROM qa_evaluations WHERE status = 'failed'
-         ORDER BY updated_at DESC LIMIT 1)                                       AS last_error
+       (SELECT max(evaluated_at) FROM qa_grades WHERE status = 'scored')         AS last_graded,
+       (SELECT left(reason, 160) FROM qa_grades WHERE status = 'failed'
+         ORDER BY updated_at DESC LIMIT 1)                                       AS last_error,
+       (SELECT value FROM qa_config WHERE key = 'loss_reason_model')             AS loss_model,
+       (SELECT may_run FROM v_pipeline_gate WHERE provider = 'anthropic')        AS sonnet_may_run,
+       (SELECT reason FROM v_pipeline_gate WHERE provider = 'anthropic')         AS sonnet_reason
 FROM v_qa_gate g
 """
 
@@ -392,8 +395,9 @@ def check_qa() -> dict[str, Any]:
     c = _check("qa", "تقييم الموظفين بشيت الجودة (10)")
     r = db.one(SQL_QA)
     c["since"] = _riyadh(r["last_graded"])
+    source = "Claude Sonnet" if r.get("loss_model") == "sonnet" else "DeepSeek"
     c["what"] = (f"آخر 26 ساعة: {r['graded26']} شات اتقيّم، {r['failed26']} فشل. "
-                 f"مستني تقييم: {r['due']}.")
+                 f"مستني تقييم: {r['due']}. سبب الخسارة من: {source}.")
     if r["mode"] != "on":
         c["status"] = "off"
         c["why"] = "التقييم بشيت الجودة مقفول (qa_config.mode = off)."
@@ -407,6 +411,16 @@ def check_qa() -> dict[str, Any]:
         c["why"] = ("مفتوح وفيه شاتات مستنية، ومفيش ولا تقييم آخر 26 ساعة. يا workflow 10 "
                     "مش Active في n8n، يا بيقع قبل ما يخلص.")
         c["fix"] = "افتح n8n واتأكد إن 10 · Chat QA scorecard شغال، وشوف آخر execution."
+    elif r.get("loss_model") == "sonnet" and not r.get("sonnet_may_run"):
+        c["status"] = "warn"
+        c["why"] = (f"سبب الخسارة مضبوط على Sonnet بس بوابة Anthropic مقفولة: {r.get('sonnet_reason')}. "
+                    "الشاتات بتتقيّم عادي وسبب الخسارة بييجي من DeepSeek لحد ما تتفتح.")
+        c["fix"] = "شوف الحد الشهري للـ anthropic في provider_budgets، أو رجّع qa_config.loss_reason_model لـ deepseek."
+    elif r.get("loss_model") == "sonnet" and not r.get("sonnet_may_run"):
+        c["status"] = "warn"
+        c["why"] = (f"سبب الخسارة مضبوط على Sonnet بس بوابة Anthropic مقفولة: {r.get('sonnet_reason')}. "
+                    "الشاتات بتتقيّم عادي وسبب الخسارة بييجي من DeepSeek لحد ما تتفتح.")
+        c["fix"] = "شوف provider_budgets للـ anthropic (الحد الشهري)، أو ارجع لـ DeepSeek من qa_config."
     elif r["failed26"]:
         c["status"] = "warn"
         c["why"] = f"شاتات فشل تقييمها وهتتعاد لوحدها. آخر خطأ: {r['last_error']}"

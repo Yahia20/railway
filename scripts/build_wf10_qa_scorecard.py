@@ -6,8 +6,12 @@
 Every 10 minutes, 23:00-03:59 Riyadh (gotcha 14: off-peak, and finished before
 04:00): check the DeepSeek balance, ask v_qa_gate whether the QA scorecard may
 spend, claim a few due chats with a fenced token, grade them ONE AT A TIME
-through the worker (POST /qa/evaluate), and store each answer plus its three
-model_calls rows. n8n writes; the worker only reads and asks (rule 11).
+through the worker (POST /qa/evaluate), and store each answer plus its
+model_calls rows (three DeepSeek runs, and a Sonnet vote when qa_config says
+so). n8n writes; the worker only reads and asks (rule 11).
+
+Results go to `qa_grades` (031, the v4 scorecard). The v0.5 grades in
+`qa_evaluations` are history and nothing here touches them.
 """
 from __future__ import annotations
 
@@ -48,20 +52,24 @@ SQL_BLOCKED = """-- lease-exempt: a run log entry; nothing was claimed.
 INSERT INTO job_runs (job_name, status, started_at, finished_at,
                       items_in, items_ok, items_failed, error, detail)
 SELECT 'qa_chat', 'skipped'::job_status, now(), now(),
-       (SELECT count(*) FROM v_qa_due), 0, 0, $1::text,
+       (SELECT count(*) FROM v_qa_grade_due), 0, 0, $1::text,
        jsonb_build_object('gate', 'v_qa_gate', 'reason', $1::text)
 RETURNING run_id;"""
 
 SQL_RETENTION = """-- lease-exempt: housekeeping on rows no run holds.
--- The 90-day purge blanks a conversation's text; the quotes stored in
--- qa_evaluations.items are that same text, so they go too. Score and the 15
--- item scores stay: they are numbers about the agent, not the customer's words.
+-- The 90-day purge blanks a conversation's text; the masked lines in
+-- qa_grades.detail and the model answers in qa_grades.answers are that same
+-- text, so they go too. Score, items (values and line NUMBERS) and the loss
+-- reason stay: they are facts about the agent, not the customer's words.
 WITH gone AS (
-  UPDATE qa_evaluations q SET items = NULL, updated_at = now()
+  UPDATE qa_grades g
+     SET detail = jsonb_build_object('purged', true, 'metrics', g.detail->'metrics'),
+         answers = NULL, updated_at = now()
   FROM interactions i
-  WHERE i.interaction_id = q.interaction_id
-    AND i.content_purged_at IS NOT NULL AND q.items IS NOT NULL
-  RETURNING q.interaction_id)
+  WHERE i.interaction_id = g.interaction_id
+    AND i.content_purged_at IS NOT NULL
+    AND (g.answers IS NOT NULL OR (g.detail IS NOT NULL AND NOT g.detail ? 'purged'))
+  RETURNING g.interaction_id)
 SELECT count(*)::int AS blanked FROM gone;"""
 
 SQL_CLAIM = """-- fence-exempt: this statement IS the claim. INSERT ... ON CONFLICT DO UPDATE
@@ -70,19 +78,19 @@ SQL_CLAIM = """-- fence-exempt: this statement IS the claim. INSERT ... ON CONFL
 -- Claim up to qa_config.batch due chats, oldest first, each with a fresh
 -- token. A row that is already claimed is taken over only once its claim is
 -- 30 minutes stale (a crashed run); a failed one only after an hour, and only
--- while it has attempts left — the same rules v_qa_due states.
-INSERT INTO qa_evaluations (interaction_id, status, claimed_at, claim_token)
+-- while it has attempts left — the same rules v_qa_grade_due states.
+INSERT INTO qa_grades (interaction_id, status, claimed_at, claim_token)
 SELECT d.interaction_id, 'claimed', now(), gen_random_uuid()
-  FROM v_qa_due d
+  FROM v_qa_grade_due d
  ORDER BY d.started_at
  LIMIT (SELECT value::int FROM qa_config WHERE key = 'batch')
 ON CONFLICT (interaction_id) DO UPDATE
    SET status = 'claimed', claimed_at = now(), claim_token = EXCLUDED.claim_token,
        updated_at = now()
- WHERE (qa_evaluations.status = 'claimed'
-        AND qa_evaluations.claimed_at < now() - interval '30 minutes')
-    OR (qa_evaluations.status = 'failed' AND qa_evaluations.attempts < 3
-        AND qa_evaluations.updated_at < now() - interval '1 hour')
+ WHERE (qa_grades.status = 'claimed'
+        AND qa_grades.claimed_at < now() - interval '30 minutes')
+    OR (qa_grades.status = 'failed' AND qa_grades.attempts < 3
+        AND qa_grades.updated_at < now() - interval '1 hour')
 RETURNING interaction_id::text, claim_token::text;"""
 
 SQL_STORE = """-- Store one answer, FENCED on the claim token: an answer whose claim was taken
@@ -102,28 +110,33 @@ owned AS MATERIALIZED (
   -- The fence, LOCKED: the row is held from here to commit, so a takeover
   -- cannot slip in between this check and the write below.
   SELECT q.interaction_id
-  FROM qa_evaluations q, o
+  FROM qa_grades q, o
   WHERE q.interaction_id = o.id AND q.claim_token = o.tok AND q.status = 'claimed'
   FOR UPDATE OF q)
-UPDATE qa_evaluations q SET
-  status         = o.outcome,
-  agent_id       = coalesce((o.j->>'agent_id')::uuid, q.agent_id),
-  prompt_version = o.j->>'prompt_version',
-  model          = o.j->>'model',
-  runs           = (o.j->>'runs')::smallint,
-  score          = (o.j->>'score')::numeric,
-  critical       = coalesce(ARRAY(SELECT x::smallint
-                                    FROM jsonb_array_elements_text(o.j->'critical') AS x), '{}'),
-  items          = CASE WHEN o.outcome = 'scored' THEN o.j->'items' END,
-  categories     = CASE WHEN o.outcome = 'scored' THEN o.j->'categories' END,
-  cost_usd       = (o.j->>'cost_usd')::numeric,
-  reason         = CASE o.outcome WHEN 'not_gradeable' THEN o.j->>'reason'
-                                  WHEN 'failed' THEN left(coalesce(o.j->'error'->>'message', o.j::text), 500)
-                   END,
-  attempts       = q.attempts + CASE WHEN o.outcome = 'failed' THEN 1 ELSE 0 END,
-  evaluated_at   = CASE WHEN o.outcome = 'scored' THEN now() END,
-  claim_token    = NULL,
-  updated_at     = now()
+UPDATE qa_grades q SET
+  status             = o.outcome,
+  agent_id           = coalesce((o.j->>'agent_id')::uuid, q.agent_id),
+  prompt_version     = o.j->>'prompt_version',
+  model              = o.j->>'model',
+  runs               = (o.j->>'runs')::smallint,
+  score              = (o.j->>'score')::smallint,
+  items              = CASE WHEN o.outcome = 'scored' THEN o.j->'items' END,
+  chat_type          = CASE WHEN o.outcome = 'scored' THEN o.j->>'chat_type' END,
+  qualified          = CASE WHEN o.outcome = 'scored' THEN (o.j->>'qualified')::boolean END,
+  red_flag           = CASE WHEN o.outcome = 'scored' THEN o.j->>'red_flag' END,
+  loss_reason        = CASE WHEN o.outcome = 'scored' THEN o.j->>'loss_reason' END,
+  loss_reason_source = CASE WHEN o.outcome = 'scored' THEN o.j->>'loss_reason_source' END,
+  followup_attempts  = CASE WHEN o.outcome = 'scored' THEN (o.j->>'followup_attempts')::smallint END,
+  detail             = CASE WHEN o.outcome = 'scored' THEN o.j->'detail' END,
+  answers            = CASE WHEN o.outcome = 'scored' THEN o.j->'answers' END,
+  cost_usd           = (o.j->>'cost_usd')::numeric,
+  reason             = CASE o.outcome WHEN 'not_gradeable' THEN o.j->>'reason'
+                                      WHEN 'failed' THEN left(coalesce(o.j->'error'->>'message', o.j::text), 500)
+                       END,
+  attempts           = q.attempts + CASE WHEN o.outcome = 'failed' THEN 1 ELSE 0 END,
+  evaluated_at       = CASE WHEN o.outcome = 'scored' THEN now() END,
+  claim_token        = NULL,
+  updated_at         = now()
 FROM o, owned
 WHERE q.interaction_id = owned.interaction_id
 RETURNING q.interaction_id::text, q.status;"""
@@ -131,7 +144,8 @@ RETURNING q.interaction_id::text, q.status;"""
 SQL_CALLS = """-- lease-exempt: the money was spent whether or not this claim still owns the
 -- chat, and rule 12 says every judge call lands in model_calls; UNIQUE below
 -- dedupes a re-store, and the rows describe the calls, not the chat's grade.
--- Rule 12: every judge call lands in model_calls. Three per chat, one per run;
+-- Rule 12: every judge call lands in model_calls. Three DeepSeek runs per chat,
+-- plus each Sonnet vote (provider 'anthropic') when the loss reason asks for one;
 -- UNIQUE (purpose, input_hash, prompt_version) makes a re-store a no-op.
 -- multi-item: one worker answer per item.
 WITH c AS (SELECT jsonb_array_elements(coalesce($1::jsonb->'calls', '[]'::jsonb)) AS x),
@@ -158,8 +172,8 @@ SELECT 'qa_chat', 'succeeded'::job_status, now(), now(),
                           AND updated_at > now() - interval '15 minutes'),
        count(*) FILTER (WHERE status = 'failed' AND updated_at > now() - interval '15 minutes'),
        sum(cost_usd) FILTER (WHERE updated_at > now() - interval '15 minutes'),
-       jsonb_build_object('due_left', (SELECT count(*) FROM v_qa_due))
-  FROM qa_evaluations
+       jsonb_build_object('due_left', (SELECT count(*) FROM v_qa_grade_due))
+  FROM qa_grades
 RETURNING run_id;"""
 
 
@@ -219,7 +233,8 @@ nodes = [
                     "options": {"timeout": 240000}},
      "name": "Grade through worker", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
      "position": [1980, 200], "onError": "continueRegularOutput", "alwaysOutputData": True,
-     "notes": "Three model runs in parallel inside the worker, ~10-30 s. onError continues so a "
+     "notes": "Three DeepSeek runs in parallel inside the worker, then a Sonnet vote when "
+              "qa_config.loss_reason_model = 'sonnet': ~15-60 s. onError continues so a "
               "timeout becomes a recorded failure with an attempt spent, never a lost claim."},
     pg("Store result", SQL_STORE,
        replace="={{ [ JSON.stringify($json), $('Each chat').item.json.interaction_id, "

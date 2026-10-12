@@ -243,6 +243,56 @@ chats render byte-for-byte as on the approved page.
 DeepSeek now echoes `deepseek-flash` for a v4-flash request; it is priced, or
 every call would store `cost_usd = NULL` and vanish from the cap.
 
+### 031 — the v4 scorecard replaces v0.5, and /dashboard is the Customer 360 console
+
+**The owner's handoff of 2026-10-11** (from Mohamed Amin; kept out of this
+public repo because it quotes real customer lines) replaced the 15-item sheet with **nine weighted items** (probe 10,
+offer 15, match 5, follow-up 15, promise 10, objection 5, answered 15, correct
+10, professional 15 = 100), a loss reason, and one red flag ("qualified
+customer got no offer"). Nothing zeroes a chat any more (q35/q37/q38 removed),
+and discounts are allowed.
+
+| | |
+|---|---|
+| `app/qa/v4/` | `transcript` (numbered, masked chat) → `evidence` (quote must be in THAT message, by THAT side) → `scorecard` (handoff section 5, one run → items, three runs → grade) · `claude` (call 4) · `engine` · `texts` (every Arabic label, shipped as `meta`) · `render` |
+| `prompt.txt` | the owner's v4 prompt + two wording clarifications → `qa-chat-v4.1`. The note block at the end is stripped before sending |
+| `POST /qa/evaluate` | now v4. Three DeepSeek runs; item applies in ≥2 runs, value = median. Returns the grade, `detail` (masked evidence lines), the raw `answers`, and every `model_calls` row |
+| `qa_grades` (031) | one row per chat, the queue's state too. `answers` is kept so a rule change can be replayed without paying again; `detail` + `answers` blanked with the 90-day purge |
+| `v_qa_grade_due` | 030's filter, unchanged (quiet 3 days — the follow-up item needs it) |
+| loss reason | `qa_config.loss_reason_model` = `deepseek` (default) or `sonnet`. Sonnet needs `ANTHROPIC_API_KEY` on the worker and an open `v_pipeline_gate` row for `anthropic` (cap 20 USD). A closed gate or a failed vote falls back to the DeepSeek runs and says so in `loss_reason_source` + `detail.loss_note` |
+| `v_spend_mtd` | **fixed**: it summed every `model_calls` row under `deepseek`. Now grouped by `model_calls.provider`, same columns |
+| `/dashboard` | the Customer 360 console (design: artifact Az7qGpVtZAos4BGbezSq4t) — `static/c360/`, ES modules, no build. Data from `app/dashboard.py` |
+| `/dashboard/v05` | the old page, read-only, for the 297 v0.5 trial grades in `qa_evaluations` |
+
+**Calls 2 (q40) and 3 (coaching) are NOT built**: their prompt files were not in
+the handoff folder. Neither feeds the score.
+
+**Where the code is stricter than the reference implementation, it enforces a
+rule the prompt already states**, so the same answers can only give one grade:
+a delivery/answer/mismatch must come after what it answers; q36 needs both of
+its sides verified; a line that only announces a question ("ابغى استفسر") is
+not a request; bot/system lines never count; an unknown label is no label; a
+stated loss reason proven by a verified line outranks "No Response" votes, and
+so does a price/competitor objection in the customer's LAST message.
+
+**Re-grade stability, measured 2026-10-11 on 35 real chats graded twice**
+(scratch runs, nothing stored, ~$0.55 of DeepSeek): the loss reason flipped on
+3 of 35 before the fixes and on 0 of 35 after — those flips were the 12-38 point
+swings, through the follow-up item. After the fixes 83-89% of chats re-grade to
+the identical score, mean movement 1-3 points. What remains is the model
+reading one line differently (`answered`, `probe`, `offer`) — a different chat
+each time, not a rule. Five runs instead of three gained 2 chats of 35; not
+worth +65% cost. Read agent scores as weekly means, as the owner's handoff says.
+
+**Cost at current volume** (~2,200 gradable chats/month): DeepSeek call 1 × 3
+≈ $2/month. Sonnet ≈ $13 per 1,000 chats per vote (the owner's measurement),
+i.e. ≈ $29/month for ONE vote and ≈ $85 for the 3 the owner tested — so it
+ships OFF, and with the 20 USD `anthropic` cap even one vote would close the
+gate around day 20 and fall back to DeepSeek for the rest of the month.
+
+To go live: apply 031, deploy the worker, `python scripts/n8n_deploy.py 10 --activate`
+(needs `N8N_API_KEY`), then `UPDATE qa_config SET value = 'on' WHERE key = 'mode';`.
+
 ### The judge reports observations, not scores — `pass2-agent-quality-v7`
 
 v6 asked for a number per criterion and got `{"greeting": 18}` on a criterion
@@ -750,7 +800,8 @@ python scripts/simulate_conversation.py <id> --webhook  # POST at live n8n
 ## Layout
 
 ```
-db/migrations/         001-029 APPLIED to Railway (verified 2026-10-07).
+db/migrations/         001-030 APPLIED to Railway (verified 2026-10-07); 031 (v4
+                       scorecard, qa_grades, spend per provider) written 2026-10-11.
                        023 removed the calls lane; 024 linked deals to
                        customers; 025 retention without transcripts; 026 chat
                        media archive; 027 customer names; 028 deal-title noise;

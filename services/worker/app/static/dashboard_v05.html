@@ -220,7 +220,7 @@ function renderEmployees(agents) {
 async function openAgent(el) {
   const body = el.querySelector(".emp-body");
   try {
-    const chats = await get("dashboard/agent/" + el.dataset.agent + "/chats" + qs());
+    const chats = await get("/dashboard/v05/agent/" + el.dataset.agent + "/chats" + qs());
     const avg = Math.round(chats.reduce((s, c) => s + c.score, 0) / (chats.length || 1));
     body.innerHTML = chats.map((c, i) =>
       '<details class="chatrow" data-id="' + esc(c.interaction_id) + '" data-k="' + (i + 1) + '"><summary>' +
@@ -236,7 +236,7 @@ async function openAgent(el) {
 
 async function openChat(row) {
   const frag = row.querySelector(".frag");
-  try { frag.innerHTML = await get("dashboard/chat/" + row.dataset.id + "?k=" + row.dataset.k, true); }
+  try { frag.innerHTML = await get("/dashboard/v05/chat/" + row.dataset.id + "?k=" + row.dataset.k, true); }
   catch (e) { frag.innerHTML = '<span class="err">' + esc(e.message) + "</span>"; }
 }
 
@@ -269,7 +269,7 @@ function renderCustomers() {
 
 async function load() {
   try {
-    const d = await get("dashboard/data" + qs());
+    const d = await get("/dashboard/v05/data" + qs());
     $("gate").hidden = true; $("app").hidden = false; $("loadErr").textContent = "";
     $("from").value = d.from;
     const to = new Date(d.to + "T00:00:00"); to.setDate(to.getDate() - 1);
@@ -293,7 +293,7 @@ document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", asy
   document.querySelectorAll(".tab").forEach((x) => x.setAttribute("aria-selected", x === b));
   document.querySelectorAll(".page").forEach((p) => { p.hidden = p.id !== "p-" + b.dataset.p; });
   if (b.dataset.p === "rules" && !rulesLoaded) {
-    try { $("rules").innerHTML = await get("dashboard/rules", true); rulesLoaded = true; }
+    try { $("rules").innerHTML = await get("/dashboard/v05/rules", true); rulesLoaded = true; }
     catch (e) { $("rules").innerHTML = '<span class="err">' + esc(e.message) + "</span>"; }
   }
 }));

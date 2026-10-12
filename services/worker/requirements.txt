@@ -5,6 +5,10 @@ httpx==0.28.1
 psycopg[binary,pool]==3.2.3
 numpy==2.2.1
 
+# QA scorecard call 4 (app/qa/v4/claude.py): the loss reason from Claude Sonnet 5.5.
+# Imported lazily, only when qa_config.loss_reason_model = 'sonnet'.
+anthropic==1.13.0
+
 # ASR — Space backend (default). Swap for the local backend by installing the
 # extras in requirements-local-asr.txt instead.
 gradio-client==2.0.2
