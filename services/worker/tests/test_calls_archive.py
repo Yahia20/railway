@@ -7,6 +7,9 @@ there) and POSTs the raw bytes here. What must hold:
   * anything that is not audio (an HTML error page, an empty body) is refused
     and never written
   * a bad id or day is a 422 before the bucket is touched
+  * a `stored` answer always describes the object that IS in the bucket, also
+    when a retry finds the key already taken
+  * a body without Content-Length is cut off at the size cap, not buffered
   * the call-recordings bucket is configured from CALLS_S3_*, never from the
     chat-media S3_* variables
 """
@@ -14,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -36,6 +40,9 @@ class Store:
 
     def exists(self, key):
         return key in self.objects
+
+    def get_bytes(self, key):
+        return self.objects.get(key)
 
     def put(self, key, data, *, sha256_hex, content_type):
         self.puts.append((key, content_type))
@@ -135,3 +142,60 @@ def test_without_a_calls_bucket_the_endpoint_is_503(client, monkeypatch):
         monkeypatch.delenv("CALLS_S3_" + k, raising=False)
     r = client.post(URL, content=WAV, headers=H)
     assert r.status_code == 503 and "CALLS_S3_BUCKET" in r.text
+
+
+KEY_OBJ = f"calls/2026/11/01/{UID}.wav"
+
+
+def test_a_retry_with_a_longer_copy_replaces_the_truncated_one(client, bucket):
+    bucket.objects[KEY_OBJ] = WAV[:100]
+    r = client.post(URL, content=WAV, headers=H).json()
+    assert r["outcome"] == "stored" and r["replaced"] is True and r["already_stored"] is False
+    assert r["sha256"] == hashlib.sha256(WAV).hexdigest() and r["bytes"] == len(WAV)
+    assert bucket.objects[KEY_OBJ] == WAV
+
+
+def test_a_retry_with_a_shorter_copy_keeps_the_stored_one_and_describes_it(client, bucket):
+    longer = WAV + b"" * 50
+    bucket.objects[KEY_OBJ] = longer
+    r = client.post(URL, content=WAV, headers=H).json()
+    assert r["outcome"] == "stored" and r["already_stored"] is True and "replaced" not in r
+    assert r["sha256"] == hashlib.sha256(longer).hexdigest() and r["bytes"] == len(longer)
+    assert bucket.objects[KEY_OBJ] == longer and bucket.puts == []
+
+
+def test_a_chunked_body_is_cut_off_at_the_cap(client, bucket, monkeypatch):
+    monkeypatch.setattr(calls_store, "MAX_BYTES", 100)
+    def body():
+        for _ in range(50):
+            yield WAV[:64]
+
+    r = client.post(URL, content=body(), headers=H)
+    assert r.json()["outcome"] == "too_large" and bucket.objects == {}
+
+
+def test_a_chunked_body_under_the_cap_is_stored(client, bucket):
+    r = client.post(URL, content=iter([WAV[:50], WAV[50:]]), headers=H)
+    assert r.json()["outcome"] == "stored" and bucket.objects[KEY_OBJ] == WAV
+
+
+@pytest.mark.parametrize("qs", [
+    "uniqueid=1793546440.46642%0A&day=2026-11-01",
+    "uniqueid=1793546440.46642&day=2026-02-30",
+    "uniqueid=1793546440.46642&day=2026-13-01",
+])
+def test_trailing_newlines_and_impossible_dates_are_422(client, bucket, qs):
+    r = client.post("/calls/recording/store?" + qs, content=WAV, headers=H)
+    assert r.status_code == 422 and bucket.objects == {}
+
+
+def test_get_bytes_reads_the_object_or_none():
+    cfg = s3.S3Config(endpoint="https://t3.storageapi.dev", bucket="b", access_key_id="a",
+                      secret_access_key="s", region="auto", url_style="virtual")
+    answers = {"/x.wav": httpx.Response(200, content=b"RIFFdata"), "/gone.wav": httpx.Response(404),
+               "/broken.wav": httpx.Response(500)}
+    http = httpx.Client(transport=httpx.MockTransport(lambda req: answers[req.url.path]))
+    c = s3.S3Client(cfg, http=http)
+    assert c.get_bytes("x.wav") == b"RIFFdata" and c.get_bytes("gone.wav") is None
+    with pytest.raises(s3.StorageUnavailable):
+        c.get_bytes("broken.wav")

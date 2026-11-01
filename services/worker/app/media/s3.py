@@ -233,6 +233,16 @@ class S3Client:
         if r.status_code not in (200, 201):
             raise StorageUnavailable(f"PUT {key}: HTTP {r.status_code} {r.text[:200]}")
 
+    def get_bytes(self, key: str) -> bytes | None:
+        """The whole object, or None when it does not exist."""
+        url, hdrs = sign_headers(self.cfg, "GET", key)
+        r = self.http.get(url, headers=hdrs)
+        if r.status_code == 404:
+            return None
+        if r.status_code != 200:
+            raise StorageUnavailable(f"GET {key}: HTTP {r.status_code}")
+        return r.content
+
     def get_json(self, key: str) -> dict | None:
         """A small JSON object, or None when it does not exist."""
         url, hdrs = sign_headers(self.cfg, "GET", key)
