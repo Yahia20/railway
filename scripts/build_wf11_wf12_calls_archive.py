@@ -62,8 +62,22 @@ return [{ json: { rows: Array.from(seen.values()), pages, min_calldate: min } }]
 UPSERT = """-- Upsert the customer calls of this run, and queue a download for every call
 -- that has a recording file. Idempotent: re-seeing a call refreshes its row
 -- and never queues it twice.
-WITH src AS (
+--
+-- ONE BAD ROW MUST NOT SINK THE BATCH. Every cast below is guarded: a field
+-- the PBX sends empty, negative or in an odd shape becomes NULL instead of
+-- aborting the statement (which would lose every good call of the run too).
+-- A row whose calldate cannot be read at all cannot be kept (calldate_local
+-- is NOT NULL) and is counted in `skipped`. A call whose uniqueid the worker
+-- would refuse as an object key is indexed but never queued, so it cannot
+-- burn retries against a 422.
+WITH inp AS (
   SELECT r FROM jsonb_array_elements($1::jsonb) AS r
+),
+src AS (
+  SELECT r FROM inp
+  WHERE r->>'uniqueid' IS NOT NULL
+    AND r->>'call_type' IN ('IN', 'OUT')
+    AND r->>'calldate' ~ '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])[T ]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$'
 ),
 up AS (
   INSERT INTO call_log (uniqueid, linkedid, calldate_local, calldate_utc, call_type, route, app,
@@ -76,10 +90,12 @@ up AS (
          (r->>'calldate')::timestamp AT TIME ZONE 'Asia/Riyadh',
          r->>'call_type', r->>'route', r->>'app', r->>'src', r->>'dst',
          r->>'phone_number', r->>'customer_name', r->>'extension', r->>'agent_name',
-         (r->>'duration')::int, (r->>'talk')::int,
+         CASE WHEN r->>'duration' ~ '^[0-9]{1,9}$' THEN (r->>'duration')::int END,
+         CASE WHEN r->>'talk'     ~ '^[0-9]{1,9}$' THEN (r->>'talk')::int END,
          r->>'disposition', r->>'status', r->>'canonical_status',
-         r->>'ended_by', r->>'ended_by_agent', (r->>'call_journey_count')::int,
-         (r->>'is_supervision')::boolean,
+         r->>'ended_by', r->>'ended_by_agent',
+         CASE WHEN r->>'call_journey_count' ~ '^[0-9]{1,9}$' THEN (r->>'call_journey_count')::int END,
+         CASE WHEN jsonb_typeof(r->'is_supervision') = 'boolean' THEN (r->'is_supervision')::boolean END,
          NULLIF(r->>'recording_file', ''), NULLIF(r->>'recording_path', ''), r
   FROM src
   ON CONFLICT (uniqueid) DO UPDATE SET
@@ -100,23 +116,38 @@ up AS (
 ),
 jobs AS (
   INSERT INTO call_recording_jobs (uniqueid)
-  SELECT uniqueid FROM up WHERE recording_file IS NOT NULL
+  SELECT uniqueid FROM up
+  WHERE recording_file IS NOT NULL
+    AND uniqueid ~ '^[0-9]{6,12}[.][0-9]{1,9}$'   -- the worker's object-key rule
   ON CONFLICT (uniqueid) DO NOTHING
   RETURNING uniqueid
 )
 SELECT (SELECT count(*) FROM up)                AS upserted,
        (SELECT count(*) FROM up WHERE inserted) AS new_calls,
-       (SELECT count(*) FROM jobs)              AS new_jobs;"""
+       (SELECT count(*) FROM jobs)              AS new_jobs,
+       (SELECT count(*) FROM inp) - (SELECT count(*) FROM src) AS skipped,
+       (SELECT coalesce(jsonb_agg(r->>'uniqueid'), '[]'::jsonb)
+          FROM (SELECT r FROM inp EXCEPT SELECT r FROM src LIMIT 5) x) AS skipped_ids;"""
 
-CLAIM = """-- Workflow 12: claim ONE recording to download, only when mode = 'on' and
--- the Riyadh clock is inside the night window. Claims whose deadline passed
--- (their execution died) go back to retry_wait first.
+CLAIM = """-- Workflow 12: claim ONE recording to download, only when mode = 'on', the
+-- Riyadh clock is inside the night window, and NO other download is in
+-- flight. A run that is still downloading when the next 2-minute tick fires
+-- makes that tick claim nothing, so the PBX never serves two of our
+-- downloads at once (the owner's "one call at a time").
+--
+-- A claim whose deadline passed (its execution died) counts as a failed
+-- attempt: it waits out the same backoff as any other failure and becomes
+-- `failed` at max_attempts, so a job that kills its execution every time
+-- cannot loop forever. Sibling CTEs share one snapshot, so a lease expired
+-- here is no longer "busy" (busy reads claim_until, not just status) but the
+-- job itself is only claimable again after its backoff.
 WITH cfg AS (
   SELECT max(value) FILTER (WHERE key = 'mode')                    AS mode,
          max(value) FILTER (WHERE key = 'pbx_base_url')            AS base,
          max(value) FILTER (WHERE key = 'pbx_api_key')             AS api_key,
          max(value) FILTER (WHERE key = 'fetch_window_start')::int AS ws,
-         max(value) FILTER (WHERE key = 'fetch_window_end')::int   AS we
+         max(value) FILTER (WHERE key = 'fetch_window_end')::int   AS we,
+         coalesce(max(value) FILTER (WHERE key = 'max_attempts')::int, 5) AS max_attempts
   FROM call_archive_config
 ),
 gate AS (
@@ -126,17 +157,25 @@ gate AS (
     AND extract(hour FROM now() AT TIME ZONE 'Asia/Riyadh') <  we
 ),
 reclaimed AS (
-  UPDATE call_recording_jobs
-     SET status = 'retry_wait', claim_token = NULL, claim_until = NULL, claimed_at = NULL,
-         last_outcome = 'claim_expired'
-   WHERE status = 'fetching' AND claim_until < now()
-  RETURNING uniqueid
+  UPDATE call_recording_jobs j
+     SET status = CASE WHEN j.attempts >= (SELECT max_attempts FROM cfg) THEN 'failed' ELSE 'retry_wait' END,
+         claim_token = NULL, claim_until = NULL, claimed_at = NULL,
+         last_outcome = 'claim_expired',
+         last_error = 'the run that claimed it never reported back before its lease ran out',
+         next_attempt_at = now() + interval '10 minutes' * power(2, least(j.attempts, 4))
+   WHERE j.status = 'fetching' AND j.claim_until < now()
+  RETURNING j.uniqueid
+),
+busy AS (
+  SELECT 1 FROM call_recording_jobs WHERE status = 'fetching' AND claim_until >= now()
 ),
 picked AS (
   SELECT j.uniqueid
   FROM call_recording_jobs j
   WHERE EXISTS (SELECT 1 FROM gate)
+    AND NOT EXISTS (SELECT 1 FROM busy)
     AND j.status IN ('pending', 'retry_wait')
+    AND j.attempts < (SELECT max_attempts FROM cfg)
     AND j.next_attempt_at <= now()
   ORDER BY j.next_attempt_at, j.uniqueid
   LIMIT 1

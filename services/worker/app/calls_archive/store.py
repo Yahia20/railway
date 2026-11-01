@@ -12,6 +12,18 @@ either way.
 
 The key is the call's own id under its day, so storing the same call twice
 writes the same object: a retry after a lost answer cannot create a second copy.
+
+WHAT `stored` DESCRIBES. The sha256, size and type in a `stored` answer are
+always those of the object that is in the bucket afterwards, because n8n
+writes them down as the archive's record of that object. When the key is
+already taken (a retry after an answer was lost), the existing object is read
+back and compared:
+
+  same bytes          nothing is written; already_stored = true
+  existing is longer  kept; the answer describes IT, not the new bytes. A
+                      recording only grows, so the shorter copy is the
+                      truncated one.
+  new is longer       the new bytes replace it; replaced = true
 """
 from __future__ import annotations
 
@@ -20,6 +32,7 @@ import logging
 import os
 import re
 from dataclasses import asdict, dataclass
+from datetime import date
 
 import httpx
 
@@ -45,6 +58,7 @@ class StoreResult:
     mime: str | None = None
     storage_key: str | None = None
     already_stored: bool | None = None
+    replaced: bool | None = None
     error: str | None = None
 
     def as_dict(self) -> dict:
@@ -53,10 +67,14 @@ class StoreResult:
 
 def object_key(uniqueid: str, day: str) -> str:
     """calls/<yyyy>/<mm>/<dd>/<uniqueid>.wav, `day` = the call's local date."""
-    m = _DAY.match(day or "")
+    m = _DAY.fullmatch(day or "")
     if not m:
         raise ValueError("day must be YYYY-MM-DD")
-    if not UNIQUEID.match(uniqueid or ""):
+    try:
+        date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        raise ValueError("day must be a real calendar date") from None
+    if not UNIQUEID.fullmatch(uniqueid or ""):
         raise ValueError("uniqueid must look like 1793546440.46642")
     return f"calls/{m.group(1)}/{m.group(2)}/{m.group(3)}/{uniqueid}.wav"
 
@@ -77,12 +95,19 @@ def store_recording(uniqueid: str, day: str, data: bytes, *, store: S3Client,
                            error=f"first bytes are {mime or 'text'}, not audio")
     sha = hashlib.sha256(data).hexdigest()
     try:
-        already = store.exists(key)
-        if not already:
-            store.put(key, data, sha256_hex=sha, content_type=mime)
+        existing = store.get_bytes(key) if store.exists(key) else None
+        if existing is not None:
+            old_sha = hashlib.sha256(existing).hexdigest()
+            if old_sha == sha or len(existing) >= len(data):
+                old_mime = sniff(bytes(existing[:64]), f"{uniqueid}.wav") or mime
+                log.info("call recording kept id=%s bytes=%d same=%s", uniqueid, len(existing), old_sha == sha)
+                return StoreResult("stored", sha256=old_sha, bytes=len(existing), mime=old_mime,
+                                   storage_key=key, already_stored=True)
+        store.put(key, data, sha256_hex=sha, content_type=mime)
     except (StorageUnavailable, httpx.HTTPError) as exc:
         return StoreResult("failed", sha256=sha, bytes=len(data), mime=mime,
                            error=f"bucket: {exc}"[:300])
-    log.info("call recording stored id=%s bytes=%d mime=%s already=%s", uniqueid, len(data), mime, already)
+    replaced = existing is not None
+    log.info("call recording stored id=%s bytes=%d mime=%s replaced=%s", uniqueid, len(data), mime, replaced)
     return StoreResult("stored", sha256=sha, bytes=len(data), mime=mime,
-                       storage_key=key, already_stored=already)
+                       storage_key=key, already_stored=False, replaced=replaced or None)

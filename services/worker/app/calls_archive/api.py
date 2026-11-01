@@ -6,6 +6,11 @@
 Called by workflow 12 after it downloads one recording from the PBX. Always
 200 with an `outcome` for anything about the bytes; 503 only when the bucket
 is not configured, so the run fails loudly instead of recording a fake result.
+
+The body is read as a stream and abandoned as soon as it passes the size cap,
+so a request without Content-Length cannot make the worker buffer an
+unbounded body. Hashing and the bucket's blocking HTTP calls run in a worker
+thread: the event loop keeps serving every other route meanwhile.
 """
 from __future__ import annotations
 
@@ -13,6 +18,7 @@ import logging
 import threading
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from starlette.concurrency import run_in_threadpool
 
 from ..media.s3 import S3Client, S3Config, StorageUnavailable
 from . import store as calls_store
@@ -40,6 +46,12 @@ def storage() -> S3Client:
     return _client
 
 
+def _store_one(uniqueid: str, day: str, data: bytearray, client: S3Client) -> dict:
+    """Runs in a worker thread. One upload at a time from this process."""
+    with _uploads:
+        return calls_store.store_recording(uniqueid, day, data, store=client).as_dict()
+
+
 def build_router(require_api_key) -> APIRouter:
     router = APIRouter(dependencies=[Depends(require_api_key)])
 
@@ -57,10 +69,13 @@ def build_router(require_api_key) -> APIRouter:
         if declared and declared.isdigit() and int(declared) > calls_store.MAX_BYTES:
             return {"outcome": "too_large", "bytes": int(declared), "uniqueid": uniqueid}
         client = storage()
-        data = await request.body()
-        with _uploads:
-            result = calls_store.store_recording(uniqueid, day, data, store=client)
-        out = result.as_dict()
+        data = bytearray()
+        async for chunk in request.stream():
+            data.extend(chunk)
+            if len(data) > calls_store.MAX_BYTES:
+                log.warning("call recording too large id=%s read=%d", uniqueid, len(data))
+                return {"outcome": "too_large", "bytes": len(data), "uniqueid": uniqueid}
+        out = await run_in_threadpool(_store_one, uniqueid, day, data, client)
         out["uniqueid"] = uniqueid
         log.info("call recording store id=%s outcome=%s bytes=%s", uniqueid, out["outcome"], out.get("bytes"))
         return out
