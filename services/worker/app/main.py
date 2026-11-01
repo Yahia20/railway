@@ -1049,3 +1049,9 @@ def conversation_page() -> HTMLResponse:
 
 app.include_router(media_api.build_router(require_api_key))
 app.include_router(media_reader.build_router(require_api_key))
+
+# Call recordings archive — workflow 12 hands over the bytes it downloaded from
+# the PBX; see app/calls_archive/.
+from .calls_archive import api as calls_archive_api  # noqa: E402
+
+app.include_router(calls_archive_api.build_router(require_api_key))

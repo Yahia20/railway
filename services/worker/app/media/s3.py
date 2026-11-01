@@ -64,29 +64,30 @@ class S3Config:
     url_style: str = "virtual"   # or "path"
 
     @classmethod
-    def from_env(cls) -> "S3Config":
+    def from_env(cls, prefix: str = "S3_") -> "S3Config":
         """Read the bucket's credentials. Railway exposes them as BUCKET,
         ACCESS_KEY_ID, SECRET_ACCESS_KEY, ENDPOINT and REGION on the bucket;
         the worker receives them as S3_* through variable references so the
-        names cannot collide with anything else in its environment."""
-        values = {
-            "S3_ENDPOINT": os.getenv("S3_ENDPOINT", "").strip(),
-            "S3_BUCKET": os.getenv("S3_BUCKET", "").strip(),
-            "S3_ACCESS_KEY_ID": os.getenv("S3_ACCESS_KEY_ID", "").strip(),
-            "S3_SECRET_ACCESS_KEY": os.getenv("S3_SECRET_ACCESS_KEY", "").strip(),
-        }
+        names cannot collide with anything else in its environment.
+
+        `prefix` selects which bucket: S3_* is chat-media (the default, and
+        the only one before 2026-11-01); CALLS_S3_* is call-recordings, a
+        separate bucket so call audio and chat files never share keys or
+        credentials."""
+        names = {k: prefix + k for k in ("ENDPOINT", "BUCKET", "ACCESS_KEY_ID", "SECRET_ACCESS_KEY")}
+        values = {names[k]: os.getenv(names[k], "").strip() for k in names}
         missing = sorted(k for k, v in values.items() if not v)
         if missing:
             raise StorageUnavailable("missing required environment variables: " + ", ".join(missing))
-        style = (os.getenv("S3_URL_STYLE") or "virtual").strip().lower()
+        style = (os.getenv(prefix + "URL_STYLE") or "virtual").strip().lower()
         if style not in ("virtual", "path"):
-            raise StorageUnavailable("S3_URL_STYLE must be 'virtual' or 'path'")
+            raise StorageUnavailable(prefix + "URL_STYLE must be 'virtual' or 'path'")
         return cls(
-            endpoint=values["S3_ENDPOINT"].rstrip("/"),
-            bucket=values["S3_BUCKET"],
-            access_key_id=values["S3_ACCESS_KEY_ID"],
-            secret_access_key=values["S3_SECRET_ACCESS_KEY"],
-            region=(os.getenv("S3_REGION") or "auto").strip(),
+            endpoint=values[names["ENDPOINT"]].rstrip("/"),
+            bucket=values[names["BUCKET"]],
+            access_key_id=values[names["ACCESS_KEY_ID"]],
+            secret_access_key=values[names["SECRET_ACCESS_KEY"]],
+            region=(os.getenv(prefix + "REGION") or "auto").strip(),
             url_style=style,
         )
 
