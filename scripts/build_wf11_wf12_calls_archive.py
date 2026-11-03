@@ -118,8 +118,10 @@ up AS (
 -- under fetch_min_duration_seconds cannot hold a conversation worth keeping,
 -- so it is indexed but never downloaded. Duration, not `talk`: the PBX's talk
 -- counter is wrong for queue calls (it counts the first ringing agent's leg),
--- so 51 of the first 149 recordings had talk < 20 s yet minutes of real audio.
--- A call re-seen later with a longer duration is queued then.
+-- so 46 of the first 149 recordings had talk < 20 s yet >= 20 s of real speech
+-- (WebRTC VAD). A call re-seen later with a longer duration is queued then,
+-- and a job inserted by hand is always downloaded: only this INSERT applies
+-- the rule, the claim in wf12 does not re-check it.
 jobs AS (
   INSERT INTO call_recording_jobs (uniqueid)
   SELECT uniqueid FROM up
@@ -155,8 +157,7 @@ WITH cfg AS (
          max(value) FILTER (WHERE key = 'pbx_api_key')             AS api_key,
          max(value) FILTER (WHERE key = 'fetch_window_start')::int AS ws,
          max(value) FILTER (WHERE key = 'fetch_window_end')::int   AS we,
-         coalesce(max(value) FILTER (WHERE key = 'max_attempts')::int, 5) AS max_attempts,
-         coalesce(max(value) FILTER (WHERE key = 'fetch_min_duration_seconds')::int, 30) AS min_duration
+         coalesce(max(value) FILTER (WHERE key = 'max_attempts')::int, 5) AS max_attempts
   FROM call_archive_config
 ),
 gate AS (
@@ -186,9 +187,6 @@ picked AS (
     AND j.status IN ('pending', 'retry_wait')
     AND j.attempts < (SELECT max_attempts FROM cfg)
     AND j.next_attempt_at <= now()
-    AND EXISTS (SELECT 1 FROM call_log l
-                WHERE l.uniqueid = j.uniqueid
-                  AND coalesce(l.duration_seconds, 0) >= (SELECT min_duration FROM cfg))
   ORDER BY j.next_attempt_at, j.uniqueid
   LIMIT 1
   FOR UPDATE SKIP LOCKED
