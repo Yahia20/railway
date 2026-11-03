@@ -112,13 +112,23 @@ up AS (
     ended_by_agent   = EXCLUDED.ended_by_agent,
     recording_file   = coalesce(EXCLUDED.recording_file, call_log.recording_file),
     recording_path   = coalesce(EXCLUDED.recording_path, call_log.recording_path)
-  RETURNING uniqueid, recording_file, (xmax = 0) AS inserted
+  RETURNING uniqueid, recording_file, duration_seconds, (xmax = 0) AS inserted
 ),
+-- TOO SHORT TO MATTER (owner, 2026-11-03): a call whose whole duration is
+-- under fetch_min_duration_seconds cannot hold a conversation worth keeping,
+-- so it is indexed but never downloaded. Duration, not `talk`: the PBX's talk
+-- counter is wrong for queue calls (it counts the first ringing agent's leg),
+-- so 46 of the first 149 recordings had talk < 20 s yet >= 20 s of real speech
+-- (WebRTC VAD). A call re-seen later with a longer duration is queued then,
+-- and a job inserted by hand is always downloaded: only this INSERT applies
+-- the rule, the claim in wf12 does not re-check it.
 jobs AS (
   INSERT INTO call_recording_jobs (uniqueid)
   SELECT uniqueid FROM up
   WHERE recording_file IS NOT NULL
     AND uniqueid ~ '^[0-9]{6,12}[.][0-9]{1,9}$'   -- the worker's object-key rule
+    AND coalesce(duration_seconds, 0) >= coalesce(
+          (SELECT value::int FROM call_archive_config WHERE key = 'fetch_min_duration_seconds'), 30)
   ON CONFLICT (uniqueid) DO NOTHING
   RETURNING uniqueid
 )
