@@ -112,13 +112,21 @@ up AS (
     ended_by_agent   = EXCLUDED.ended_by_agent,
     recording_file   = coalesce(EXCLUDED.recording_file, call_log.recording_file),
     recording_path   = coalesce(EXCLUDED.recording_path, call_log.recording_path)
-  RETURNING uniqueid, recording_file, (xmax = 0) AS inserted
+  RETURNING uniqueid, recording_file, duration_seconds, (xmax = 0) AS inserted
 ),
+-- TOO SHORT TO MATTER (owner, 2026-11-03): a call whose whole duration is
+-- under fetch_min_duration_seconds cannot hold a conversation worth keeping,
+-- so it is indexed but never downloaded. Duration, not `talk`: the PBX's talk
+-- counter is wrong for queue calls (it counts the first ringing agent's leg),
+-- so 51 of the first 149 recordings had talk < 20 s yet minutes of real audio.
+-- A call re-seen later with a longer duration is queued then.
 jobs AS (
   INSERT INTO call_recording_jobs (uniqueid)
   SELECT uniqueid FROM up
   WHERE recording_file IS NOT NULL
     AND uniqueid ~ '^[0-9]{6,12}[.][0-9]{1,9}$'   -- the worker's object-key rule
+    AND coalesce(duration_seconds, 0) >= coalesce(
+          (SELECT value::int FROM call_archive_config WHERE key = 'fetch_min_duration_seconds'), 30)
   ON CONFLICT (uniqueid) DO NOTHING
   RETURNING uniqueid
 )
@@ -147,7 +155,8 @@ WITH cfg AS (
          max(value) FILTER (WHERE key = 'pbx_api_key')             AS api_key,
          max(value) FILTER (WHERE key = 'fetch_window_start')::int AS ws,
          max(value) FILTER (WHERE key = 'fetch_window_end')::int   AS we,
-         coalesce(max(value) FILTER (WHERE key = 'max_attempts')::int, 5) AS max_attempts
+         coalesce(max(value) FILTER (WHERE key = 'max_attempts')::int, 5) AS max_attempts,
+         coalesce(max(value) FILTER (WHERE key = 'fetch_min_duration_seconds')::int, 30) AS min_duration
   FROM call_archive_config
 ),
 gate AS (
@@ -177,6 +186,9 @@ picked AS (
     AND j.status IN ('pending', 'retry_wait')
     AND j.attempts < (SELECT max_attempts FROM cfg)
     AND j.next_attempt_at <= now()
+    AND EXISTS (SELECT 1 FROM call_log l
+                WHERE l.uniqueid = j.uniqueid
+                  AND coalesce(l.duration_seconds, 0) >= (SELECT min_duration FROM cfg))
   ORDER BY j.next_attempt_at, j.uniqueid
   LIMIT 1
   FOR UPDATE SKIP LOCKED
