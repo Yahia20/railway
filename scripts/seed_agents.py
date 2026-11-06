@@ -26,10 +26,16 @@ ROSTER FORMAT — {"<bitrix_user_id>": {"name": str, "is_bot": bool}}:
       "20114": {"name": "Qualification Bot", "is_bot": true}
     }
 
-`is_bot` is the only flag that matters and it is not cosmetic: it is what keeps
-an automation out of `v_agent_scorecard`, and what makes 01d relabel its turns
-so its text never reaches the judge as agent speech. Set it for anything that
-posts into a thread without a person typing.
+`is_bot` is not cosmetic: it is what keeps an automation out of
+`v_agent_scorecard`, and what makes 01d relabel its turns so its text never
+reaches the judge as agent speech. Set it for anything that posts into a thread
+without a person typing.
+
+`qa_excluded` (034) keeps an account's chats out of the v6 QA scorecard
+(owner decision 2026-10-17: leaders and staff who do not sell). Unlike is_bot it
+follows the roster both ways, because only the roster ever sets it:
+
+      "123": {"name": "Team Leader", "qa_excluded": true}
 """
 from __future__ import annotations
 
@@ -57,12 +63,14 @@ def main() -> int:
             print(f"  skip {uid}: no name")
             continue
         is_bot = bool(v.get("is_bot")) if isinstance(v, dict) else False
-        rows.append((str(uid), name, is_bot, not is_bot))
+        qa_excluded = bool(v.get("qa_excluded")) if isinstance(v, dict) else False
+        rows.append((str(uid), name, is_bot, not is_bot, qa_excluded))
 
     bots = [r[0] for r in rows if r[2]]
     print(f"roster        : {args.roster}")
     print(f"people        : {len(rows) - len(bots)}")
     print(f"automations   : {len(bots)}  (ids {', '.join(bots) or 'none'})")
+    print(f"QA excluded   : {sum(1 for r in rows if r[4])}")
     if not args.apply:
         print("\nCHECK ONLY — nothing written. Re-run with --apply.")
         return 0
@@ -80,8 +88,8 @@ def main() -> int:
             # whole cost, and ON CONFLICT keeps it re-runnable.
             cur.executemany(
                 """
-                INSERT INTO agents (bitrix_user_id, full_name, is_bot, is_active)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO agents (bitrix_user_id, full_name, is_bot, is_active, qa_excluded)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (bitrix_user_id) DO UPDATE
                    SET full_name  = EXCLUDED.full_name,
                        -- is_bot only ever goes ON, never off. A roster
@@ -93,6 +101,7 @@ def main() -> int:
                        --   UPDATE agents SET is_bot = false WHERE ...
                        is_bot     = agents.is_bot OR EXCLUDED.is_bot,
                        is_active  = NOT (agents.is_bot OR EXCLUDED.is_bot),
+                       qa_excluded = EXCLUDED.qa_excluded,
                        updated_at = now()
                 """,
                 rows,

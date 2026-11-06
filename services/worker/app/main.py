@@ -704,6 +704,46 @@ def qa_evaluate(req: QAEvaluateRequest) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# QA scorecard v6 (app/qa/v6), approved 2026-11-05. Workflow 13 claims a chat,
+# calls this, and stores what comes back.
+#
+# A FAILED GRADE IS A 200 WITH NO `gradeable`. The readings that did come back
+# were paid for, and rule 12 says every paid call lands in model_calls; a 502
+# would take their rows with it. Workflow 13 decides by the TYPE of
+# `gradeable` (gotcha 15): absent means failed, an attempt spent.
+# ---------------------------------------------------------------------------
+
+def _bitrix_or_none():
+    """Bitrix for the assignment time and call records, or None when it is not configured. The grade goes on
+    without them: the scorecard treats a missing assignment time as unknown, not as zero."""
+    try:
+        settings.validate_for("chats")
+    except RuntimeError:
+        return None
+    from .sources.bitrix_chats import BitrixRestSource
+    return BitrixRestSource(portal_domain=settings.bitrix_portal_domain,
+                            webhook_token=settings.bitrix_webhook_token,
+                            user_id=settings.bitrix_webhook_user_id)
+
+
+@app.post("/qa/v6/evaluate", dependencies=[Depends(require_api_key)])
+def qa_v6_evaluate(req: QAEvaluateRequest) -> dict:
+    from .qa.engine import NotGradeable
+    from .qa.v6 import engine as v6
+
+    try:
+        result = v6.evaluate(req.interaction_id, bitrix=_bitrix_or_none())
+    except NotGradeable as exc:
+        return {"gradeable": False, "interaction_id": req.interaction_id, "reason": str(exc)}
+    except db.DatabaseUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    except judge.JudgeError as exc:
+        return {"interaction_id": req.interaction_id, "error": {"message": str(exc)[:500]},
+                "calls": getattr(exc, "calls", [])}
+    return {"gradeable": True, **result}
+
+
+# ---------------------------------------------------------------------------
 # The Customer 360 console (/dashboard). Like /report: the page and its
 # assets hold no data and no key; the page asks for WORKER_API_KEY and calls
 # the keyed routes below, which read the database live (app/dashboard.py).
