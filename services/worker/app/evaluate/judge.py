@@ -176,6 +176,25 @@ def _extract_json(text: str) -> dict:
         raise JudgeError(f"model did not return valid JSON: {exc}; got {cleaned[:300]!r}") from exc
 
 
+def _extract_first_json(text: str) -> dict:
+    """The first JSON object in a reply sent without JSON mode (v6 alerts).
+
+    With thinking on and no response_format, the object can come inside a fence
+    or with a word after it. Only that is tolerated: the object itself must parse.
+    """
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip())
+    start = cleaned.find("{")
+    if start < 0:
+        raise JudgeError(f"model returned no JSON object; got {cleaned[:300]!r}")
+    try:
+        value, _ = json.JSONDecoder().raw_decode(cleaned[start:])
+    except json.JSONDecodeError as exc:
+        raise JudgeError(f"model did not return valid JSON: {exc}; got {cleaned[:300]!r}") from exc
+    if not isinstance(value, dict):
+        raise JudgeError("model returned JSON that is not an object")
+    return value
+
+
 def _hash_input(*parts: str) -> str:
     h = hashlib.sha256()
     for p in parts:
@@ -252,13 +271,19 @@ class DeepSeekClient:
 
     def complete_json(self, prompt: str, temperature: float = 0.0,
                       max_tokens: int = 8000, retries: int = 3,
-                      system: str | None = None) -> tuple[dict, dict]:
+                      system: str | None = None,
+                      follow_up: list[dict] | None = None,
+                      json_mode: bool = True) -> tuple[dict, dict]:
         # 8000 is a mitigation for long calls whose pass-2 JSON overran 4096
         # and died truncated 3/3; the real fix is segmenting long transcripts.
         # `system` is for the QA scorecard (app/qa), whose approved request is
         # a system prompt plus the chat as the user turn. Pass 1 and pass 2
         # never set it, so their request is byte-for-byte what it was.
-        messages = [{"role": "user", "content": prompt}]
+        # `follow_up` (v6) appends turns after the chat: the one re-copy request
+        # when a quote was not found where the model said. `json_mode=False`
+        # (v6 alerts) sends no response_format, as the trial did with thinking
+        # on, and takes the first JSON object in the reply.
+        messages = [{"role": "user", "content": prompt}, *(follow_up or [])]
         if system is not None:
             messages.insert(0, {"role": "system", "content": system})
         body = {
@@ -281,6 +306,8 @@ class DeepSeekClient:
             # Non-DeepSeek endpoint: the field is DeepSeek-specific and some
             # providers 400 on parameters they do not know.
             del body["thinking"]
+        if not json_mode:
+            del body["response_format"]
         if self.reasoning_effort:
             body["reasoning"] = {"effort": self.reasoning_effort}
         last: Exception | None = None
@@ -342,7 +369,7 @@ class DeepSeekClient:
                         "model returned no content (finish_reason="
                         f"{data['choices'][0].get('finish_reason')!r}; likely the "
                         "whole max_tokens budget went to hidden reasoning)")
-                return _extract_json(content), usage
+                return (_extract_json(content) if json_mode else _extract_first_json(content)), usage
             except (httpx.HTTPError, KeyError, JudgeError) as exc:
                 last = exc
                 if attempt < retries - 1:

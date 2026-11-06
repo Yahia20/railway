@@ -1,0 +1,519 @@
+{
+  "name": "13 · Chat QA scorecard v6",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/10 23,0-3 * * *"
+            }
+          ]
+        }
+      },
+      "name": "Every 10 min, 23:00-04:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "Asia/Riyadh (settings.timezone). 23:00-03:59 local is entirely outside DeepSeek's peak (01-04 and 06-10 UTC), which halves the bill, and it ends before 04:00.",
+      "id": "wf13-01"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORKER_URL }}/budget/preflight",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ providers: [\"deepseek\"] }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "name": "Check budget",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "id": "wf13-02"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: pipeline-wide state, not per-job work; the same single write\n-- path into provider_status that 01d uses (the worker probes, n8n writes).\nINSERT INTO provider_status\n  (provider, checked_at, available, reason, balance_usd, spend_mtd_usd, raw)\nSELECT e.key, now(),\n       (e.value->>'available')::boolean,\n       e.value->>'reason',\n       nullif(e.value->>'balance_usd', '')::numeric,\n       nullif(e.value->>'spend_mtd_usd', '')::numeric,\n       coalesce(e.value->'raw', '{}'::jsonb)\n  FROM jsonb_each($1::jsonb) AS e\nON CONFLICT (provider) DO UPDATE\n   SET checked_at = EXCLUDED.checked_at, available = EXCLUDED.available,\n       reason = EXCLUDED.reason, balance_usd = EXCLUDED.balance_usd,\n       spend_mtd_usd = EXCLUDED.spend_mtd_usd, raw = EXCLUDED.raw\nRETURNING provider, available;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.providers || {}) ] }}"
+        }
+      },
+      "name": "Record provider status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf13-03"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- multi-item: a plain read of one row.\n-- A SEPARATE statement so it sees the balance just written. v_qa6_gate (034) is\n-- every money rule of v_qa_gate on v6's own switch, qa_config.v6_mode.\nSELECT mode, may_run, reason, balance_usd FROM v_qa6_gate;",
+        "options": {}
+      },
+      "name": "Read v6 gate",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf13-04"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "may-we-spend",
+              "leftValue": "={{ $json.may_run === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "May we spend?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        300
+      ],
+      "id": "wf13-05"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: a run log entry; nothing was claimed.\n-- 'skipped', not 'failed': no chat changed state, so the next tick picks the\n-- queue up exactly where it was.\nINSERT INTO job_runs (job_name, status, started_at, finished_at,\n                      items_in, items_ok, items_failed, error, detail)\nSELECT 'qa_chat_v6', 'skipped'::job_status, now(), now(),\n       (SELECT count(*) FROM v_qa6_grade_due), 0, 0, $1::text,\n       jsonb_build_object('gate', 'v_qa6_gate', 'reason', $1::text)\nRETURNING run_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Read v6 gate').first().json.reason || 'blocked' ] }}"
+        }
+      },
+      "name": "Log blocked run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        480
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf13-06"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: housekeeping on rows no run holds.\n-- The 90-day purge blanks a conversation's text. The masked transcript, the\n-- model answers and the alerts' explanations are that same text, so they go.\n-- The score, the checks (statuses and line NUMBERS) and the loss reason stay:\n-- they are facts about the agent, not the customer's words.\nWITH gone AS (\n  UPDATE qa_grades_v6 g\n     SET transcript = NULL, answers = NULL,\n         result = (g.result - 'alerts') || '{\"purged\": true}'::jsonb,\n         updated_at = now()\n  FROM interactions i\n  WHERE i.interaction_id = g.interaction_id\n    AND i.content_purged_at IS NOT NULL\n    AND g.result IS NOT NULL AND NOT g.result ? 'purged'\n  RETURNING g.interaction_id)\nSELECT count(*)::int AS blanked FROM gone;",
+        "options": {}
+      },
+      "name": "Retention",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf13-07"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- fence-exempt: this statement IS the claim. INSERT ... ON CONFLICT DO UPDATE\n-- locks the conflicting row and evaluates the WHERE below on its current\n-- version, so two ticks cannot both take the same chat.\n-- Up to qa_config.v6_batch due chats, oldest first, each with a fresh token.\n-- The deal's stage is stamped AT CLAIM: a chat answered \"not gradeable\" must\n-- still record which stage it was judged at, or the queue would offer it again\n-- every tick.\nINSERT INTO qa_grades_v6 (interaction_id, status, claimed_at, claim_token, deal_stage)\nSELECT d.interaction_id, 'claimed', now(), gen_random_uuid(), d.deal_stage\n  FROM v_qa6_grade_due d\n ORDER BY d.started_at\n LIMIT (SELECT value::int FROM qa_config WHERE key = 'v6_batch')\nON CONFLICT (interaction_id) DO UPDATE\n   SET status = 'claimed', claimed_at = now(), claim_token = EXCLUDED.claim_token,\n       deal_stage = EXCLUDED.deal_stage, updated_at = now()\n WHERE (qa_grades_v6.status = 'claimed'\n        AND qa_grades_v6.claimed_at < now() - interval '30 minutes')\n    OR (qa_grades_v6.status = 'failed' AND qa_grades_v6.attempts < 3\n        AND qa_grades_v6.updated_at < now() - interval '1 hour')\n    OR qa_grades_v6.status IN ('scored', 'not_gradeable')\nRETURNING interaction_id::text, claim_token::text;",
+        "options": {}
+      },
+      "name": "Claim chats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1320,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf13-08"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "claimed-one",
+              "leftValue": "={{ typeof $json.claim_token === 'string' && $json.claim_token.length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Claimed one?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1540,
+        300
+      ],
+      "id": "wf13-09"
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "name": "Each chat",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1760,
+        300
+      ],
+      "id": "wf13-10"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORKER_URL }}/qa/v6/evaluate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ interaction_id: $json.interaction_id }) }}",
+        "options": {
+          "timeout": 280000
+        }
+      },
+      "name": "Grade through worker",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "notes": "Three DeepSeek readings and the alerts call in parallel inside the worker: ~60-90 s. onError continues so a timeout becomes a recorded failure with an attempt spent, never a lost claim.",
+      "id": "wf13-11"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Store one answer, FENCED on the claim token: an answer whose claim was taken\n-- over by a later tick matches nothing and changes nothing.\n-- multi-item: one worker answer per item, each paired with its own claim.\n-- The outcome is decided by the TYPE of `gradeable` (gotcha 15): a timeout or a\n-- failed grade has no `gradeable` at all and is recorded as a failure with an\n-- attempt spent, never read as a grade.\nWITH r AS (SELECT $1::jsonb AS j, $2::uuid AS id, $3::uuid AS tok),\no AS (\n  SELECT r.*, CASE WHEN jsonb_typeof(j->'gradeable') = 'boolean'\n                    AND (j->>'gradeable')::boolean           THEN 'scored'\n                   WHEN jsonb_typeof(j->'gradeable') = 'boolean' THEN 'not_gradeable'\n                   ELSE 'failed' END AS outcome\n  FROM r),\nowned AS MATERIALIZED (\n  SELECT q.interaction_id\n  FROM qa_grades_v6 q, o\n  WHERE q.interaction_id = o.id AND q.claim_token = o.tok AND q.status = 'claimed'\n  FOR UPDATE OF q),\ns AS (SELECT o.*, (o.outcome = 'scored') AS ok FROM o)\nUPDATE qa_grades_v6 q SET\n  status                = s.outcome,\n  agent_id              = CASE WHEN s.ok THEN (s.j->>'agent_id')::uuid ELSE q.agent_id END,\n  employee              = CASE WHEN s.ok THEN s.j->>'employee' ELSE q.employee END,\n  attribution           = CASE WHEN s.ok THEN s.j->>'attribution' END,\n  deal_stage            = coalesce(CASE WHEN s.ok THEN s.j->>'deal_stage' END, q.deal_stage),\n  outcome               = CASE WHEN s.ok THEN s.j->>'outcome' END,\n  prompt_version        = CASE WHEN s.ok THEN s.j->>'prompt_version' END,\n  alerts_prompt_version = CASE WHEN s.ok THEN s.j->>'alerts_prompt_version' END,\n  engine_version        = CASE WHEN s.ok THEN s.j->>'engine_version' END,\n  model                 = CASE WHEN s.ok THEN s.j->>'model' END,\n  votes                 = CASE WHEN s.ok THEN (s.j->>'votes')::smallint END,\n  score                 = CASE WHEN s.ok THEN (s.j->>'score')::smallint END,\n  earned                = CASE WHEN s.ok THEN (s.j->>'earned')::numeric END,\n  total                 = CASE WHEN s.ok THEN (s.j->>'total')::numeric END,\n  chat_type             = CASE WHEN s.ok THEN s.j->>'chat_type' END,\n  title                 = CASE WHEN s.ok THEN s.j->>'title' END,\n  loss_reason           = CASE WHEN s.ok THEN s.j->>'loss_reason' END,\n  reviews_open          = CASE WHEN s.ok THEN (s.j->>'reviews_open')::smallint END,\n  result                = CASE WHEN s.ok THEN s.j->'result' END,\n  transcript            = CASE WHEN s.ok THEN s.j->'transcript' END,\n  answers               = CASE WHEN s.ok THEN s.j->'answers' END,\n  observed_at           = CASE WHEN s.ok THEN (s.j->>'observed_at')::timestamp END,\n  cost_usd              = (s.j->>'cost_usd')::numeric,\n  reason                = CASE s.outcome WHEN 'not_gradeable' THEN s.j->>'reason'\n                                         WHEN 'failed' THEN left(coalesce(s.j->'error'->>'message', s.j::text), 500)\n                          END,\n  attempts              = CASE WHEN s.outcome = 'failed' THEN q.attempts + 1 ELSE 0 END,\n  evaluated_at          = CASE WHEN s.outcome = 'failed' THEN q.evaluated_at ELSE now() END,\n  claim_token           = NULL,\n  updated_at            = now()\nFROM s, owned\nWHERE q.interaction_id = owned.interaction_id\nRETURNING q.interaction_id::text, q.status;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json), $('Each chat').item.json.interaction_id, $('Each chat').item.json.claim_token ] }}"
+        }
+      },
+      "name": "Store result",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2200,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true,
+      "id": "wf13-12"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: the money was spent whether or not this claim still owns the\n-- chat, and rule 12 says every judge call lands in model_calls. A failed grade\n-- carries the calls that did come back, so they are stored too; UNIQUE below\n-- makes a re-store a no-op.\n-- multi-item: one worker answer per item.\nWITH c AS (SELECT jsonb_array_elements(coalesce($1::jsonb->'calls', '[]'::jsonb)) AS x),\nins AS (\n  INSERT INTO model_calls (interaction_id, purpose, provider, model, prompt_version, input_hash,\n                           prompt_tokens, output_tokens, cached_tokens, cost_usd, priced_at_peak,\n                           latency_ms, succeeded, error)\n  SELECT $2::uuid, x->>'purpose', x->>'provider', x->>'model', x->>'prompt_version',\n         x->>'input_hash', (x->>'prompt_tokens')::int, (x->>'output_tokens')::int,\n         (x->>'cached_tokens')::int, (x->>'cost_usd')::numeric,\n         (x->>'priced_at_peak')::boolean, (x->>'latency_ms')::int,\n         coalesce((x->>'succeeded')::boolean, true), x->>'error'\n    FROM c\n  ON CONFLICT (purpose, input_hash, prompt_version) DO NOTHING\n  RETURNING call_id)\nSELECT count(*)::int AS calls_stored FROM ins;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('Grade through worker').item.json), $('Each chat').item.json.interaction_id ] }}"
+        }
+      },
+      "name": "Store model calls",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2420,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Reads the worker answer by node name: after a Postgres node $json is that node's own result (gotcha 5).",
+      "id": "wf13-13"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: a run log entry written once the loop is done.\nINSERT INTO job_runs (job_name, status, started_at, finished_at,\n                      items_in, items_ok, items_failed, cost_usd, detail)\nSELECT 'qa_chat_v6', 'succeeded'::job_status, now(), now(),\n       count(*) FILTER (WHERE updated_at > now() - interval '15 minutes'),\n       count(*) FILTER (WHERE status IN ('scored', 'not_gradeable')\n                          AND updated_at > now() - interval '15 minutes'),\n       count(*) FILTER (WHERE status = 'failed' AND updated_at > now() - interval '15 minutes'),\n       sum(cost_usd) FILTER (WHERE updated_at > now() - interval '15 minutes'),\n       jsonb_build_object('due_left', (SELECT count(*) FROM v_qa6_grade_due))\n  FROM qa_grades_v6\nRETURNING run_id;",
+        "options": {}
+      },
+      "name": "Log run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1980,
+        440
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf13-14"
+    }
+  ],
+  "connections": {
+    "Every 10 min, 23:00-04:00": {
+      "main": [
+        [
+          {
+            "node": "Check budget",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check budget": {
+      "main": [
+        [
+          {
+            "node": "Record provider status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record provider status": {
+      "main": [
+        [
+          {
+            "node": "Read v6 gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read v6 gate": {
+      "main": [
+        [
+          {
+            "node": "May we spend?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "May we spend?": {
+      "main": [
+        [
+          {
+            "node": "Retention",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log blocked run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retention": {
+      "main": [
+        [
+          {
+            "node": "Claim chats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim chats": {
+      "main": [
+        [
+          {
+            "node": "Claimed one?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claimed one?": {
+      "main": [
+        [
+          {
+            "node": "Each chat",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Each chat": {
+      "main": [
+        [
+          {
+            "node": "Log run",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Grade through worker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Grade through worker": {
+      "main": [
+        [
+          {
+            "node": "Store result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store result": {
+      "main": [
+        [
+          {
+            "node": "Store model calls",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store model calls": {
+      "main": [
+        [
+          {
+            "node": "Each chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Riyadh",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true,
+    "executionTimeout": 540
+  }
+}
