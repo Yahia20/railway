@@ -319,11 +319,13 @@ the trial had leaked), two deals reopened since and one chat that grew. Two
 chats graded end to end on live DeepSeek and Bitrix gave the trial's scores
 (94, 100) for $0.0094.
 
-To go live: apply 034, add `qa_excluded` / new names to the roster and run
-`scripts/seed_agents.py --apply`, deploy the worker,
-`python scripts/n8n_deploy.py 13 --activate`, then
-`UPDATE qa_config SET value = 'on' WHERE key = 'v6_mode';` (first night
-`v6_batch` = 4 and read the results in the morning).
+**LIVE since 2026-11-06** (PR #4): 034 applied, roster seeded (3 accounts
+`qa_excluded`), worker deployed, workflow 13 = `Iwq9fkb31KQaLEaW` active,
+`v6_mode = 'on'`, `v6_since = 2026-11-01` (42 chats due at switch-on). One
+chat graded through the deployed worker before switch-on: 22 s, 3 readings +
+alerts, Bitrix read, $0.0029. First scheduled run: 23:00 Riyadh that night.
+Off switch: `UPDATE qa_config SET value = 'off' WHERE key = 'v6_mode';`.
+The first two weeks are coaching only, by the owner's choice.
 
 ### The judge reports observations, not scores — `pass2-agent-quality-v7`
 
@@ -383,6 +385,7 @@ what counts as persuasion. Expect more, and add them there.
 | live | **01c** chats store-only | `H7r5YWGJ3nNVA99Z` | every Bitrix message, ~1,300/day |
 | live | **01d** chat scoring | `P1zSFsw16wmV28YF` | every 10 min, 23:00–03:59 |
 | live | **04** housekeeping | `z60SxzoYmKOLsH4S` | 03:20 daily |
+| live | **13** chat QA scorecard v6 | `Iwq9fkb31KQaLEaW` | every 10 min, 23:00–03:59 (`qa_config.v6_mode`) |
 | live | **03** identity + promises | `sUnNPv6Ucye6Gsii` | 03:40 daily |
 | built, not deployed | **09** chat media archive | — | every minute, idle while `media_archive_config.mode = 'off'` |
 
@@ -834,8 +837,8 @@ python scripts/simulate_conversation.py <id> --webhook  # POST at live n8n
 ```
 db/migrations/         001-030 APPLIED to Railway (verified 2026-10-07); 031 (v4
                        scorecard, qa_grades, spend per provider) written 2026-10-11.
-                       032-033 calls archive (M. Amin). 034 v6 scorecard, written
-                       2026-11-06, NOT applied yet.
+                       032-033 calls archive (M. Amin). 034 v6 scorecard,
+                       APPLIED and switched on 2026-11-06.
                        023 removed the calls lane; 024 linked deals to
                        customers; 025 retention without transcripts; 026 chat
                        media archive; 027 customer names; 028 deal-title noise;
