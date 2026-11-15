@@ -22,6 +22,7 @@ from starlette.concurrency import run_in_threadpool
 
 from ..media.s3 import S3Client, S3Config, StorageUnavailable
 from . import store as calls_store
+from .attribution import reduce_journey
 
 log = logging.getLogger("worker.calls")
 
@@ -79,5 +80,27 @@ def build_router(require_api_key) -> APIRouter:
         out["uniqueid"] = uniqueid
         log.info("call recording store id=%s outcome=%s bytes=%s", uniqueid, out["outcome"], out.get("bytes"))
         return out
+
+    @router.post("/calls/journeys/reduce")
+    def calls_journeys_reduce(body: dict) -> dict:
+        """Workflow 14: reduce each fetched PBX journey to who answered.
+
+        body: {"calls": [{"uniqueid": "...", "status": 200, "body": {...journey...}}]}
+        A call whose PBX request failed comes back as `error`, so n8n can retry
+        it rather than record a verdict about a response it never got.
+        """
+        calls = body.get("calls")
+        if not isinstance(calls, list) or len(calls) > 100:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "calls must be a list of at most 100")
+        out = []
+        for c in calls:
+            if not isinstance(c, dict) or not isinstance(c.get("uniqueid"), str):
+                continue
+            ok = c.get("status") == 200 and isinstance(c.get("body"), dict)
+            if not ok:
+                out.append({"uniqueid": c["uniqueid"], "error": f"PBX answered {c.get('status')!r}"})
+                continue
+            out.append({"uniqueid": c["uniqueid"], **reduce_journey(c["body"])})
+        return {"calls": out}
 
     return router

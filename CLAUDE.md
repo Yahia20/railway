@@ -327,6 +327,34 @@ alerts, Bitrix read, $0.0029. First scheduled run: 23:00 Riyadh that night.
 Off switch: `UPDATE qa_config SET value = 'off' WHERE key = 'v6_mode';`.
 The first two weeks are coaching only, by the owner's choice.
 
+### 035–037 — the agent portal (`/portal`) and the calls lane, 2026-11-15
+
+The owner's request: every employee logs in and sees their own chats and calls,
+managers and team leaders see everyone, calls split into two channels, graded on
+the company's 16-item Call QA sheet. Money rule for building it: **10 USD in
+total**, only DeepSeek, Anthropic (Haiku) and the existing Railway. Plan and
+phase-0 measurements: `docs/agent-portal-phase0-2026-11-14.md`.
+
+| | |
+|---|---|
+| `/portal` (`app/portal/`) | Arabic RTL, roles agent / leader / manager. An agent is scoped **in SQL** to their own rows. Chats read `qa_grades_v6` (the `/dashboard` console still reads retired v4). Accounts: `scripts/portal_accounts.py` (44 created; list in `local-reports/portal-accounts-2026-11-15.csv`), then the portal's own "الحسابات" tab |
+| 035 | `portal_auth` schema. Two roles: `portal_auth_app` writes ONLY users/sessions/attempts/audit; `portal_reader` is SELECT-only and read-only. The scoring path stays read-only (rule 11). Their URLs are `PORTAL_*_DATABASE_URL` on the worker |
+| **who answered** (036) | `call_log.extension` is the FIRST leg that rang (ext 143 = 57% of calls). The PBX journey (`/api/call-log/journey?linkedid=`) has the ANSWER event; workflow 14 reads it, `attribution.py` reduces it. **The person is resolved live in `v_call_owner`** from `call_agent_mappings` (owner-approved 2026-11-15, applied by `scripts/seed_call_extensions.py` from `local-reports/call_extension_map.json`). Anything unproven has `agent_id` NULL and counts for the team only |
+| 17 PBX-only staff | added to `agents` with `team = 'calls'`, no Bitrix id: calls only |
+| `calls-audio` (`services/audio/`) | its own Railway service, app sleeping on, deployed with `railway up services/audio --path-as-root --service calls-audio`. Sortformer v2.1 + gap fill + faster-whisper large-v3-turbo (CPU). No credentials; handed a 10-minute URL by the worker |
+| `/calls/transcribe` | masks the words, asks which voice is the agent (Haiku if `ANTHROPIC_API_KEY` is set, else DeepSeek — recorded per call in `model_calls`), writes `stereo/yyyy/mm/dd/<id>.wav` (agent left) next to the recording |
+| `/calls/qa/evaluate` | three DeepSeek readings → `app/call_qa/scorecard.py`. Accuracy and procedure items stay `review` until there is an approved reference, so `assessed_weight` tops out at 82 |
+| 037 | `v_call_audio_due` (skips header-only WAVs), `v_call_grade_due`, and the two gates. Both respect `v_call_lane_spend` (model calls `call_*` + Railway compute at published rates) against `lifetime_cap_usd = 10` |
+| workflows | 14 `rF0q33jXo0ssaz7Y` (journeys, free), 15 `LTorr6ebWiSmMXzi` (transcribe), 16 `9WIaIPctnzkGiImt` (grade, 23:00–03:59) |
+
+**Switches**, all in `call_pipeline_config`: `journey_mode`, `audio_mode`,
+`grade_mode` (each ships `off`), `audio_batch`, `grade_batch`, `since`.
+
+**The 250 empty recordings are not ours to fix.** The PBX itself serves a
+44-byte header for calls nobody answered (BUSY / NO ANSWER / FAILED, no ANSWER
+event in the journey); the archive downloads them because their duration counts
+ring time. Nothing deleted; the audio queue skips them.
+
 ### The judge reports observations, not scores — `pass2-agent-quality-v7`
 
 v6 asked for a number per criterion and got `{"greeting": 18}` on a criterion

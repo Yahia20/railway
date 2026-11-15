@@ -1,0 +1,518 @@
+{
+  "name": "16 · Calls · grade (16-item sheet)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/10 23,0-3 * * *"
+            }
+          ]
+        }
+      },
+      "name": "Every 10 min, 23:00-04:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "Asia/Riyadh (settings.timezone). Outside DeepSeek's peak; ends before 04:00 (gotcha 14).",
+      "id": "wf16-01"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORKER_URL }}/budget/preflight",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ providers: [\"deepseek\"] }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "name": "Check budget",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "id": "wf16-02"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: pipeline-wide state, not per-job work; the same single write\n-- path into provider_status that 01d uses (the worker probes, n8n writes).\nINSERT INTO provider_status\n  (provider, checked_at, available, reason, balance_usd, spend_mtd_usd, raw)\nSELECT e.key, now(),\n       (e.value->>'available')::boolean,\n       e.value->>'reason',\n       nullif(e.value->>'balance_usd', '')::numeric,\n       nullif(e.value->>'spend_mtd_usd', '')::numeric,\n       coalesce(e.value->'raw', '{}'::jsonb)\n  FROM jsonb_each($1::jsonb) AS e\nON CONFLICT (provider) DO UPDATE\n   SET checked_at = EXCLUDED.checked_at, available = EXCLUDED.available,\n       reason = EXCLUDED.reason, balance_usd = EXCLUDED.balance_usd,\n       spend_mtd_usd = EXCLUDED.spend_mtd_usd, raw = EXCLUDED.raw\nRETURNING provider, available;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.providers || {}) ] }}"
+        }
+      },
+      "name": "Record provider status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf16-03"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- multi-item: a plain read of one row.\n-- A SEPARATE statement so it sees the balance just written.\nSELECT mode, may_run, reason, balance_usd FROM v_call_grade_gate;",
+        "options": {}
+      },
+      "name": "Read grade gate",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf16-04"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "may-we-spend",
+              "leftValue": "={{ $json.may_run === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "May we spend?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        300
+      ],
+      "id": "wf16-05"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: a run log entry; nothing was claimed.\nINSERT INTO job_runs (job_name, status, started_at, finished_at, items_in, items_ok, items_failed, error, detail)\nSELECT 'call_grade', 'skipped'::job_status, now(), now(),\n       (SELECT count(*) FROM v_call_grade_due), 0, 0, $1::text,\n       jsonb_build_object('gate', 'v_call_grade_gate', 'reason', $1::text)\nRETURNING run_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Read grade gate').first().json.reason || 'blocked' ] }}"
+        }
+      },
+      "name": "Log blocked run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        480
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf16-06"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: housekeeping on rows no run holds.\n-- 90 days after the call, the words go: transcript and the model's readings.\n-- The score, the items (statuses and segment NUMBERS) and the timings stay:\n-- they are facts about the agent, not the customer's words. The stereo file is\n-- left for the bucket's own lifecycle rule.\nWITH old AS (\n  SELECT j.uniqueid FROM call_processing_jobs j JOIN call_log l USING (uniqueid)\n  WHERE l.calldate_local < (now() AT TIME ZONE 'Asia/Riyadh') - interval '90 days'\n    AND j.content_purged_at IS NULL AND j.status NOT IN ('claimed', 'grading')),\njobs AS (\n  UPDATE call_processing_jobs j SET transcript = NULL, content_purged_at = now(), updated_at = now()\n  FROM old WHERE j.uniqueid = old.uniqueid RETURNING j.uniqueid),\ngrades AS (\n  UPDATE call_grades g SET answers = NULL,\n         critical_errors = (SELECT coalesce(jsonb_agg(e - 'reason'), '[]'::jsonb)\n                              FROM jsonb_array_elements(coalesce(g.critical_errors, '[]'::jsonb)) e)\n  FROM jobs WHERE g.uniqueid = jobs.uniqueid RETURNING g.uniqueid)\nSELECT (SELECT count(*) FROM jobs)::int AS blanked, (SELECT count(*) FROM grades)::int AS grades_blanked;",
+        "options": {}
+      },
+      "name": "Retention",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf16-07"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Claim up to grade_batch transcribed calls with a fresh token each.\n-- Lock first, then update (FOR UPDATE SKIP LOCKED), so two ticks never take the\n-- same call.\nWITH cand AS (\n  SELECT j.uniqueid FROM call_processing_jobs j\n  JOIN v_call_grade_due d USING (uniqueid)\n  ORDER BY d.calldate_local DESC\n  LIMIT (SELECT value::int FROM call_pipeline_config WHERE key = 'grade_batch')\n  FOR UPDATE OF j SKIP LOCKED)\nUPDATE call_processing_jobs j\n   SET status = 'grading', claim_token = gen_random_uuid(),\n       claim_until = now() + interval '15 minutes', attempts = j.attempts + 1, updated_at = now()\n  FROM cand WHERE j.uniqueid = cand.uniqueid\nRETURNING j.uniqueid, j.claim_token::text AS claim_token;",
+        "options": {}
+      },
+      "name": "Claim calls",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1320,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf16-08"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "claimed-one",
+              "leftValue": "={{ typeof $json.claim_token === 'string' && $json.claim_token.length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Claimed one?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1540,
+        300
+      ],
+      "id": "wf16-09"
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "name": "Each call",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1760,
+        300
+      ],
+      "id": "wf16-10"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORKER_URL }}/calls/qa/evaluate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ uniqueid: $json.uniqueid }) }}",
+        "options": {
+          "timeout": 280000
+        }
+      },
+      "name": "Grade through worker",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "id": "wf16-11"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Store one grade, FENCED on the claim token.\n-- multi-item: one worker answer per item, each paired with its own claim.\n-- `gradeable` must be a real boolean true (gotcha 15); anything else is a failed\n-- attempt that goes back to `transcribed` after a backoff, or to `failed`.\nWITH r AS (SELECT $1::jsonb AS j, $2::text AS uid, $3::uuid AS tok),\no AS (SELECT r.*, (jsonb_typeof(j->'gradeable') = 'boolean' AND (j->>'gradeable')::boolean) AS ok,\n             (SELECT value::int FROM call_pipeline_config WHERE key = 'max_attempts') AS max_attempts\n      FROM r),\nowned AS MATERIALIZED (\n  SELECT q.uniqueid FROM call_processing_jobs q, o\n  WHERE q.uniqueid = o.uid AND q.claim_token = o.tok AND q.status = 'grading'\n  FOR UPDATE OF q),\ngrade AS (\n  INSERT INTO call_grades (uniqueid, score, assessed_weight, reviews_open, items, critical_errors,\n                           answers, rubric_version, prompt_version, cost_usd, evaluated_at)\n  SELECT o.uid, (o.j->>'score')::numeric, (o.j->>'assessed_weight')::numeric,\n         coalesce((o.j->>'reviews_open')::smallint, 0), o.j->'items', o.j->'critical_errors',\n         o.j->'answers', o.j->>'rubric_version', o.j->>'prompt_version',\n         coalesce((o.j->>'cost_usd')::numeric, 0), now()\n  FROM o JOIN owned ON owned.uniqueid = o.uid WHERE o.ok\n  ON CONFLICT (uniqueid) DO UPDATE SET\n    score = EXCLUDED.score, assessed_weight = EXCLUDED.assessed_weight, reviews_open = EXCLUDED.reviews_open,\n    items = EXCLUDED.items, critical_errors = EXCLUDED.critical_errors, answers = EXCLUDED.answers,\n    rubric_version = EXCLUDED.rubric_version, prompt_version = EXCLUDED.prompt_version,\n    cost_usd = EXCLUDED.cost_usd, evaluated_at = EXCLUDED.evaluated_at\n  RETURNING uniqueid)\nUPDATE call_processing_jobs q SET\n  status = CASE WHEN o.ok THEN 'graded'\n                WHEN q.attempts >= o.max_attempts THEN 'failed' ELSE 'transcribed' END,\n  last_error = CASE WHEN o.ok THEN NULL ELSE left(coalesce(o.j->>'error', o.j::text), 400) END,\n  next_attempt_at = CASE WHEN o.ok THEN q.next_attempt_at\n                         ELSE now() + interval '1 hour' * power(2, least(q.attempts, 3)) END,\n  claim_token = NULL, claim_until = NULL, updated_at = now()\nFROM o, owned\nWHERE q.uniqueid = owned.uniqueid\nRETURNING q.uniqueid, q.status, (SELECT count(*) FROM grade) AS stored;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json), $('Each call').item.json.uniqueid, $('Each call').item.json.claim_token ] }}"
+        }
+      },
+      "name": "Store grade",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2200,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true,
+      "id": "wf16-12"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: the money was spent whether or not this claim still owns the\n-- call, and rule 12 says every model call lands in model_calls. UNIQUE makes a\n-- re-store a no-op. Calls have no interactions row, so interaction_id is NULL.\n-- multi-item: one worker answer per item.\nWITH c AS (SELECT jsonb_array_elements(coalesce($1::jsonb->'calls', '[]'::jsonb)) AS x),\nins AS (\n  INSERT INTO model_calls (interaction_id, purpose, provider, model, prompt_version, input_hash,\n                           prompt_tokens, output_tokens, cached_tokens, cost_usd, priced_at_peak,\n                           latency_ms, succeeded, error)\n  SELECT NULL, x->>'purpose', x->>'provider', x->>'model', x->>'prompt_version',\n         x->>'input_hash', (x->>'prompt_tokens')::int, (x->>'output_tokens')::int,\n         (x->>'cached_tokens')::int, (x->>'cost_usd')::numeric,\n         coalesce((x->>'priced_at_peak')::boolean, false), (x->>'latency_ms')::int,\n         coalesce((x->>'succeeded')::boolean, true), x->>'error'\n    FROM c\n  ON CONFLICT (purpose, input_hash, prompt_version) DO NOTHING\n  RETURNING call_id)\nSELECT count(*)::int AS calls_stored FROM ins;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('Grade through worker').item.json) ] }}"
+        }
+      },
+      "name": "Store model calls",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2420,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Reads the worker answer by node name (gotcha 5).",
+      "id": "wf16-13"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: a run log entry written once the loop is done.\nINSERT INTO job_runs (job_name, status, started_at, finished_at, items_in, items_ok, items_failed, cost_usd, detail)\nSELECT 'call_grade', 'succeeded'::job_status, now(), now(),\n       count(*) FILTER (WHERE j.updated_at > now() - interval '15 minutes'),\n       count(*) FILTER (WHERE j.status = 'graded' AND j.updated_at > now() - interval '15 minutes'),\n       count(*) FILTER (WHERE j.status = 'failed' AND j.updated_at > now() - interval '15 minutes'),\n       (SELECT sum(cost_usd) FROM call_grades WHERE evaluated_at > now() - interval '15 minutes'),\n       jsonb_build_object('due_left', (SELECT count(*) FROM v_call_grade_due),\n                          'spent_usd', (SELECT spent_usd FROM v_call_lane_spend))\n  FROM call_processing_jobs j\nRETURNING run_id;",
+        "options": {}
+      },
+      "name": "Log run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1980,
+        440
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf16-14"
+    }
+  ],
+  "connections": {
+    "Every 10 min, 23:00-04:00": {
+      "main": [
+        [
+          {
+            "node": "Check budget",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check budget": {
+      "main": [
+        [
+          {
+            "node": "Record provider status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record provider status": {
+      "main": [
+        [
+          {
+            "node": "Read grade gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read grade gate": {
+      "main": [
+        [
+          {
+            "node": "May we spend?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "May we spend?": {
+      "main": [
+        [
+          {
+            "node": "Retention",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log blocked run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retention": {
+      "main": [
+        [
+          {
+            "node": "Claim calls",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim calls": {
+      "main": [
+        [
+          {
+            "node": "Claimed one?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claimed one?": {
+      "main": [
+        [
+          {
+            "node": "Each call",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Each call": {
+      "main": [
+        [
+          {
+            "node": "Log run",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Grade through worker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Grade through worker": {
+      "main": [
+        [
+          {
+            "node": "Store grade",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store grade": {
+      "main": [
+        [
+          {
+            "node": "Store model calls",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store model calls": {
+      "main": [
+        [
+          {
+            "node": "Each call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Riyadh",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true,
+    "executionTimeout": 1500
+  }
+}
