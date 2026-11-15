@@ -1,0 +1,317 @@
+{
+  "name": "14 · Calls · who answered (PBX journey)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7,22,37,52 * * * *"
+            }
+          ]
+        }
+      },
+      "name": "Every 15 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "Offset from workflow 11 (:00/:15/:30/:45) so the PBX never sees both at once.",
+      "id": "wf14-01"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- fence-exempt: this statement IS the claim. INSERT ... ON CONFLICT DO UPDATE\n-- locks the conflicting row and re-checks the WHERE on its current version, so\n-- two ticks cannot both take the same call.\n-- Inbound calls long enough to have been answered (the archive's own minimum),\n-- settled for 15 minutes so the journey is complete, newest first so the\n-- portal fills from today backwards. Nothing at all while journey_mode is off.\nWITH cfg AS (\n  SELECT max(value) FILTER (WHERE key = 'journey_mode')            AS mode,\n         max(value) FILTER (WHERE key = 'journey_batch')::int      AS batch,\n         max(value) FILTER (WHERE key = 'since')::date             AS since,\n         max(value) FILTER (WHERE key = 'max_attempts')::int       AS max_attempts\n  FROM call_pipeline_config\n),\narc AS (\n  SELECT max(value) FILTER (WHERE key = 'pbx_base_url')                     AS base,\n         max(value) FILTER (WHERE key = 'pbx_api_key')                      AS api_key,\n         coalesce(max(value) FILTER (WHERE key = 'fetch_min_duration_seconds')::int, 30) AS min_seconds\n  FROM call_archive_config\n),\ncand AS (\n  SELECT l.uniqueid\n  FROM call_log l\n  LEFT JOIN call_journeys j USING (uniqueid)\n  CROSS JOIN cfg CROSS JOIN arc\n  WHERE cfg.mode = 'on'\n    AND l.call_type = 'IN'\n    AND l.linkedid IS NOT NULL\n    AND l.calldate_local >= cfg.since\n    AND l.calldate_utc < now() - interval '15 minutes'\n    AND coalesce(l.duration_seconds, 0) >= arc.min_seconds\n    AND (j.uniqueid IS NULL\n         OR (j.status = 'retry_wait' AND j.next_attempt_at <= now())\n         OR (j.status = 'claimed' AND j.claim_until < now() AND j.attempts < cfg.max_attempts))\n  ORDER BY l.calldate_local DESC\n  LIMIT (SELECT batch FROM cfg)\n),\nclaimed AS (\n  INSERT INTO call_journeys (uniqueid, status, attempts, claim_token, claim_until)\n  SELECT uniqueid, 'claimed', 1, gen_random_uuid(), now() + interval '10 minutes' FROM cand\n  ON CONFLICT (uniqueid) DO UPDATE\n     SET status = 'claimed', attempts = call_journeys.attempts + 1,\n         claim_token = EXCLUDED.claim_token, claim_until = EXCLUDED.claim_until, updated_at = now()\n   WHERE (call_journeys.status = 'retry_wait' AND call_journeys.next_attempt_at <= now())\n      OR (call_journeys.status = 'claimed' AND call_journeys.claim_until < now())\n  RETURNING uniqueid, claim_token\n)\nSELECT c.uniqueid, c.claim_token::text AS claim_token, l.linkedid, arc.base, arc.api_key\nFROM claimed c JOIN call_log l USING (uniqueid) CROSS JOIN arc;",
+        "options": {}
+      },
+      "name": "Claim journeys",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf14-02"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "claimed-one",
+              "leftValue": "={{ typeof $json.claim_token === 'string' && $json.claim_token.length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Claimed one?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        300
+      ],
+      "id": "wf14-03"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.base }}/api/call-log/journey",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "linkedid",
+              "value": "={{ $json.linkedid }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $json.api_key }}"
+            }
+          ]
+        },
+        "options": {
+          "allowUnauthorizedCerts": true,
+          "timeout": 20000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1000
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "name": "Read journey from PBX",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "notes": "One request per second: the vendor asked us to be gentle with the live PBX.",
+      "id": "wf14-04"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Pair each PBX answer with the claim it was fetched for. The HTTP node emits\n// exactly one item per input item, in order, even on error (onError continues),\n// so index i of its output belongs to claim i.\nconst claims = $('Claim journeys').all().map(i => i.json);\nconst answers = $input.all();\nconst calls = claims.map((c, i) => {\n  const a = (answers[i] && answers[i].json) || {};\n  return { uniqueid: c.uniqueid, status: a.statusCode ?? null, body: a.body ?? null };\n});\nreturn [{ json: { calls, claims: claims.map(c => ({ uniqueid: c.uniqueid, claim_token: c.claim_token })) } }];"
+      },
+      "name": "Pair with claims",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ],
+      "id": "wf14-05"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORKER_URL }}/calls/journeys/reduce",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ calls: $json.calls }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "name": "Reduce in worker",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "executeOnce": true,
+      "id": "wf14-06"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Store the reductions, FENCED on the claim token: a late answer for a claim a\n-- later tick took over matches nothing. A call the PBX did not answer for comes\n-- back as `error` and waits (30 min, doubling) instead of getting a verdict.\n-- A call missing from the worker's answer (the worker itself failed) is not\n-- touched; its claim expires and the next tick retries it.\nWITH r AS (SELECT x FROM jsonb_array_elements(coalesce($1::jsonb->'calls', '[]'::jsonb)) AS x),\nt AS (SELECT x->>'uniqueid' AS uid, (x->>'claim_token')::uuid AS tok\n      FROM jsonb_array_elements(coalesce($2::jsonb, '[]'::jsonb)) AS x),\ncfg AS (SELECT max(value) FILTER (WHERE key = 'max_attempts')::int AS max_attempts FROM call_pipeline_config),\nv AS (SELECT t.uid, t.tok, r.x, (r.x ? 'error') AS failed FROM r JOIN t ON t.uid = r.x->>'uniqueid'),\nowned AS MATERIALIZED (\n  SELECT q.uniqueid FROM call_journeys q JOIN v ON q.uniqueid = v.uid\n  WHERE q.claim_token = v.tok AND q.status = 'claimed'\n  FOR UPDATE OF q)\nUPDATE call_journeys j SET\n  status            = CASE WHEN NOT v.failed THEN 'read'\n                           WHEN j.attempts >= cfg.max_attempts THEN 'failed'\n                           ELSE 'retry_wait' END,\n  verdict           = CASE WHEN v.failed THEN j.verdict ELSE v.x->>'verdict' END,\n  answer_extension  = CASE WHEN v.failed THEN j.answer_extension ELSE v.x->>'answer_extension' END,\n  answer_extensions = CASE WHEN v.failed THEN j.answer_extensions\n                           ELSE ARRAY(SELECT jsonb_array_elements_text(coalesce(v.x->'answer_extensions', '[]'::jsonb))) END,\n  events            = CASE WHEN v.failed THEN j.events ELSE v.x->'events' END,\n  last_error        = CASE WHEN v.failed THEN left(v.x->>'error', 300) END,\n  read_at           = CASE WHEN v.failed THEN j.read_at ELSE now() END,\n  next_attempt_at   = CASE WHEN v.failed THEN now() + interval '30 minutes' * power(2, least(j.attempts, 4))\n                           ELSE j.next_attempt_at END,\n  claim_token = NULL, claim_until = NULL, updated_at = now()\nFROM v JOIN owned ON owned.uniqueid = v.uid, cfg\nWHERE j.uniqueid = v.uid AND j.claim_token = v.tok AND j.status = 'claimed'\nRETURNING j.uniqueid, j.status;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json), JSON.stringify($('Pair with claims').first().json.claims) ] }}"
+        }
+      },
+      "name": "Store journeys",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1320,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf14-07"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: housekeeping and a run log entry.\n-- A claim that expired on its last allowed attempt can never be claimed again,\n-- so it is closed as failed here instead of sitting 'claimed' forever.\nWITH stale AS (\n  UPDATE call_journeys SET status = 'failed', claim_token = NULL, claim_until = NULL,\n         last_error = 'claim expired on the last attempt', updated_at = now()\n   WHERE status = 'claimed' AND claim_until < now()\n     AND attempts >= (SELECT max(value)::int FROM call_pipeline_config WHERE key = 'max_attempts')\n  RETURNING 1)\nINSERT INTO job_runs (job_name, status, started_at, finished_at, items_in, items_ok, items_failed, detail)\nSELECT 'call_journeys', 'succeeded'::job_status, now(), now(),\n       count(*) FILTER (WHERE updated_at > now() - interval '10 minutes'),\n       count(*) FILTER (WHERE status = 'read' AND updated_at > now() - interval '10 minutes'),\n       count(*) FILTER (WHERE status IN ('retry_wait', 'failed') AND updated_at > now() - interval '10 minutes'),\n       jsonb_build_object('closed_stale', (SELECT count(*) FROM stale),\n                          'answered', count(*) FILTER (WHERE verdict = 'answered'),\n                          'read', count(*) FILTER (WHERE status = 'read'))\n  FROM call_journeys\nRETURNING run_id;",
+        "options": {}
+      },
+      "name": "Log run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1540,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf14-08"
+    }
+  ],
+  "connections": {
+    "Every 15 min": {
+      "main": [
+        [
+          {
+            "node": "Claim journeys",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim journeys": {
+      "main": [
+        [
+          {
+            "node": "Claimed one?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claimed one?": {
+      "main": [
+        [
+          {
+            "node": "Read journey from PBX",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Read journey from PBX": {
+      "main": [
+        [
+          {
+            "node": "Pair with claims",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pair with claims": {
+      "main": [
+        [
+          {
+            "node": "Reduce in worker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reduce in worker": {
+      "main": [
+        [
+          {
+            "node": "Store journeys",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store journeys": {
+      "main": [
+        [
+          {
+            "node": "Log run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Riyadh",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true,
+    "executionTimeout": 300
+  }
+}

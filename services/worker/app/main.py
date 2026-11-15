@@ -1095,3 +1095,20 @@ app.include_router(media_reader.build_router(require_api_key))
 from .calls_archive import api as calls_archive_api  # noqa: E402
 
 app.include_router(calls_archive_api.build_router(require_api_key))
+
+# Personal portal: separate sessions and restricted database roles.
+from .portal import api as portal_api, auth as portal_auth  # noqa: E402
+app.include_router(portal_auth.router)
+app.include_router(portal_api.router)
+app.mount('/portal/assets', StaticFiles(directory=portal_api.STATIC), name='portal-assets')
+
+
+@app.middleware('http')
+async def portal_headers(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith('/portal'):
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['Referrer-Policy'] = 'no-referrer'
+        response.headers['X-Frame-Options'] = 'DENY'
+    return response
