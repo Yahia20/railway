@@ -1,0 +1,406 @@
+{
+  "name": "15 · Calls · transcribe (two voices)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 */10 * * * *"
+            }
+          ]
+        }
+      },
+      "name": "Every 10 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "id": "wf15-01"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- multi-item: a plain read of one row.\nSELECT mode, may_run, reason, spent_usd FROM v_call_audio_gate;",
+        "options": {}
+      },
+      "name": "Read audio gate",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf15-02"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "may-we-spend",
+              "leftValue": "={{ $json.may_run === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "May we spend?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        300
+      ],
+      "id": "wf15-03"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: a run log entry; nothing was claimed.\nINSERT INTO job_runs (job_name, status, started_at, finished_at, items_in, items_ok, items_failed, error, detail)\nSELECT 'call_transcribe', 'skipped'::job_status, now(), now(),\n       (SELECT count(*) FROM v_call_audio_due), 0, 0, $1::text,\n       jsonb_build_object('gate', 'v_call_audio_gate', 'reason', $1::text)\nRETURNING run_id;",
+        "options": {
+          "queryReplacement": "={{ [ $('Read audio gate').first().json.reason || 'blocked' ] }}"
+        }
+      },
+      "name": "Log blocked run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        480
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf15-04"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- fence-exempt: this statement IS the claim. INSERT ... ON CONFLICT DO UPDATE\n-- locks the conflicting row and re-checks the WHERE on its current version.\n-- Newest calls first, so the portal fills from today backwards. Nothing at all\n-- while another run still holds a live claim: calls-audio takes one recording\n-- at a time, and two runs would only queue inside it and time out.\nWITH busy AS (\n  SELECT 1 FROM call_processing_jobs WHERE status = 'claimed' AND claim_until >= now()\n),\ncand AS (\n  SELECT d.uniqueid FROM v_call_audio_due d\n  WHERE NOT EXISTS (SELECT 1 FROM busy)\n  ORDER BY d.calldate_local DESC\n  LIMIT (SELECT value::int FROM call_pipeline_config WHERE key = 'audio_batch')\n)\nINSERT INTO call_processing_jobs (uniqueid, status, attempts, claim_token, claim_until)\nSELECT uniqueid, 'claimed', 1, gen_random_uuid(), now() + interval '20 minutes' FROM cand\nON CONFLICT (uniqueid) DO UPDATE\n   SET status = 'claimed', attempts = call_processing_jobs.attempts + 1,\n       claim_token = EXCLUDED.claim_token, claim_until = EXCLUDED.claim_until, updated_at = now()\n WHERE (call_processing_jobs.status = 'retry_wait' AND call_processing_jobs.next_attempt_at <= now())\n    OR (call_processing_jobs.status = 'claimed' AND call_processing_jobs.claim_until < now())\nRETURNING uniqueid, claim_token::text AS claim_token;",
+        "options": {}
+      },
+      "name": "Claim recordings",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf15-05"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "claimed-one",
+              "leftValue": "={{ typeof $json.claim_token === 'string' && $json.claim_token.length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Claimed one?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        300
+      ],
+      "id": "wf15-06"
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "name": "Each call",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1100,
+        300
+      ],
+      "id": "wf15-07"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.WORKER_URL }}/calls/transcribe",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.WORKER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ uniqueid: $json.uniqueid }) }}",
+        "options": {
+          "timeout": 900000
+        }
+      },
+      "name": "Transcribe through worker",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1320,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "notes": "calls-audio may be waking from app sleeping (model load ~1 min) and then listens at about real time on CPU. onError continues so a timeout becomes a recorded failure.",
+      "id": "wf15-08"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Store one transcription, FENCED on the claim token.\n-- multi-item: one worker answer per item, each paired with its own claim.\n-- The outcome is read from the answer's `outcome` TEXT (gotcha 15): a timeout or\n-- an error item has none and is recorded as a failure with an attempt spent.\n-- compute_seconds ADDS UP across attempts: it is what Railway billed.\nWITH r AS (SELECT $1::jsonb AS j, $2::text AS uid, $3::uuid AS tok),\no AS (\n  SELECT r.*, CASE WHEN j->>'outcome' IN ('transcribed', 'empty', 'review') THEN j->>'outcome'\n                   WHEN j->>'outcome' = 'no_recording' THEN 'failed_final'\n                   ELSE 'failed' END AS outcome,\n         (SELECT value::int FROM call_pipeline_config WHERE key = 'max_attempts') AS max_attempts\n  FROM r),\nowned AS MATERIALIZED (\n  SELECT q.uniqueid FROM call_processing_jobs q, o\n  WHERE q.uniqueid = o.uid AND q.claim_token = o.tok AND q.status = 'claimed'\n  FOR UPDATE OF q)\nUPDATE call_processing_jobs q SET\n  status          = CASE o.outcome WHEN 'failed_final' THEN 'failed'\n                                   WHEN 'failed' THEN CASE WHEN q.attempts >= o.max_attempts THEN 'failed' ELSE 'retry_wait' END\n                                   ELSE o.outcome END,\n  audio_seconds   = coalesce(nullif(o.j->>'audio_seconds', '')::numeric, q.audio_seconds),\n  speech_seconds  = coalesce(nullif(o.j->>'speech_seconds', '')::numeric, q.speech_seconds),\n  compute_seconds = coalesce(q.compute_seconds, 0) + coalesce(nullif(o.j->>'compute_seconds', '')::numeric, 0),\n  stereo_key      = CASE WHEN o.outcome = 'transcribed' THEN o.j->>'stereo_key' ELSE q.stereo_key END,\n  agent_voice     = CASE WHEN o.outcome = 'transcribed' THEN o.j->>'agent_voice' ELSE q.agent_voice END,\n  transcript      = CASE WHEN o.outcome = 'transcribed' THEN o.j->'transcript' ELSE q.transcript END,\n  metrics         = CASE WHEN o.outcome = 'transcribed' THEN o.j->'metrics' ELSE q.metrics END,\n  model_versions  = coalesce(o.j->'models', q.model_versions),\n  last_error      = CASE WHEN o.outcome LIKE 'failed%' THEN left(coalesce(o.j->>'error', o.j->>'message', o.j::text), 400)\n                         WHEN o.outcome = 'review' THEN o.j->>'reason' END,\n  next_attempt_at = CASE WHEN o.outcome = 'failed' THEN now() + interval '30 minutes' * power(2, least(q.attempts, 4))\n                         ELSE now() END,\n  claim_token = NULL, claim_until = NULL, updated_at = now()\nFROM o, owned\nWHERE q.uniqueid = owned.uniqueid\nRETURNING q.uniqueid, q.status;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json), $('Each call').item.json.uniqueid, $('Each call').item.json.claim_token ] }}"
+        }
+      },
+      "name": "Store transcript",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1540,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true,
+      "id": "wf15-09"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: the money was spent whether or not this claim still owns the\n-- call, and rule 12 says every model call lands in model_calls. UNIQUE makes a\n-- re-store a no-op. Calls have no interactions row, so interaction_id is NULL.\n-- multi-item: one worker answer per item.\nWITH c AS (SELECT jsonb_array_elements(coalesce($1::jsonb->'calls', '[]'::jsonb)) AS x),\nins AS (\n  INSERT INTO model_calls (interaction_id, purpose, provider, model, prompt_version, input_hash,\n                           prompt_tokens, output_tokens, cached_tokens, cost_usd, priced_at_peak,\n                           latency_ms, succeeded, error)\n  SELECT NULL, x->>'purpose', x->>'provider', x->>'model', x->>'prompt_version',\n         x->>'input_hash', (x->>'prompt_tokens')::int, (x->>'output_tokens')::int,\n         (x->>'cached_tokens')::int, (x->>'cost_usd')::numeric,\n         coalesce((x->>'priced_at_peak')::boolean, false), (x->>'latency_ms')::int,\n         coalesce((x->>'succeeded')::boolean, true), x->>'error'\n    FROM c\n  ON CONFLICT (purpose, input_hash, prompt_version) DO NOTHING\n  RETURNING call_id)\nSELECT count(*)::int AS calls_stored FROM ins;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($('Transcribe through worker').item.json) ] }}"
+        }
+      },
+      "name": "Store model calls",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1760,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Reads the worker answer by node name (gotcha 5).",
+      "id": "wf15-10"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- lease-exempt: a run log entry written once the loop is done.\nINSERT INTO job_runs (job_name, status, started_at, finished_at, items_in, items_ok, items_failed, detail)\nSELECT 'call_transcribe', 'succeeded'::job_status, now(), now(),\n       count(*) FILTER (WHERE updated_at > now() - interval '30 minutes'),\n       count(*) FILTER (WHERE status IN ('transcribed', 'empty', 'review') AND updated_at > now() - interval '30 minutes'),\n       count(*) FILTER (WHERE status IN ('retry_wait', 'failed') AND updated_at > now() - interval '30 minutes'),\n       jsonb_build_object('due_left', (SELECT count(*) FROM v_call_audio_due),\n                          'spent_usd', (SELECT spent_usd FROM v_call_lane_spend))\n  FROM call_processing_jobs\nRETURNING run_id;",
+        "options": {}
+      },
+      "name": "Log run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1320,
+        440
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "railway-pg",
+          "name": "railway-pg"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "id": "wf15-11"
+    }
+  ],
+  "connections": {
+    "Every 10 min": {
+      "main": [
+        [
+          {
+            "node": "Read audio gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read audio gate": {
+      "main": [
+        [
+          {
+            "node": "May we spend?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "May we spend?": {
+      "main": [
+        [
+          {
+            "node": "Claim recordings",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log blocked run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim recordings": {
+      "main": [
+        [
+          {
+            "node": "Claimed one?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claimed one?": {
+      "main": [
+        [
+          {
+            "node": "Each call",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Each call": {
+      "main": [
+        [
+          {
+            "node": "Log run",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Transcribe through worker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transcribe through worker": {
+      "main": [
+        [
+          {
+            "node": "Store transcript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store transcript": {
+      "main": [
+        [
+          {
+            "node": "Store model calls",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store model calls": {
+      "main": [
+        [
+          {
+            "node": "Each call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Riyadh",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true,
+    "executionTimeout": 2400
+  }
+}

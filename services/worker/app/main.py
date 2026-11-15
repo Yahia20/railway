@@ -1096,6 +1096,10 @@ from .calls_archive import api as calls_archive_api  # noqa: E402
 
 app.include_router(calls_archive_api.build_router(require_api_key))
 
+from .calls_audio import api as calls_audio_api  # noqa: E402
+
+app.include_router(calls_audio_api.build_router(require_api_key))
+
 # Personal portal: separate sessions and restricted database roles.
 from .portal import api as portal_api, auth as portal_auth  # noqa: E402
 app.include_router(portal_auth.router)
