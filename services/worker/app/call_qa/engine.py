@@ -20,9 +20,9 @@ from typing import Any
 
 from .. import db
 from ..evaluate.judge import DeepSeekClient, JudgeError, cost_row
-from .scorecard import RUBRIC, score
+from .scorecard import REFERENCE_ITEMS, RUBRIC, score
 
-PROMPT_VERSION = "call-qa-1.0"
+PROMPT_VERSION = "call-qa-1.1"
 PURPOSE = "call_qa"
 VOTES, MIN_VOTES = 3, 2
 MAX_TOKENS = 12000
@@ -34,7 +34,10 @@ ENGINE_VERSION = hashlib.sha256((_HERE / "scorecard.py").read_bytes()).hexdigest
 def rubric_text() -> str:
     """The items and their five checks, in the order the answer must keep."""
     lines = ["RUBRIC (answer every item id with exactly five observations, in this order):"]
-    for item in RUBRIC["items"]:
+    # Accuracy and procedure need an approved company reference the call does
+    # not carry; the scorecard sends them to review without one, so asking the
+    # model about them would only be paid for and thrown away.
+    for item in (i for i in RUBRIC["items"] if i["id"] not in REFERENCE_ITEMS):
         lines.append(f"- {item['id']}: {item['label']}")
         lines += [f"    {k}. {c}" for k, c in enumerate(item["checks"], 1)]
     return "\n".join(lines)

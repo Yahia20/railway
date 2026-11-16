@@ -72,3 +72,17 @@ def test_critical_flag_does_not_zero_score():
     r=reading();r['critical_errors']=[{'kind':'privacy_breach','evidence':r['items']['greeting'][0]['evidence']}]
     result=score(TRANSCRIPT,[r]*3,reference_verified=True)
     assert result['score']==100 and len(result['critical_errors'])==1
+
+
+def test_reference_items_are_not_asked_and_still_go_to_review():
+    from app.call_qa.engine import rubric_text
+    text=rubric_text()
+    assert '- accuracy:' not in text and '- procedure:' not in text
+    assert '- greeting:' in text
+    r=reading()
+    for item in ('accuracy','procedure'):
+        del r['items'][item]                      # the model was never asked
+    result=score(TRANSCRIPT,[r,r,r])
+    status={i['id']:i['status'] for i in result['items']}
+    assert status['accuracy']=='review' and status['procedure']=='review'
+    assert result['assessed_weight']==82
