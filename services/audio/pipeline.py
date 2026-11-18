@@ -8,9 +8,16 @@ The recipe the 2026-11-11 bake-off chose (scripts kept in local-reports/):
 3. Gap fill: every moment of the call goes to the nearest of the two voices in
    time, so a word the diariser missed still lands in a channel (70% -> 80% of
    speech on the right channel, measured on synthetic calls with known truth).
-4. faster-whisper large-v3-turbo transcribes the whole call ONCE with word
-   timestamps; each word is placed by time onto voice A or B. (Transcribing
-   each voice separately pays twice and loses the context across turns.)
+4. Words. Two engines, chosen by ASR_ENGINE (both are baked into the image,
+   so switching back is one variable and a restart, no rebuild):
+
+   cohere (default since 2026-11-18): Cohere Transcribe Arabic 07-2026 writes
+     each gap-filled turn ON ITS OWN, so every piece it hears is one voice.
+     It returns no timestamps at all, which is why the turn comes first: the
+     turn's own start/end are the times, and its words are spread across it
+     by length (only the line breaks read those times, never a metric).
+   whisper: faster-whisper large-v3-turbo transcribes the whole call ONCE with
+     word timestamps; each word is placed by time onto voice A or B.
 
 Voice A is whoever speaks first. Which voice is the AGENT is not decided here:
 it is one question to a model per call, asked by the worker (/calls/prepare),
@@ -32,7 +39,13 @@ import numpy as np
 SR = 16000
 DIAR_MODEL = "nvidia/diar_streaming_sortformer_4spk-v2.1"
 ASR_MODEL = os.getenv("ASR_MODEL", "large-v3-turbo")
+ASR_ENGINE = os.getenv("ASR_ENGINE", "cohere")
+COHERE_MODEL = "CohereLabs/cohere-transcribe-arabic-07-2026"
+COHERE_DTYPE = os.getenv("COHERE_DTYPE", "bfloat16")
+COHERE_BATCH = int(os.getenv("COHERE_BATCH", "8"))
 THREADS = int(os.getenv("CPU_THREADS", "8"))
+MIN_TURN_S = 0.3          # shorter than this is a click, not a word
+SILENT_RMS = 0.004        # a turn this quiet is line noise; the model card warns it writes noise as words
 
 
 def read_pcm(data: bytes) -> tuple[np.ndarray, int]:
@@ -70,6 +83,17 @@ def diariser():
 def recogniser():
     from faster_whisper import WhisperModel
     return WhisperModel(ASR_MODEL, device="cpu", compute_type="int8", cpu_threads=THREADS)
+
+
+@lru_cache(maxsize=1)
+def cohere():
+    import torch
+    from transformers import AutoProcessor, CohereAsrForConditionalGeneration
+    torch.set_num_threads(THREADS)
+    proc = AutoProcessor.from_pretrained(COHERE_MODEL)
+    model = CohereAsrForConditionalGeneration.from_pretrained(COHERE_MODEL, dtype=getattr(torch, COHERE_DTYPE))
+    model.eval()
+    return proc, model
 
 
 def diarise(x16: np.ndarray) -> list[list]:
@@ -130,6 +154,47 @@ def transcribe(x16: np.ndarray) -> list[list]:
     return [[round(w.start, 2), round(w.end, 2), w.word] for s in segments for w in (s.words or [])]
 
 
+def spread(a: float, b: float, voice: str, text: str) -> list[list]:
+    """One turn's text -> [start, end, voice, ' word'] with times shared out by
+    word length across the turn. The worker's line builder reads only order,
+    voice and pauses BETWEEN turns, which are real."""
+    ws = text.split()
+    if not ws:
+        return []
+    total = sum(len(w) + 1 for w in ws)
+    out, t = [], a
+    for w in ws:
+        d = (b - a) * (len(w) + 1) / total
+        out.append([round(t, 2), round(t + d, 2), voice, " " + w])
+        t += d
+    return out
+
+
+def transcribe_turns(x16: np.ndarray, spans: list[list]) -> list[list]:
+    """Cohere on every turn separately, a few turns per model call."""
+    import torch
+    proc, model = cohere()
+    turns = []
+    for a, b, v in spans:
+        piece = x16[int(a * SR):int(b * SR)]
+        if b - a >= MIN_TURN_S and len(piece) and float(np.sqrt(np.mean(piece ** 2))) >= SILENT_RMS:
+            turns.append((a, b, v, piece))
+    words: list[list] = []
+    for i in range(0, len(turns), COHERE_BATCH):
+        batch = turns[i:i + COHERE_BATCH]
+        inputs = proc([t[3] for t in batch], sampling_rate=SR, return_tensors="pt", language="ar")
+        index = inputs.pop("audio_chunk_index", None)
+        inputs = inputs.to(model.device, dtype=model.dtype)
+        with torch.inference_mode():
+            ids = model.generate(**inputs, max_new_tokens=448)
+        texts = proc.decode(ids, skip_special_tokens=True, audio_chunk_index=index, language="ar")
+        if isinstance(texts, str):
+            texts = [texts]
+        for (a, b, v, _), text in zip(batch, texts):
+            words += spread(a, b, v, text)
+    return words
+
+
 def voice_at(spans: list[list], a: float, b: float) -> str | None:
     best, who = 0.0, None
     for s0, s1, v in spans:
@@ -150,9 +215,14 @@ def process(data: bytes) -> dict:
     raw = diarise(x16)
     t1 = time.monotonic()
     spans = fill_two(raw, total) if raw else []
-    words = transcribe(x16)
+    if ASR_ENGINE == "cohere":
+        placed = transcribe_turns(x16, spans)
+        asr = f"{COHERE_MODEL} {COHERE_DTYPE} per-turn"
+    else:
+        placed = [[a, b, voice_at(spans, a, b) or "A", w] for a, b, w in transcribe(x16)]
+        asr = f"faster-whisper {ASR_MODEL} int8 beam1 vad"
+    words = placed
     t2 = time.monotonic()
-    placed = [[a, b, voice_at(spans, a, b) or "A", w] for a, b, w in words]
     # speech actually heard per voice, mapped from raw speaker ids to A/B
     labels = {}
     for a, b, v in spans:
@@ -173,5 +243,5 @@ def process(data: bytes) -> dict:
         "speech_seconds": {k: round(v, 2) for k, v in spoken.items()},
         "compute_seconds": round(t2 - t0, 2),
         "timing": {"diarise": round(t1 - t0, 2), "transcribe": round(t2 - t1, 2)},
-        "models": {"diariser": DIAR_MODEL, "asr": f"faster-whisper {ASR_MODEL} int8 beam1 vad"},
+        "models": {"diariser": DIAR_MODEL, "asr": asr},
     }

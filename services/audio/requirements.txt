@@ -2,6 +2,11 @@
 # default wheel drags in ~3 GB of CUDA this service never uses.
 nemo_toolkit[asr]==3.0.0
 faster-whisper==1.2.1
+# Cohere Transcribe Arabic: CohereAsrForConditionalGeneration is in
+# transformers >= 5.4; 5.23.0 is the version NeMo already resolved here.
+transformers==5.23.0
+sentencepiece==0.2.3
+protobuf==7.36.2
 soundfile==0.14.0
 fastapi==0.115.6
 uvicorn==0.34.0
