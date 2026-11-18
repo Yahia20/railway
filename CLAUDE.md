@@ -341,14 +341,40 @@ phase-0 measurements: `docs/agent-portal-phase0-2026-11-14.md`.
 | 035 | `portal_auth` schema. Two roles: `portal_auth_app` writes ONLY users/sessions/attempts/audit; `portal_reader` is SELECT-only and read-only. The scoring path stays read-only (rule 11). Their URLs are `PORTAL_*_DATABASE_URL` on the worker |
 | **who answered** (036) | `call_log.extension` is the FIRST leg that rang (ext 143 = 57% of calls). The PBX journey (`/api/call-log/journey?linkedid=`) has the ANSWER event; workflow 14 reads it, `attribution.py` reduces it. **The person is resolved live in `v_call_owner`** from `call_agent_mappings` (owner-approved 2026-11-15, applied by `scripts/seed_call_extensions.py` from `local-reports/call_extension_map.json`). Anything unproven has `agent_id` NULL and counts for the team only |
 | 17 PBX-only staff | added to `agents` with `team = 'calls'`, no Bitrix id: calls only |
-| `calls-audio` (`services/audio/`) | its own Railway service, app sleeping on, deployed with `railway up services/audio --path-as-root --service calls-audio`. Sortformer v2.1 + gap fill + faster-whisper large-v3-turbo (CPU). No credentials; handed a 10-minute URL by the worker |
-| `/calls/transcribe` | masks the words, asks which voice is the agent (Haiku if `ANTHROPIC_API_KEY` is set, else DeepSeek — recorded per call in `model_calls`), writes `stereo/yyyy/mm/dd/<id>.wav` (agent left) next to the recording |
+| `calls-audio` (`services/audio/`) | its own Railway service, app sleeping on, deployed with `railway up services/audio --path-as-root --service calls-audio`. Sortformer v2.1 splits the voices, `partition()` cuts non-overlapping one-voice pieces, **Cohere Transcribe Arabic 07-2026** writes each piece (since 2026-11-18; faster-whisper kept: `ASR_ENGINE=whisper`). CPU. No credentials at run time; handed a 10-minute URL by the worker. The gated Cohere repo is downloaded at BUILD time with the `HF_TOKEN` variable on calls-audio |
+| `/calls/transcribe` | masks the words, asks which voice is the agent AND the name the agent said (`call-role-2`; DeepSeek unless `role_provider = 'anthropic'` and the key is set), writes `stereo/yyyy/mm/dd/<id>.wav` (agent left) next to the recording |
 | `/calls/qa/evaluate` | three DeepSeek readings → `app/call_qa/scorecard.py`. Accuracy and procedure items stay `review` until there is an approved reference, so `assessed_weight` tops out at 82 |
 | 037 | `v_call_audio_due` (skips header-only WAVs), `v_call_grade_due`, and the two gates. Both respect `v_call_lane_spend` (model calls `call_*` + Railway compute at published rates) against `lifetime_cap_usd = 10` |
 | workflows | 14 `rF0q33jXo0ssaz7Y` (journeys, free), 15 `LTorr6ebWiSmMXzi` (transcribe), 16 `9WIaIPctnzkGiImt` (grade, 23:00–03:59) |
 
 **Switches**, all in `call_pipeline_config`: `journey_mode`, `audio_mode`,
-`grade_mode` (each ships `off`), `audio_batch`, `grade_batch`, `since`.
+`grade_mode` (each ships `off`), `audio_batch`, `grade_batch`, `since`,
+`chat_reserve_usd` (038), `role_provider` (040).
+
+### 038–040 and the audio engines, 2026-11-16 → 18 (PRs #6–#8)
+
+| | |
+|---|---|
+| 038 | call grading stops while DeepSeek's month is within `chat_reserve_usd` (2) of its cap, so calls never starve v6 chat grading. `call-qa-1.1` halved the grade cost: **$0.0055 a call** |
+| 039 | the PBX knows which PHONE answered, not which person. `name_check` (worker) holds the model's "agent said name X" to the AGENT's own lines and to a known owner; `v_call_owner.reason = 'name_mismatch'`, `agent_id` NULL, only on a clear different name **bound to the employee asked about** (`owner_id`), so a re-mapped extension is never cleared by an old verdict. Unclear = `unknown`, never takes a call away. Inbound calls wait for their journey before transcription |
+| 040 | the transcription gate asks the provider the worker really uses (`role_provider`), with 038's reserve |
+| workflow 16 | the 90-day purge runs before the money gate (in the repo; **live copy still needs `n8n_deploy.py 16`**, which needs `N8N_API_KEY`) |
+
+**Cohere vs Whisper, 8 real calls (22 min):** same compute (157 s vs 159 s), Cohere's
+Arabic far closer to what was said. Its first run wrote overlapping seconds into
+BOTH voices — `fill_two`'s spans overlap by design (right for stereo, wrong for a
+transcriber); `partition()` is the fix and `test_pipeline.py` pins it.
+
+**Nemotron-3-Diarization vs Sortformer, 20 known-truth calls built from 30 real
+ones:** Sortformer 96.0% on the right channel, 1.1% missed, 1.41 s/min;
+Nemotron 89.5%, 9.0% missed, 1.76 s/min. **Sortformer stays.** Nemotron is in the
+image (`DIARISER=nemotron`) on NeMo main pinned at `0c7af33` + `lhotse==2.0.0a6`,
+both in `/opt/nemo-main` so 3.0.0 is untouched. Script:
+`local-reports/calls-diarization-bakeoff-2026-11-11/bench_diar.py`.
+
+**The 183 calls first transcribed with Whisper were re-queued** (`retry_wait`) on
+2026-11-18 to be written again with Cohere. Nothing was deleted; their old grades
+stay until the new ones replace them.
 
 **The 250 empty recordings are not ours to fix.** The PBX itself serves a
 44-byte header for calls nobody answered (BUSY / NO ANSWER / FAILED, no ANSWER
