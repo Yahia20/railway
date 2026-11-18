@@ -170,8 +170,50 @@ def spread(a: float, b: float, voice: str, text: str) -> list[list]:
     return out
 
 
+def partition(raw: list[list], total: float, step: float = 0.01) -> list[list]:
+    """Cut the call into pieces that NEVER overlap, each owned by one voice.
+
+    fill_two's spans may overlap where Sortformer hears both voices, which is
+    right for the stereo file and wrong for a transcriber: the same seconds
+    would be written into both voices' lines (measured 2026-11-18: whole
+    sentences repeated under A and B). Here a moment both voices cover goes to
+    the voice whose segment there is LONGER, i.e. the one talking rather than
+    the one saying "اه" over them; a moment nobody covers goes to the nearer
+    voice, as in fill_two. Same A/B labels as fill_two."""
+    dur, first = defaultdict(float), {}
+    for a, b, s in raw:
+        dur[s] += b - a
+        first[s] = min(first.get(s, a), a)
+    keep = sorted([s for s, _ in sorted(dur.items(), key=lambda z: -z[1])[:2]], key=lambda s: first[s])
+    if not keep:
+        return []
+    n = max(1, int(round(total / step)))
+    cover = np.zeros((len(keep), n))
+    for a, b, s in raw:
+        if s in keep:
+            i, j = max(0, int(a / step)), min(n, int(b / step))
+            k = keep.index(s)
+            cover[k, i:j] = np.maximum(cover[k, i:j], b - a)
+    owner = np.where(cover.max(0) > 0, cover.argmax(0), -1)
+    known = np.flatnonzero(owner >= 0)
+    if not len(known):
+        return []
+    # nearest known frame for every unknown one (ties to the earlier side)
+    idx = np.searchsorted(known, np.arange(n))
+    left = known[np.clip(idx - 1, 0, len(known) - 1)]
+    right = known[np.clip(idx, 0, len(known) - 1)]
+    near = np.where(np.abs(np.arange(n) - left) <= np.abs(right - np.arange(n)), left, right)
+    owner = owner[near]
+    cuts = np.flatnonzero(np.diff(owner)) + 1
+    starts, ends = np.r_[0, cuts], np.r_[cuts, n]
+    return [[round(float(s * step), 2), round(float(min(e * step, total)), 2), "AB"[int(owner[s])]]
+            for s, e in zip(starts, ends)]
+
+
 def transcribe_turns(x16: np.ndarray, spans: list[list]) -> list[list]:
-    """Cohere on every turn separately, a few turns per model call."""
+    """Cohere on every turn separately, a few turns per model call. `spans`
+    must not overlap (partition), or the same speech is written twice."""
+    import re
     import torch
     proc, model = cohere()
     turns = []
@@ -190,8 +232,10 @@ def transcribe_turns(x16: np.ndarray, spans: list[list]) -> list[list]:
         texts = proc.decode(ids, skip_special_tokens=True, audio_chunk_index=index, language="ar")
         if isinstance(texts, str):
             texts = [texts]
+        if len(texts) != len(batch):
+            raise RuntimeError(f"cohere returned {len(texts)} texts for {len(batch)} turns")
         for (a, b, v, _), text in zip(batch, texts):
-            words += spread(a, b, v, text)
+            words += spread(a, b, v, re.sub(r"<[^>]{1,30}>", " ", text))   # "<hesitation>" and similar tags
     return words
 
 
@@ -216,7 +260,7 @@ def process(data: bytes) -> dict:
     t1 = time.monotonic()
     spans = fill_two(raw, total) if raw else []
     if ASR_ENGINE == "cohere":
-        placed = transcribe_turns(x16, spans)
+        placed = transcribe_turns(x16, partition(raw, total))
         asr = f"{COHERE_MODEL} {COHERE_DTYPE} per-turn"
     else:
         placed = [[a, b, voice_at(spans, a, b) or "A", w] for a, b, w in transcribe(x16)]
