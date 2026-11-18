@@ -21,3 +21,16 @@ def test_a_turns_words_share_its_time_and_keep_their_order():
 
 def test_no_speech_no_pieces():
     assert p.partition([], 5) == []
+
+
+def test_both_voices_keep_their_own_talk_time_when_they_overlap():
+    # Codex review: A 0-10 and B 8-14 used to give A all 16 s and B none.
+    raw = [[0, 10, "s0"], [8, 14, "s1"]]
+    assert p.ab_labels(raw) == {"s0": "A", "s1": "B"}
+
+
+def test_words_are_timed_where_the_voice_was_heard_not_over_leading_silence():
+    raw = [[10, 14, "s0"], [15, 20, "s1"]]
+    piece = p.partition(raw, 20)[0]
+    assert piece[0] == 0.0                                  # the piece starts at 0 (gap fill)
+    assert p.speech_extent(*piece, raw, p.ab_labels(raw)) == (10, 14)   # the words do not

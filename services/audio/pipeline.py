@@ -37,7 +37,10 @@ from functools import lru_cache
 import numpy as np
 
 SR = 16000
-DIAR_MODEL = "nvidia/diar_streaming_sortformer_4spk-v2.1"
+DIARISER = os.getenv("DIARISER", "sortformer")       # sortformer | nemotron
+DIAR_MODEL = {"sortformer": "nvidia/diar_streaming_sortformer_4spk-v2.1",
+              "nemotron": "nvidia/Nemotron-3-Diarization"}[DIARISER]
+NEMO_MAIN = "/opt/nemo-main"                          # pinned NeMo for Nemotron only (Dockerfile)
 ASR_MODEL = os.getenv("ASR_MODEL", "large-v3-turbo")
 ASR_ENGINE = os.getenv("ASR_ENGINE", "cohere")
 COHERE_MODEL = "CohereLabs/cohere-transcribe-arabic-07-2026"
@@ -69,7 +72,10 @@ def to_16k(x: np.ndarray, rate: int) -> np.ndarray:
 
 @lru_cache(maxsize=1)
 def diariser():
+    import sys
     import torch
+    if DIARISER == "nemotron" and NEMO_MAIN not in sys.path:
+        sys.path.insert(0, NEMO_MAIN)                 # before nemo is first imported
     from nemo.collections.asr.models import SortformerEncLabelModel
     torch.set_num_threads(THREADS)
     m = SortformerEncLabelModel.from_pretrained(DIAR_MODEL, map_location="cpu")
@@ -112,16 +118,22 @@ def diarise(x16: np.ndarray) -> list[list]:
     return out
 
 
-def fill_two(segs: list[list], total: float) -> list[list]:
-    """Keep the two longest voices, label them A (speaks first) and B, and give
-    every moment of the call to the nearest of the two. Returns contiguous
-    [[start, end, 'A'|'B'], ...] covering 0..total."""
+def ab_labels(segs: list[list]) -> dict[str, str]:
+    """The two voices that talk longest, A = the one that speaks first. One
+    definition, used by fill_two, partition and the metrics."""
     dur, first = defaultdict(float), {}
     for a, b, s in segs:
         dur[s] += b - a
         first[s] = min(first.get(s, a), a)
     keep = sorted([s for s, _ in sorted(dur.items(), key=lambda z: -z[1])[:2]], key=lambda s: first[s])
-    label = {s: "AB"[i] for i, s in enumerate(keep)}
+    return {s: "AB"[i] for i, s in enumerate(keep)}
+
+
+def fill_two(segs: list[list], total: float) -> list[list]:
+    """Keep the two longest voices, label them A (speaks first) and B, and give
+    every moment of the call to the nearest of the two. Returns contiguous
+    [[start, end, 'A'|'B'], ...] covering 0..total."""
+    label = ab_labels(segs)
     S = sorted(x for x in segs if x[2] in label)
     out = []
     for i, (a, b, s) in enumerate(S):
@@ -180,11 +192,7 @@ def partition(raw: list[list], total: float, step: float = 0.01) -> list[list]:
     the voice whose segment there is LONGER, i.e. the one talking rather than
     the one saying "اه" over them; a moment nobody covers goes to the nearer
     voice, as in fill_two. Same A/B labels as fill_two."""
-    dur, first = defaultdict(float), {}
-    for a, b, s in raw:
-        dur[s] += b - a
-        first[s] = min(first.get(s, a), a)
-    keep = sorted([s for s, _ in sorted(dur.items(), key=lambda z: -z[1])[:2]], key=lambda s: first[s])
+    keep = sorted(ab_labels(raw), key=lambda s: ab_labels(raw)[s])
     if not keep:
         return []
     n = max(1, int(round(total / step)))
@@ -210,9 +218,20 @@ def partition(raw: list[list], total: float, step: float = 0.01) -> list[list]:
             for s, e in zip(starts, ends)]
 
 
-def transcribe_turns(x16: np.ndarray, spans: list[list]) -> list[list]:
+def speech_extent(a: float, b: float, voice: str, raw: list[list], labels: dict[str, str]) -> tuple[float, float]:
+    """Where this voice was actually HEARD inside the piece. The piece itself
+    reaches into silence (gap fill), and spreading words over that silence put
+    an agent's greeting at 0 s on a call that opens with ten silent seconds."""
+    hits = [(max(a, r0), min(b, r1)) for r0, r1, s in raw
+            if labels.get(s) == voice and min(b, r1) > max(a, r0)]
+    return (min(h[0] for h in hits), max(h[1] for h in hits)) if hits else (a, b)
+
+
+def transcribe_turns(x16: np.ndarray, spans: list[list], raw: list[list] | None = None) -> list[list]:
     """Cohere on every turn separately, a few turns per model call. `spans`
-    must not overlap (partition), or the same speech is written twice."""
+    must not overlap (partition), or the same speech is written twice. With
+    `raw`, each turn's words are timed over the speech heard in it, not the
+    whole piece."""
     import re
     import torch
     proc, model = cohere()
@@ -234,8 +253,10 @@ def transcribe_turns(x16: np.ndarray, spans: list[list]) -> list[list]:
             texts = [texts]
         if len(texts) != len(batch):
             raise RuntimeError(f"cohere returned {len(texts)} texts for {len(batch)} turns")
+        labels = ab_labels(raw) if raw else {}
         for (a, b, v, _), text in zip(batch, texts):
-            words += spread(a, b, v, re.sub(r"<[^>]{1,30}>", " ", text))   # "<hesitation>" and similar tags
+            s0, s1 = speech_extent(a, b, v, raw, labels) if raw else (a, b)
+            words += spread(s0, s1, v, re.sub(r"<[^>]{1,30}>", " ", text))   # "<hesitation>" and similar tags   # "<hesitation>" and similar tags
     return words
 
 
@@ -260,7 +281,7 @@ def process(data: bytes) -> dict:
     t1 = time.monotonic()
     spans = fill_two(raw, total) if raw else []
     if ASR_ENGINE == "cohere":
-        placed = transcribe_turns(x16, partition(raw, total))
+        placed = transcribe_turns(x16, partition(raw, total), raw)
         asr = f"{COHERE_MODEL} {COHERE_DTYPE} per-turn"
     else:
         placed = [[a, b, voice_at(spans, a, b) or "A", w] for a, b, w in transcribe(x16)]
@@ -268,11 +289,9 @@ def process(data: bytes) -> dict:
     words = placed
     t2 = time.monotonic()
     # speech actually heard per voice, mapped from raw speaker ids to A/B
-    labels = {}
-    for a, b, v in spans:
-        for r0, r1, s in raw:
-            if min(b, r1) - max(a, r0) > 0 and s not in labels:
-                labels[s] = v
+    # raw speaker id -> A/B by the same rule as the spans (Codex review
+    # 2026-11-18: mapping by first overlap gave both ids to A when they overlap)
+    labels = ab_labels(raw)
     spoken = defaultdict(float)
     for s, d in speech_spans(raw).items():
         if s in labels:

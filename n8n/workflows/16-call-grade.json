@@ -363,6 +363,17 @@
       "main": [
         [
           {
+            "node": "Retention",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retention": {
+      "main": [
+        [
+          {
             "node": "Check budget",
             "type": "main",
             "index": 0
@@ -407,7 +418,7 @@
       "main": [
         [
           {
-            "node": "Retention",
+            "node": "Claim calls",
             "type": "main",
             "index": 0
           }
@@ -415,17 +426,6 @@
         [
           {
             "node": "Log blocked run",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Retention": {
-      "main": [
-        [
-          {
-            "node": "Claim calls",
             "type": "main",
             "index": 0
           }
