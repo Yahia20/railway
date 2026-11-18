@@ -41,10 +41,14 @@ WITH base AS (
          ON m.extension = CASE WHEN l.call_type = 'OUT' THEN nullif(trim(l.extension), '') ELSE j.answer_extension END
   LEFT JOIN agents a ON a.agent_id = m.agent_id
   LEFT JOIN call_processing_jobs p USING (uniqueid))
+-- A verdict counts only against the employee it was asked about (owner_id):
+-- if the extension is re-mapped later, an old "no" never clears the new owner.
 SELECT uniqueid, call_type, calldate_local, handled_extension, evidence,
-       CASE WHEN line_agent_id IS NOT NULL AND nc ->> 'verdict' = 'no' THEN 'name_mismatch'
+       CASE WHEN line_agent_id IS NOT NULL AND nc ->> 'verdict' = 'no'
+                 AND nc ->> 'owner_id' = line_agent_id::text THEN 'name_mismatch'
             ELSE line_reason END AS reason,
-       CASE WHEN nc ->> 'verdict' = 'no' THEN NULL ELSE line_agent_id END AS agent_id,
+       CASE WHEN nc ->> 'verdict' = 'no' AND nc ->> 'owner_id' = line_agent_id::text THEN NULL
+            ELSE line_agent_id END AS agent_id,
        line_agent_id,
        nc ->> 'said' AS name_said
 FROM base;

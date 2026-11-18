@@ -66,20 +66,31 @@ def test_stereo_puts_the_agent_left_and_the_customer_right():
     assert abs(int(left[rate + rate // 2]) - 1000) < 50 and abs(int(right[rate + rate // 2])) < 50
 
 
-def test_a_different_name_said_in_the_call_is_a_mismatch():
+OWNER = "00000000-0000-0000-0000-00000000000a"
+
+
+def test_a_different_name_said_by_the_agent_is_a_mismatch():
     from app.calls_audio.service import name_check
-    text = "A: السلام عليكم معاك محمد من ترافل جيت\nB: اهلا"
-    assert name_check({"said_name": "محمد", "same_person": "no"}, "Sara", text)["verdict"] == "no"
-    assert name_check({"said_name": "محمد", "same_person": "yes"}, "Mohamed", text)["verdict"] == "yes"
+    agent = "السلام عليكم معاك محمد من ترافل جيت"
+    assert name_check({"said_name": "محمد", "same_person": "no"}, "Sara", OWNER, agent)["verdict"] == "no"
+    assert name_check({"said_name": "محمد", "same_person": "yes"}, "Mohamed", OWNER, agent)["verdict"] == "yes"
+    assert name_check({"said_name": "محمد", "same_person": "no"}, "Sara", OWNER, agent)["owner_id"] == OWNER
+
+
+def test_a_name_the_customer_said_is_not_the_agents_introduction():
+    # Codex review 2026-11-18: the customer saying "منى" must not clear Sara's call.
+    from app.calls_audio.service import name_check
+    agent_lines = "السلام عليكم ترافل جيت تفضل"           # the customer's "انا منى" is in the other voice
+    assert name_check({"said_name": "منى", "same_person": "no"}, "Sara", OWNER, agent_lines)["verdict"] == "unknown"
 
 
 def test_a_name_never_said_or_no_owner_never_takes_a_call_away():
     from app.calls_audio.service import name_check
-    text = "A: السلام عليكم ترافل جيت\nB: اهلا"
-    assert name_check({"said_name": "خالد", "same_person": "no"}, "Sara", text)["verdict"] == "unknown"   # not in the call
-    assert name_check({"said_name": "", "same_person": "no"}, "Sara", text)["verdict"] == "unknown"
-    assert name_check({"said_name": "ترافل", "same_person": "no"}, None, text)["verdict"] == "unknown"   # owner unknown
-    assert name_check({}, "Sara", text) == {"said": None, "owner": "Sara", "verdict": "unknown"}
+    agent = "السلام عليكم ترافل جيت"
+    assert name_check({"said_name": "خالد", "same_person": "no"}, "Sara", OWNER, agent)["verdict"] == "unknown"   # not in the call
+    assert name_check({"said_name": "", "same_person": "no"}, "Sara", OWNER, agent)["verdict"] == "unknown"
+    assert name_check({"said_name": "ترافل", "same_person": "no"}, None, None, agent)["verdict"] == "unknown"   # owner unknown
+    assert name_check({}, "Sara", OWNER, agent) == {"said": None, "owner": "Sara", "owner_id": OWNER, "verdict": "unknown"}
 
 
 def test_stereo_lands_next_to_the_recording_never_over_it():

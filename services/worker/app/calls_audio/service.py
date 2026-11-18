@@ -79,15 +79,18 @@ def pick_agent(text: str, owner: str | None = None) -> tuple[str, str, dict, dic
     return _pick_deepseek(text, system)
 
 
-def name_check(answer: dict, owner: str | None, text: str) -> dict:
-    """The model's reading, held to what the transcript shows: a mismatch
-    needs a said name that really is in the call and a known owner. Anything
-    less is `unknown`, which never takes a call away from anyone."""
+def name_check(answer: dict, owner: str | None, owner_id: str | None, agent_text: str) -> dict:
+    """The model's reading, held to what the transcript shows: a verdict needs
+    a said name that is in the AGENT's own lines (a customer saying a name is
+    not the agent introducing themselves) and a known owner. Anything less is
+    `unknown`, which never takes a call away from anyone. owner_id binds the
+    verdict to the employee it was asked about: if the extension's mapping
+    changes later, v_call_owner ignores it."""
     said = str(answer.get("said_name") or "").strip()
     verdict = answer.get("same_person") if answer.get("same_person") in ("yes", "no") else "unknown"
-    if not owner or not said or said not in text:
+    if not owner or not owner_id or not said or said not in agent_text:
         verdict = "unknown"
-    return {"said": said or None, "owner": owner, "verdict": verdict}
+    return {"said": said or None, "owner": owner, "owner_id": owner_id, "verdict": verdict}
 
 
 def _pick_deepseek(text: str, system: str) -> tuple[str, str, dict, dict]:
@@ -135,7 +138,7 @@ def transcribe(uniqueid: str) -> dict[str, Any]:
     # before any name check), so the agent-voice question can compare the name
     # the agent said. Only the first name leaves for the model.
     job = db.one("""SELECT r.storage_key, l.customer_name,
-                           split_part(trim(a.full_name), ' ', 1) AS owner
+                           split_part(trim(a.full_name), ' ', 1) AS owner, a.agent_id::text AS owner_id
                       FROM call_recording_jobs r JOIN call_log l USING (uniqueid)
                       LEFT JOIN v_call_owner o USING (uniqueid)
                       LEFT JOIN agents a ON a.agent_id = o.line_agent_id
@@ -179,7 +182,9 @@ def transcribe(uniqueid: str) -> dict[str, Any]:
     wav = prepare.stereo_wav(pcm, out["spans"], agent_voice)
     store.put(key, wav, sha256_hex=hashlib.sha256(wav).hexdigest(), content_type="audio/wav")
     m = prepare.metrics(out, agent_voice, segs)
-    m["name_check"] = name_check(answer if isinstance(answer, dict) else {}, owner, text)
+    agent_text = "\n".join(t["text"] for t in lines if t["voice"] == agent_voice)
+    m["name_check"] = name_check(answer if isinstance(answer, dict) else {}, owner,
+                                 job.get("owner_id") or None, agent_text)
     return {
         "outcome": "transcribed", **base,
         "agent_voice": agent_voice,
