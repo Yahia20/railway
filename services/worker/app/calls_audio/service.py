@@ -67,14 +67,15 @@ def stereo_key(storage_key: str) -> str:
     return "stereo/" + storage_key.split("/", 1)[1]
 
 
-def pick_agent(text: str, owner: str | None = None) -> tuple[str, str, dict, dict]:
+def pick_agent(text: str, owner: str | None = None, provider: str = "deepseek") -> tuple[str, str, dict, dict]:
     """Which voice is the agent, and whether the name the agent said is the
-    line's owner. Haiku when ANTHROPIC_API_KEY is set (the bake-off's measured
-    choice), otherwise DeepSeek with the same question. The provider is
+    line's owner. Haiku only when call_pipeline_config.role_provider is
+    'anthropic' AND the key is set (the gate in 040 asks that same provider),
+    otherwise DeepSeek with the same question. The provider is
     recorded on the model_calls row, so it is never a mystery which one decided
     a call. Returns (voice, reason, answer, model_calls row)."""
     system = ROLE_SYSTEM + (ROLE_OWNER.format(owner=owner) if owner else ROLE_NO_OWNER)
-    if os.getenv("ANTHROPIC_API_KEY"):
+    if provider == "anthropic" and os.getenv("ANTHROPIC_API_KEY"):
         return _pick_haiku(text, system)
     return _pick_deepseek(text, system)
 
@@ -138,7 +139,8 @@ def transcribe(uniqueid: str) -> dict[str, Any]:
     # before any name check), so the agent-voice question can compare the name
     # the agent said. Only the first name leaves for the model.
     job = db.one("""SELECT r.storage_key, l.customer_name,
-                           split_part(trim(a.full_name), ' ', 1) AS owner, a.agent_id::text AS owner_id
+                           split_part(trim(a.full_name), ' ', 1) AS owner, a.agent_id::text AS owner_id,
+                           (SELECT value FROM call_pipeline_config WHERE key = 'role_provider') AS role_provider
                       FROM call_recording_jobs r JOIN call_log l USING (uniqueid)
                       LEFT JOIN v_call_owner o USING (uniqueid)
                       LEFT JOIN agents a ON a.agent_id = o.line_agent_id
@@ -176,7 +178,7 @@ def transcribe(uniqueid: str) -> dict[str, Any]:
 
     text = prepare.dialog(lines)
     owner = job.get("owner") or None
-    agent_voice, reason, answer, role_call = pick_agent(text, owner)
+    agent_voice, reason, answer, role_call = pick_agent(text, owner, job.get("role_provider") or "deepseek")
     segs = prepare.segments(lines, agent_voice)
     key = stereo_key(job["storage_key"])
     wav = prepare.stereo_wav(pcm, out["spans"], agent_voice)

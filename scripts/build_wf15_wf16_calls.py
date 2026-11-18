@@ -307,13 +307,16 @@ wf16_nodes = [
     pg("Log run", G_LOG, once=True, x=1980, y=440),
 ]
 wf16_conn = {
-    "Every 10 min, 23:00-04:00": {"main": [[{"node": "Check budget", "type": "main", "index": 0}]]},
+    # Retention runs FIRST, every tick, whatever the money gate says: it costs
+    # nothing, and behind the gate a closed cap kept 90-day-old call text
+    # forever (Codex review 2026-11-18).
+    "Every 10 min, 23:00-04:00": {"main": [[{"node": "Retention", "type": "main", "index": 0}]]},
+    "Retention": {"main": [[{"node": "Check budget", "type": "main", "index": 0}]]},
     "Check budget": {"main": [[{"node": "Record provider status", "type": "main", "index": 0}]]},
     "Record provider status": {"main": [[{"node": "Read grade gate", "type": "main", "index": 0}]]},
     "Read grade gate": {"main": [[{"node": "May we spend?", "type": "main", "index": 0}]]},
-    "May we spend?": {"main": [[{"node": "Retention", "type": "main", "index": 0}],
+    "May we spend?": {"main": [[{"node": "Claim calls", "type": "main", "index": 0}],
                                [{"node": "Log blocked run", "type": "main", "index": 0}]]},
-    "Retention": {"main": [[{"node": "Claim calls", "type": "main", "index": 0}]]},
     "Claim calls": {"main": [[{"node": "Claimed one?", "type": "main", "index": 0}]]},
     "Claimed one?": {"main": [[{"node": "Each call", "type": "main", "index": 0}], []]},
     "Each call": {"main": [[{"node": "Log run", "type": "main", "index": 0}],

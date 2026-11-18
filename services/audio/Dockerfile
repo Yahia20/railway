@@ -21,7 +21,14 @@ RUN pip install -r requirements.txt
 # in any ENV of the image.
 ARG HF_TOKEN
 RUN python -c "from huggingface_hub import snapshot_download as d; \
-d('nvidia/diar_streaming_sortformer_4spk-v2.1'); d('mobiuslabsgmbh/faster-whisper-large-v3-turbo')"
+d('nvidia/diar_streaming_sortformer_4spk-v2.1'); d('mobiuslabsgmbh/faster-whisper-large-v3-turbo'); \
+d('nvidia/Nemotron-3-Diarization', allow_patterns=['*.nemo','*.json','*.md'])"
+# Nemotron-3-Diarization needs NeMo after 3.0.0 (rope attention in the
+# Transformer encoder). One pinned commit of NeMo main (2026-11-03), in its own
+# folder: the 3.0.0 install Sortformer runs on is untouched, and this copy is
+# only put on sys.path when DIARISER=nemotron.
+RUN pip install --no-deps --target /opt/nemo-main \
+    https://github.com/NVIDIA/NeMo/archive/0c7af3351eb73ec7ad566f770623023e71187c92.zip
 RUN HF_TOKEN="$HF_TOKEN" python -c "from huggingface_hub import snapshot_download as d; \
 d('CohereLabs/cohere-transcribe-arabic-07-2026', allow_patterns=['*.json','*.safetensors','*.model','*.txt','*.py'])"
 ENV HF_HUB_OFFLINE=1
