@@ -1,5 +1,5 @@
-# calls-audio: Sortformer v2.1 (who speaks when) + faster-whisper large-v3-turbo
-# (words), CPU only. Versions are the ones the 2026-11-11 bake-off ran.
+# calls-audio: Sortformer v2.1 (who speaks when) + Cohere Transcribe Arabic per
+# turn (words; faster-whisper kept as the fallback engine), CPU only.
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 \
@@ -13,11 +13,17 @@ WORKDIR /srv
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-# Both models are baked into the image, so a cold start after app sleeping
-# loads from disk instead of downloading ~2 GB, and the service never needs a
-# Hugging Face token or network access to the hub at run time.
+# Every model is baked into the image, so a cold start after app sleeping
+# loads from disk instead of downloading ~6 GB, and the service never needs
+# network access to the hub at run time. Cohere's repo is gated (terms
+# accepted on the company's Hugging Face account): its read token is a
+# Railway variable that reaches the build only, as HF_TOKEN, and is not kept
+# in any ENV of the image.
+ARG HF_TOKEN
 RUN python -c "from huggingface_hub import snapshot_download as d; \
 d('nvidia/diar_streaming_sortformer_4spk-v2.1'); d('mobiuslabsgmbh/faster-whisper-large-v3-turbo')"
+RUN HF_TOKEN="$HF_TOKEN" python -c "from huggingface_hub import snapshot_download as d; \
+d('CohereLabs/cohere-transcribe-arabic-07-2026', allow_patterns=['*.json','*.safetensors','*.model','*.txt','*.py'])"
 ENV HF_HUB_OFFLINE=1
 
 COPY pipeline.py app.py ./
