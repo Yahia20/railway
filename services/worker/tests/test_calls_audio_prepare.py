@@ -66,5 +66,21 @@ def test_stereo_puts_the_agent_left_and_the_customer_right():
     assert abs(int(left[rate + rate // 2]) - 1000) < 50 and abs(int(right[rate + rate // 2])) < 50
 
 
+def test_a_different_name_said_in_the_call_is_a_mismatch():
+    from app.calls_audio.service import name_check
+    text = "A: السلام عليكم معاك محمد من ترافل جيت\nB: اهلا"
+    assert name_check({"said_name": "محمد", "same_person": "no"}, "Sara", text)["verdict"] == "no"
+    assert name_check({"said_name": "محمد", "same_person": "yes"}, "Mohamed", text)["verdict"] == "yes"
+
+
+def test_a_name_never_said_or_no_owner_never_takes_a_call_away():
+    from app.calls_audio.service import name_check
+    text = "A: السلام عليكم ترافل جيت\nB: اهلا"
+    assert name_check({"said_name": "خالد", "same_person": "no"}, "Sara", text)["verdict"] == "unknown"   # not in the call
+    assert name_check({"said_name": "", "same_person": "no"}, "Sara", text)["verdict"] == "unknown"
+    assert name_check({"said_name": "ترافل", "same_person": "no"}, None, text)["verdict"] == "unknown"   # owner unknown
+    assert name_check({}, "Sara", text) == {"said": None, "owner": "Sara", "verdict": "unknown"}
+
+
 def test_stereo_lands_next_to_the_recording_never_over_it():
     assert stereo_key("calls/2026/11/14/1794664989.324053.wav") == "stereo/2026/11/14/1794664989.324053.wav"
