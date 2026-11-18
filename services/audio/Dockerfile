@@ -28,7 +28,9 @@ d('nvidia/Nemotron-3-Diarization', allow_patterns=['*.nemo','*.json','*.md'])"
 # folder: the 3.0.0 install Sortformer runs on is untouched, and this copy is
 # only put on sys.path when DIARISER=nemotron.
 RUN pip install --no-deps --target /opt/nemo-main \
-    https://github.com/NVIDIA/NeMo/archive/0c7af3351eb73ec7ad566f770623023e71187c92.zip
+    https://github.com/NVIDIA/NeMo/archive/0c7af3351eb73ec7ad566f770623023e71187c92.zip \
+    lhotse==2.0.0a6
+# lhotse 2.0.0a6 is what that commit's pyproject pins (3.0.0 runs on 1.33).
 RUN HF_TOKEN="$HF_TOKEN" python -c "from huggingface_hub import snapshot_download as d; \
 d('CohereLabs/cohere-transcribe-arabic-07-2026', allow_patterns=['*.json','*.safetensors','*.model','*.txt','*.py'])"
 ENV HF_HUB_OFFLINE=1
