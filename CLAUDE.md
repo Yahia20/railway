@@ -360,6 +360,16 @@ phase-0 measurements: `docs/agent-portal-phase0-2026-11-14.md`.
 | 040 | the transcription gate asks the provider the worker really uses (`role_provider`), with 038's reserve |
 | workflow 16 | the 90-day purge runs before the money gate (in the repo; **live copy still needs `n8n_deploy.py 16`**, which needs `N8N_API_KEY`) |
 
+**041 — the name said in the call decides (owner's rule, 2026-11-20).** Sara
+answering Ahmed's phone and saying "معاك سارة" makes it Sara's call. Prompt
+`call-role-3` gives the model the staff's first names and it only maps the
+spelling; `name_check` counts who carries that name. One employee → theirs
+(`name_said`); several (7 "Ahmed") → the line's owner if he is one of them,
+else `name_ambiguous`; a name that is nobody's → `name_unknown`; no name →
+`name_not_said`, shown as "لم يتم ذكر الاسم في الكول", **agent NULL even when
+the phone is known**. Before transcription the phone decides provisionally, as
+in 039; call-role-2 rows keep 039's reading.
+
 **Cohere vs Whisper, 8 real calls (22 min):** same compute (157 s vs 159 s), Cohere's
 Arabic far closer to what was said. Its first run wrote overlapping seconds into
 BOTH voices — `fill_two`'s spans overlap by design (right for stereo, wrong for a

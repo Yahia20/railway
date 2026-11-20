@@ -32,13 +32,13 @@ log = logging.getLogger("worker.calls_audio")
 
 AUDIO_URL = os.getenv("AUDIO_SERVICE_URL", "http://calls-audio.railway.internal:8000")
 ROLE_MODEL = "claude-haiku-5-5"
-ROLE_PROMPT_VERSION = "call-role-2"
+ROLE_PROMPT_VERSION = "call-role-3"
 ROLE_PRICE = (0.10, 0.50)        # USD per million tokens in / out, prompts under 100K
 ROLE_SCHEMA = {"type": "object", "properties": {"agent_voice": {"type": "string", "enum": ["A", "B"]},
                                                 "reason": {"type": "string"},
                                                 "said_name": {"type": "string"},
-                                                "same_person": {"type": "string", "enum": ["yes", "no", "unknown"]}},
-               "required": ["agent_voice", "reason", "said_name", "same_person"], "additionalProperties": False}
+                                                "employee_name": {"type": "string"}},
+               "required": ["agent_voice", "reason", "said_name", "employee_name"], "additionalProperties": False}
 ROLE_SYSTEM = ("This is a phone call to/from TravelGate, a travel agency (Saudi Arabia / Egypt), transcribed "
                "automatically from 8 kHz audio in Gulf/Egyptian Arabic, so words can be wrong. Customer numbers "
                "and names are masked. A speaker-separation model split it into two voices, A and B. Which voice "
@@ -48,11 +48,9 @@ ROLE_SYSTEM = ("This is a phone call to/from TravelGate, a travel agency (Saudi 
                "said_name: the name the AGENT introduced themselves with (\"معاك محمد\", \"انا سارة من ترافل "
                "جيت\"), copied exactly as written in the transcript; an empty string if the agent never said "
                "their own name. Never guess one.")
-ROLE_OWNER = ("\nThe phone line that handled this call belongs to the employee named \"{owner}\". same_person: "
-              "\"yes\" if said_name is that person's name (any spelling, Arabic or Latin, nickname of the same "
-              "name), \"no\" only if the agent clearly said a DIFFERENT person's name, \"unknown\" if no name was "
-              "said or it cannot be told.")
-ROLE_NO_OWNER = "\nsame_person: always \"unknown\" (the line's owner is not known)."
+ROLE_ROSTER = ("\nTravelGate employees' first names: {names}. employee_name: the ONE name from that list that "
+               "said_name is (any spelling, Arabic or Latin, a nickname of the same name), copied exactly as it "
+               "is in the list; an empty string if said_name is empty or is none of them.")
 MIN_WORDS = 8                    # fewer words than this is not a conversation to grade
 
 
@@ -67,38 +65,69 @@ def stereo_key(storage_key: str) -> str:
     return "stereo/" + storage_key.split("/", 1)[1]
 
 
-def pick_agent(text: str, owner: str | None = None, provider: str = "deepseek") -> tuple[str, str, dict, dict]:
-    """Which voice is the agent, and whether the name the agent said is the
-    line's owner. Haiku only when call_pipeline_config.role_provider is
-    'anthropic' AND the key is set (the gate in 040 asks that same provider),
-    otherwise DeepSeek with the same question. The provider is
-    recorded on the model_calls row, so it is never a mystery which one decided
-    a call. Returns (voice, reason, answer, model_calls row)."""
-    system = ROLE_SYSTEM + (ROLE_OWNER.format(owner=owner) if owner else ROLE_NO_OWNER)
+def first_names(roster: list[dict]) -> list[str]:
+    """The distinct first names the model may choose from, one spelling each."""
+    seen: dict[str, str] = {}
+    for r in roster:
+        f = (r.get("first") or "").strip()
+        if f and f.casefold() not in seen:
+            seen[f.casefold()] = f
+    return sorted(seen.values(), key=str.casefold)
+
+
+def pick_agent(text: str, names: list[str], provider: str = "deepseek") -> tuple[str, str, dict, dict]:
+    """Which voice is the agent, and which employee's name the agent said.
+    Haiku only when call_pipeline_config.role_provider is 'anthropic' AND the
+    key is set (the gate in 040 asks that same provider), otherwise DeepSeek
+    with the same question. The provider is recorded on the model_calls row, so
+    it is never a mystery which one decided a call. Only first names leave.
+    Returns (voice, reason, answer, model_calls row)."""
+    system = ROLE_SYSTEM + ROLE_ROSTER.format(names=", ".join(names) or "(none)")
     if provider == "anthropic" and os.getenv("ANTHROPIC_API_KEY"):
         return _pick_haiku(text, system)
     return _pick_deepseek(text, system)
 
 
-def name_check(answer: dict, owner: str | None, owner_id: str | None, agent_text: str) -> dict:
-    """The model's reading, held to what the transcript shows: a verdict needs
-    a said name that is in the AGENT's own lines (a customer saying a name is
-    not the agent introducing themselves) and a known owner. Anything less is
-    `unknown`, which never takes a call away from anyone. owner_id binds the
-    verdict to the employee it was asked about: if the extension's mapping
-    changes later, v_call_owner ignores it."""
+def name_check(answer: dict, roster: list[dict], line_agent_id: str | None, agent_text: str) -> dict:
+    """The owner's rule (2026-11-20): the name the agent says in the call
+    decides who the call belongs to, not the phone it was answered on.
+
+      matched       the said name is in the AGENT's own lines and is exactly one
+                    employee; or several employees share it and one of them is
+                    the line's owner (method by_line)
+      not_said      the agent never said their own name -> "لم يتم ذكر الاسم في الكول"
+      unknown_name  a name was said but it is no employee's
+      ambiguous     several employees share it, none of them the line's owner
+
+    The model only maps a spelling onto the list (rule 3): which employees carry
+    that name is counted here, and only `matched` gives the call to anyone.
+    A name the customer said is not the agent introducing themselves."""
     said = str(answer.get("said_name") or "").strip()
-    verdict = answer.get("same_person") if answer.get("same_person") in ("yes", "no") else "unknown"
-    if not owner or not owner_id or not said or said not in agent_text:
-        verdict = "unknown"
-    return {"said": said or None, "owner": owner, "owner_id": owner_id, "verdict": verdict}
+    picked = str(answer.get("employee_name") or "").strip()
+    out = {"v": 3, "said": said or None, "employee_name": None, "status": "not_said",
+           "agent_id": None, "method": None, "line_agent_id": line_agent_id, "candidates": 0}
+    if not said or said not in agent_text:
+        out["said"] = None
+        return out
+    cands = [r for r in roster if picked and (r.get("first") or "").strip().casefold() == picked.casefold()]
+    out["employee_name"] = picked or None
+    out["candidates"] = len(cands)
+    if not cands:
+        out["status"] = "unknown_name"
+    elif len(cands) == 1:
+        out.update(status="matched", agent_id=str(cands[0]["agent_id"]), method="unique")
+    elif line_agent_id and any(str(r["agent_id"]) == line_agent_id for r in cands):
+        out.update(status="matched", agent_id=line_agent_id, method="by_line")
+    else:
+        out["status"] = "ambiguous"
+    return out
 
 
 def _pick_deepseek(text: str, system: str) -> tuple[str, str, dict, dict]:
     from ..evaluate.judge import DeepSeekClient, JudgeError, cost_row
     client = DeepSeekClient(thinking="disabled")
     ask = text + ('\n\nAnswer as JSON: {"agent_voice": "A" or "B", "reason": "one short sentence", '
-                  '"said_name": "...", "same_person": "yes" | "no" | "unknown"}')
+                  '"said_name": "...", "employee_name": "..."}')
     h = hashlib.sha256((system + "\n" + ask).encode("utf-8")).hexdigest()
     t0 = time.monotonic()
     try:
@@ -135,15 +164,12 @@ def _pick_haiku(text: str, system: str) -> tuple[str, str, dict, dict]:
 
 
 def transcribe(uniqueid: str) -> dict[str, Any]:
-    # owner: the first name of whoever the PBX says handled the call (v_call_owner
-    # before any name check), so the agent-voice question can compare the name
-    # the agent said. Only the first name leaves for the model.
-    job = db.one("""SELECT r.storage_key, l.customer_name,
-                           split_part(trim(a.full_name), ' ', 1) AS owner, a.agent_id::text AS owner_id,
+    # line_agent_id: whoever the PBX + approved mapping say handled the call. It
+    # only settles a name several employees share (name_check, method by_line).
+    job = db.one("""SELECT r.storage_key, l.customer_name, o.line_agent_id::text AS line_agent_id,
                            (SELECT value FROM call_pipeline_config WHERE key = 'role_provider') AS role_provider
                       FROM call_recording_jobs r JOIN call_log l USING (uniqueid)
                       LEFT JOIN v_call_owner o USING (uniqueid)
-                      LEFT JOIN agents a ON a.agent_id = o.line_agent_id
                      WHERE r.uniqueid = %s AND r.status = 'stored'""", (uniqueid,))
     if not job:
         return {"outcome": "no_recording"}
@@ -177,16 +203,19 @@ def transcribe(uniqueid: str) -> dict[str, Any]:
         return {"outcome": "review", "reason": "only one voice was heard", **base}
 
     text = prepare.dialog(lines)
-    owner = job.get("owner") or None
-    agent_voice, reason, answer, role_call = pick_agent(text, owner, job.get("role_provider") or "deepseek")
+    # Every active person, excluded accounts too: if Sara says her name the call
+    # is Sara's, and v_call_owner then reports it as an excluded account.
+    roster = db.rows("""SELECT agent_id::text AS agent_id, split_part(trim(full_name), ' ', 1) AS first
+                          FROM agents WHERE is_active AND NOT is_bot AND coalesce(trim(full_name), '') <> ''""")
+    agent_voice, reason, answer, role_call = pick_agent(text, first_names(roster), job.get("role_provider") or "deepseek")
     segs = prepare.segments(lines, agent_voice)
     key = stereo_key(job["storage_key"])
     wav = prepare.stereo_wav(pcm, out["spans"], agent_voice)
     store.put(key, wav, sha256_hex=hashlib.sha256(wav).hexdigest(), content_type="audio/wav")
     m = prepare.metrics(out, agent_voice, segs)
     agent_text = "\n".join(t["text"] for t in lines if t["voice"] == agent_voice)
-    m["name_check"] = name_check(answer if isinstance(answer, dict) else {}, owner,
-                                 job.get("owner_id") or None, agent_text)
+    m["name_check"] = name_check(answer if isinstance(answer, dict) else {}, roster,
+                                 job.get("line_agent_id") or None, agent_text)
     return {
         "outcome": "transcribed", **base,
         "agent_voice": agent_voice,
