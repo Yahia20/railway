@@ -66,31 +66,59 @@ def test_stereo_puts_the_agent_left_and_the_customer_right():
     assert abs(int(left[rate + rate // 2]) - 1000) < 50 and abs(int(right[rate + rate // 2])) < 50
 
 
-OWNER = "00000000-0000-0000-0000-00000000000a"
+AHMED = "00000000-0000-0000-0000-00000000000a"
+SARA = "00000000-0000-0000-0000-00000000000b"
+AHMED2 = "00000000-0000-0000-0000-00000000000c"
+ROSTER = [{"agent_id": AHMED, "first": "Ahmed"}, {"agent_id": SARA, "first": "Sara"},
+          {"agent_id": AHMED2, "first": "AHMED"}]
 
 
-def test_a_different_name_said_by_the_agent_is_a_mismatch():
+def test_the_name_said_in_the_call_wins_over_the_phone():
+    # The owner's rule, 2026-11-20: Sara answers Ahmed's phone -> Sara's call.
     from app.calls_audio.service import name_check
-    agent = "السلام عليكم معاك محمد من ترافل جيت"
-    assert name_check({"said_name": "محمد", "same_person": "no"}, "Sara", OWNER, agent)["verdict"] == "no"
-    assert name_check({"said_name": "محمد", "same_person": "yes"}, "Mohamed", OWNER, agent)["verdict"] == "yes"
-    assert name_check({"said_name": "محمد", "same_person": "no"}, "Sara", OWNER, agent)["owner_id"] == OWNER
+    agent = "السلام عليكم معاك سارة من ترافل جيت"
+    r = name_check({"said_name": "سارة", "employee_name": "Sara"}, ROSTER, AHMED, agent)
+    assert (r["status"], r["agent_id"], r["method"]) == ("matched", SARA, "unique")
+    assert name_check({"said_name": "سارة", "employee_name": "Sara"}, ROSTER, None, agent)["agent_id"] == SARA
+
+
+def test_no_name_said_is_its_own_answer_not_the_lines_owner():
+    from app.calls_audio.service import name_check
+    agent = "السلام عليكم ترافل جيت"
+    for answer in ({}, {"said_name": "", "employee_name": ""}):
+        r = name_check(answer, ROSTER, AHMED, agent)
+        assert (r["status"], r["agent_id"]) == ("not_said", None)
 
 
 def test_a_name_the_customer_said_is_not_the_agents_introduction():
-    # Codex review 2026-11-18: the customer saying "منى" must not clear Sara's call.
+    # Codex review 2026-11-18: the customer saying "منى" is not the agent introducing themselves.
     from app.calls_audio.service import name_check
-    agent_lines = "السلام عليكم ترافل جيت تفضل"           # the customer's "انا منى" is in the other voice
-    assert name_check({"said_name": "منى", "same_person": "no"}, "Sara", OWNER, agent_lines)["verdict"] == "unknown"
+    agent_lines = "السلام عليكم ترافل جيت تفضل"           # the customer's "انا سارة" is in the other voice
+    r = name_check({"said_name": "سارة", "employee_name": "Sara"}, ROSTER, AHMED, agent_lines)
+    assert (r["status"], r["agent_id"], r["said"]) == ("not_said", None, None)
 
 
-def test_a_name_never_said_or_no_owner_never_takes_a_call_away():
+def test_a_name_that_is_no_employee_gives_the_call_to_nobody():
     from app.calls_audio.service import name_check
-    agent = "السلام عليكم ترافل جيت"
-    assert name_check({"said_name": "خالد", "same_person": "no"}, "Sara", OWNER, agent)["verdict"] == "unknown"   # not in the call
-    assert name_check({"said_name": "", "same_person": "no"}, "Sara", OWNER, agent)["verdict"] == "unknown"
-    assert name_check({"said_name": "ترافل", "same_person": "no"}, None, None, agent)["verdict"] == "unknown"   # owner unknown
-    assert name_check({}, "Sara", OWNER, agent) == {"said": None, "owner": "Sara", "owner_id": OWNER, "verdict": "unknown"}
+    agent = "معاك خالد من ترافل جيت"
+    for picked in ("", "Khaled"):                         # the model found no one, or invented a name off the list
+        r = name_check({"said_name": "خالد", "employee_name": picked}, ROSTER, AHMED, agent)
+        assert (r["status"], r["agent_id"]) == ("unknown_name", None)
+
+
+def test_a_shared_name_is_settled_by_the_line_or_left_to_the_team():
+    from app.calls_audio.service import name_check
+    agent = "معاك احمد من ترافل جيت"
+    r = name_check({"said_name": "احمد", "employee_name": "Ahmed"}, ROSTER, AHMED2, agent)   # case differs, same name
+    assert (r["status"], r["agent_id"], r["method"], r["candidates"]) == ("matched", AHMED2, "by_line", 2)
+    r = name_check({"said_name": "احمد", "employee_name": "Ahmed"}, ROSTER, SARA, agent)
+    assert (r["status"], r["agent_id"]) == ("ambiguous", None)
+    assert name_check({"said_name": "احمد", "employee_name": "Ahmed"}, ROSTER, None, agent)["status"] == "ambiguous"
+
+
+def test_the_model_chooses_from_one_spelling_per_name():
+    from app.calls_audio.service import first_names
+    assert first_names(ROSTER + [{"agent_id": "x", "first": " "}]) == ["Ahmed", "Sara"]
 
 
 def test_stereo_lands_next_to_the_recording_never_over_it():
