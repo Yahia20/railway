@@ -370,6 +370,15 @@ else `name_ambiguous`; a name that is nobody's → `name_unknown`; no name →
 the phone is known**. Before transcription the phone decides provisionally, as
 in 039; call-role-2 rows keep 039's reading.
 
+**calls-audio holds no RAM when idle (2026-11-22).** Railway bills held RAM
+busy or not ($10/GB-month), and the models were `lru_cache`d in the server
+process: one Whisper run kept 2.75 GB for two days at 0 CPU; Cohere peaks at
+6-8 GB = $40-80/month standing still. The pipeline now runs in one spawned
+child that 10 idle minutes (`IDLE_UNLOAD_SECONDS`) end. Measured live: 1.62 GB
+after a job, 0.08 GB from minute 11. App sleeping was OFF on the live service
+although `railway.json` says true (`railway up` does not apply that field) — set
+through the API; check `serviceInstance.sleepApplication`, not the file.
+
 **Cohere vs Whisper, 8 real calls (22 min):** same compute (157 s vs 159 s), Cohere's
 Arabic far closer to what was said. Its first run wrote overlapping seconds into
 BOTH voices — `fill_two`'s spans overlap by design (right for stereo, wrong for a
